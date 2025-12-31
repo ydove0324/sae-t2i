@@ -1,0 +1,30 @@
+__object__:
+  path: models.dino_v3.image_vae_dinov3_encode
+  name: AutoencoderKL
+  args: as_params
+enc_block_out_channels:
+- 128
+- 256
+- 384
+- 512
+- 768
+dec_block_out_channels:
+- 1280
+- 1024
+- 512
+- 256
+- 128
+- 64
+- 32
+enc_layers_per_block: 2
+dec_layers_per_block: 3
+in_channels: 3
+latent_channels: 1280
+out_channels: 3
+use_quant_conv: false
+use_post_quant_conv: false
+spatial_downsample_factor: 64
+variational: false
+running_mode: "enc_dec"
+
+
