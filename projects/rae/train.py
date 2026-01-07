@@ -4,6 +4,7 @@
 """
 A minimal training script for SiT using PyTorch DDP.
 """
+
 import os
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
@@ -24,17 +25,24 @@ from time import time
 import argparse
 import logging
 
+import sys
+sys.path.append(".")
 import math
 from torch.cuda.amp import autocast
 from omegaconf import OmegaConf
-from models.rae.stage1 import RAE
+# from models.rae.stage1 import RAE
 from models.rae.stage2.models import Stage2ModelProtocol
-from models.rae.stage2.transport import create_transport, Sampler
+# from models.rae.stage2.transport import create_transport, Sampler
 from models.rae.utils.train_utils import parse_configs
 from models.rae.utils.model_utils import instantiate_from_config
 from models.rae.utils import wandb_utils
 from models.rae.utils.optim_utils import build_optimizer, build_scheduler
+from sae_model import AutoencoderKL
+from dataset import ImageNetIdxDataset
 import gc
+import torch.nn.functional as F
+from torchvision.utils import save_image
+from torch.utils.tensorboard import SummaryWriter
 
 
 #################################################################################
@@ -112,24 +120,173 @@ def center_crop_arr(pil_image, image_size):
 #                                  Training Loop                                #
 #################################################################################
 
+@torch.no_grad()
+def reconstruct_from_latent_with_diffusion(
+    vae: AutoencoderKL,
+    latent_z: torch.Tensor,
+    image_shape: torch.Size,
+    diffusion_steps: int = 25,
+) -> torch.Tensor:
+    """
+    Given latent_z from DINO encoder (or model x-pred in the same latent space),
+    run the full diffusion decoder sampling loop to reconstruct images.
+
+    Args:
+        vae: AutoencoderKL model with diffusion decoder.
+        latent_z: latent representation, [B, C_latent, H_latent, W_latent].
+        image_shape: target image shape (B, 3, H, W).
+        diffusion_steps: number of diffusion sampling steps.
+
+    Returns:
+        Reconstructed images in [-1, 1], shape = image_shape.
+    """
+    device = latent_z.device
+    z = latent_z
+
+    # 如果有 post_quant_conv，则与训练时保持一致
+    if getattr(vae, "post_quant_conv", None) is not None and vae.post_quant_conv is not None:
+        z = vae.post_quant_conv(z)
+
+    # 用 diffusion decoder 的 compressor 获得多尺度 context
+    context = vae.diffusion_decoder.get_context(z)
+    # 与 forward 一致：反转 context 顺序
+    corrected_context = list(reversed(context[:]))
+
+    diffusion = vae.diffusion_decoder.diffusion
+    diffusion.set_sample_schedule(diffusion_steps, device)
+
+    # 从纯高斯噪声开始采样
+    init_noise = torch.randn(
+        image_shape,
+        device=device,
+        dtype=latent_z.dtype,
+    )
+
+    recon = diffusion.p_sample_loop(
+        vae=vae,
+        shape=image_shape,
+        context=corrected_context,
+        clip_denoised=True,
+        init_noise=init_noise,
+        eta=0.0,  # DDIM deterministic sampling
+    )
+
+    return recon
+
+
+def load_dinov3_vae(
+    vae_checkpoint_path: str,
+    device: torch.device,
+) -> AutoencoderKL:
+    """
+    构建并加载 DINOv3 AutoencoderKL（带 diffusion decoder）。
+    和你 simple_dino_vae_reconstruct 里的参数保持一致。
+    """
+    model_params = {
+        "in_channels": 3,
+        "out_channels": 3,
+        "enc_block_out_channels": [128, 256, 384, 512, 768],
+        "dec_block_out_channels": [1280, 1024, 512, 256, 128],
+        "enc_layers_per_block": 2,
+        "dec_layers_per_block": 3,
+        "latent_channels": 1280,           # DINOv3 ViT-H/16plus output dim
+        "use_quant_conv": False,
+        "use_post_quant_conv": False,
+        "spatial_downsample_factor": 16,   # 例如 256/16 = 16
+        "variational": False,              # 训练 stage2 时一般用确定性 latent
+        "noise_tau": 0.0,
+        "denormalize_decoder_output": True,
+        "running_mode": "dec",
+        "random_masking_channel_ratio": 0.0,
+        "target_latent_channels": None,
+        "lpips_weight": 0.1,
+    }
+
+    vae = AutoencoderKL(**model_params).to(device)
+
+    print(f"[load_dinov3_vae] Loading VAE checkpoint from: {vae_checkpoint_path}")
+    checkpoint = torch.load(vae_checkpoint_path, map_location="cpu")
+
+    if "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    elif "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
+
+    missing, unexpected = vae.load_state_dict(state_dict, strict=False)
+    print(f"[load_dinov3_vae] Loaded VAE. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
+    vae.eval()
+    requires_grad(vae, False)
+    return vae
+
+
+def compute_train_loss(
+    model: Stage2ModelProtocol,
+    x_latent: torch.Tensor,
+    model_kwargs: dict,
+    time_shift: float,
+):
+    """
+    Flow-matching / x-pred 损失，不依赖 transport.
+
+    现在的设定：
+    - t ~ Uniform(0, 1)
+    - Linear path: x_t = (1 - t) * ε + t * x_0
+      其中 ε ~ N(0, I), x_0 = x_latent
+    - model(x_t, t, **model_kwargs) 直接预测 x_0（x-pred）
+    - loss = MSE(x_pred, x_0)
+
+    time_shift 目前没有再“扭曲” t 的分布，只是保留在接口里，方便后面如果
+    你想加基于 t 的 reweight（例如 w(t; time_shift)）的时候使用。
+    """
+    B = x_latent.size(0)
+    device = x_latent.device
+
+    # 基础噪声 ε
+    noise = torch.randn_like(x_latent)
+
+    # t ~ Uniform[0,1]
+    t = torch.rand(B, device=device)  # shape [B]
+    t = (time_shift * t) / (1.0 + (time_shift - 1.0) * t)
+
+    # broadcast 到 (B, 1, 1, 1)
+    t_broadcast = t.view(B, 1, 1, 1)
+
+    # Linear path: x_t = t * ε + (1 - t) * x_0
+    x_t = (t_broadcast) * noise + (1 - t_broadcast) * x_latent
+
+    # 前向：model(x_t, t, **model_kwargs)
+    # t 是 [B]，模型内部按 embd_type 处理
+    # print("t!!!!",t)
+    model_output = model(x_t, t, **model_kwargs)
+    # x-pred: 直接回归 x_0
+    loss = F.mse_loss(model_output, x_latent)
+
+    return loss, model_output, noise, t
+
+
+
+#################################################################################
+#                                  Training Loop                                #
+#################################################################################
+
 
 def main(args):
-    """Trains a new SiT model using config-driven hyperparameters."""
+    """Trains a new SiT model using config-driven hyperparameters + DINO VAE."""
     if not torch.cuda.is_available():
         raise RuntimeError("Training currently requires at least one GPU.")
 
     (
-        rae_config,
+        rae_config,          # unused now
         model_config,
-        transport_config,
-        sampler_config,
-        guidance_config,
+        transport_config,    # unused
+        sampler_config,      # unused
+        guidance_config,     # unused
         misc_config,
         training_config,
     ) = parse_configs(args.config)
-
-    if rae_config is None or model_config is None:
-        raise ValueError("Config must provide both stage_1 and stage_2 sections.")
 
     def to_dict(cfg_section):
         if cfg_section is None:
@@ -137,17 +294,9 @@ def main(args):
         return OmegaConf.to_container(cfg_section, resolve=True)
 
     misc = to_dict(misc_config)
-    transport_cfg = to_dict(transport_config)
-    sampler_cfg = to_dict(sampler_config)
-    guidance_cfg = to_dict(guidance_config)
     training_cfg = to_dict(training_config)
 
     num_classes = int(misc.get("num_classes", 1000))
-    null_label = int(misc.get("null_label", num_classes))
-    latent_size = tuple(int(dim) for dim in misc.get("latent_size", (768, 16, 16)))
-    shift_dim = misc.get("time_dist_shift_dim", math.prod(latent_size))
-    shift_base = misc.get("time_dist_shift_base", 4096)
-    time_dist_shift = math.sqrt(shift_dim / shift_base)
 
     grad_accum_steps = int(training_cfg.get("grad_accum_steps", 1))
     clip_grad = float(training_cfg.get("clip_grad", 1.0))
@@ -160,18 +309,18 @@ def main(args):
     num_workers = int(training_cfg.get("num_workers", 4))
     log_every = int(training_cfg.get("log_every", 100))
     ckpt_every = int(training_cfg.get("ckpt_every", 5_000))
-    sample_every = int(training_cfg.get("sample_every", 10_000))
-    cfg_scale_override = training_cfg.get("cfg_scale", None)
     default_seed = int(training_cfg.get("global_seed", 0))
     global_seed = args.global_seed if args.global_seed is not None else default_seed
 
     if grad_accum_steps < 1:
         raise ValueError("Gradient accumulation steps must be >= 1.")
     if args.image_size % 16 != 0:
-        raise ValueError("Image size must be divisible by 16 for the RAE encoder.")
-
+        raise ValueError("Image size must be divisible by 16 for the VAE encoder (downsample_factor=16).")
+    print("test")
+    # ---------------- DDP init ----------------
     dist.init_process_group("nccl")
     world_size = dist.get_world_size()
+    print("ddp train!!")
     if global_batch_size % (world_size * grad_accum_steps) != 0:
         raise ValueError("Global batch size must be divisible by world_size * grad_accum_steps.")
     rank = dist.get_rank()
@@ -189,52 +338,45 @@ def main(args):
     use_bf16 = args.precision == "bf16"
     if use_bf16 and not torch.cuda.is_bf16_supported():
         raise ValueError("Requested bf16 precision, but the current CUDA device does not support bfloat16.")
-    # autocast_kwargs = dict(dtype=torch.bfloat16, enabled=use_bf16)
+    # 为了稳定性，默认不开 autocast，有需要你自己改成 bf16
     autocast_kwargs = dict(dtype=torch.float32, enabled=False)
-    latent_dtype = autocast_kwargs["dtype"] if use_bf16 else torch.float32
 
-    transport_params = dict(transport_cfg.get("params", {}))
-    path_type = transport_params.get("path_type", "Linear")
-    prediction = transport_params.get("prediction", "velocity")
-    loss_weight = transport_params.get("loss_weight")
-    transport_params.pop("time_dist_shift", None)
+    # ---------------- time_shift & latent size ----------------
+    # DINO latent 尺寸固定 (C=1280, H=W=16)
+    latent_size = (1280, 16, 16)
+    # 你要求：time_shift = sqrt((16 * 16 * 1280) / 4096)
+    shift_dim = 16 * 16 * 1280
+    shift_base = 4096
+    time_shift = math.sqrt(shift_dim / shift_base)
 
-    sampler_mode = sampler_cfg.get("mode", "ODE").upper()
-    sampler_params = dict(sampler_cfg.get("params", {}))
-
-    guidance_scale = float(guidance_cfg.get("scale", 1.0))
-    if cfg_scale_override is not None:
-        guidance_scale = float(cfg_scale_override)
-    guidance_method = guidance_cfg.get("method", "cfg")
-
-    def guidance_value(key: str, default: float) -> float:
-        if key in guidance_cfg:
-            return guidance_cfg[key]
-        dashed_key = key.replace("_", "-")
-        return guidance_cfg.get(dashed_key, default)
-
-    t_min = float(guidance_value("t_min", 0.0))
-    t_max = float(guidance_value("t_max", 1.0))
-
+    # ---------------- experiment / logging / wandb ----------------
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
         experiment_index = len(glob(f"{args.results_dir}/*")) - 1
+
         model_target = str(model_config.get("target", "stage2"))
         model_string_name = model_target.split(".")[-1]
         precision_suffix = f"-{args.precision}" if args.precision == "bf16" else ""
-        loss_weight_str = loss_weight if loss_weight is not None else "none"
+
         experiment_name = (
             f"{experiment_index:03d}-{model_string_name}-"
-            f"{path_type}-{prediction}-{loss_weight_str}{precision_suffix}-acc{grad_accum_steps}"
+            f"flowmatch-xpred{precision_suffix}-acc{grad_accum_steps}"
         )
-        # experiment_dir = os.path.join(args.results_dir, experiment_name)
-        # checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
+
         experiment_dir = os.path.join(args.results_dir, "experiment")
         os.makedirs(experiment_dir, exist_ok=True)
         checkpoint_dir = os.path.join(args.results_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
+
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+
+        # === 新增：TensorBoard SummaryWriter ===
+        tb_dir = os.path.join(experiment_dir, "tensorboard")
+        os.makedirs(tb_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_dir)
+        # ==============================
+
         if args.wandb:
             entity = os.environ["ENTITY"]
             project = os.environ["PROJECT"]
@@ -243,16 +385,15 @@ def main(args):
         experiment_dir = None
         checkpoint_dir = None
         logger = create_logger(None)
+        writer = None
 
-    rae: RAE = instantiate_from_config(rae_config).to(device)
-    rae.eval()
-
+    # ---------------- load DINO VAE ----------------
+    dinov3_vae = load_dinov3_vae(args.vae_ckpt, device)
+    print("load vae!!!")
+    # ---------------- Stage2 model ----------------
     model: Stage2ModelProtocol = instantiate_from_config(model_config).to(device)
-
-    # if hasattr(model, "DiT") and hasattr(model.DiT, "gradient_checkpointing_disable"):
-    #     print("gradient_checkpointing_disable")
-    #     model.DiT.gradient_checkpointing_disable()
-
+    # print("model",model)
+    print("load diffusion model!!!")
 
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
@@ -261,6 +402,7 @@ def main(args):
     sched_state = None
     train_steps = 0
 
+    # ---------------- optional resume ----------------
     if args.ckpt is not None:
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         if "model" in checkpoint:
@@ -280,12 +422,19 @@ def main(args):
     if opt_state is not None:
         opt.load_state_dict(opt_state)
 
+    # ---------------- dataset / loader ----------------
     transform = transforms.Compose([
         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
         transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
+        transforms.ToTensor(),                       # [0,1]
+        transforms.Lambda(lambda t: t * 2.0 - 1.0),  # [-1,1]
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    index_synset_path = "/share/project/datasets/ImageNet/train/index_synset.yaml"
+    dataset = ImageNetIdxDataset(
+        root=args.data_path,
+        index_synset_path=index_synset_path,
+        transform=transform,
+    )
     sampler = DistributedSampler(
         dataset,
         num_replicas=world_size,
@@ -319,28 +468,8 @@ def main(args):
     if rank == 0:
         logger.info(f"Training configured for {epochs} epochs, {steps_per_epoch} steps per epoch.")
         logger.info(opt_msg + "\n" + sched_msg)
-    transport = create_transport(
-        **transport_params,
-        time_dist_shift=time_dist_shift,
-    )
-    transport_sampler = Sampler(transport)
 
-    if sampler_mode == "ODE":
-        eval_sampler = transport_sampler.sample_ode(**sampler_params)
-    elif sampler_mode == "SDE":
-        eval_sampler = transport_sampler.sample_sde(**sampler_params)
-    else:
-        raise NotImplementedError(f"Invalid sampling mode {sampler_mode}.")
-
-    guid_model_forward = None
-    if guidance_scale > 1.0 and guidance_method == "autoguidance":
-        guidance_model_cfg = guidance_cfg.get("guidance_model")
-        if guidance_model_cfg is None:
-            raise ValueError("Please provide a guidance model config when using autoguidance.")
-        guid_model: Stage2ModelProtocol = instantiate_from_config(guidance_model_cfg).to(device)
-        guid_model.eval()
-        guid_model_forward = guid_model.forward
-
+    # 初始化 EMA
     update_ema(ema, model.module, decay=0)
     model.train()
     ema.eval()
@@ -349,30 +478,13 @@ def main(args):
     running_loss = 0.0
     start_time = time()
 
-    ys = torch.randint(num_classes, size=(micro_batch_size,), device=device)
-    using_cfg = guidance_scale > 1.0
-    n = ys.size(0)
-    zs = torch.randn(n, *latent_size, device=device, dtype=latent_dtype)
+    logger.info(f"Training for {epochs} epochs...")
+    log_every = 10
 
-    if using_cfg:
-        zs = torch.cat([zs, zs], dim=0)
-        y_null = torch.full((n,), null_label, device=device)
-        ys = torch.cat([ys, y_null], dim=0)
-        sample_model_kwargs = dict(
-            y=ys,
-            cfg_scale=guidance_scale,
-            cfg_interval=(t_min, t_max),
-        )
-        if guidance_method == "autoguidance":
-            if guid_model_forward is None:
-                raise RuntimeError("Guidance model forward is not initialized.")
-            sample_model_kwargs["additional_model_forward"] = guid_model_forward
-            model_fn = ema.forward_with_autoguidance
-        else:
-            model_fn = ema.forward_with_cfg
-    else:
-        sample_model_kwargs = dict(y=ys)
-        model_fn = ema.forward
+    log_steps = 0
+    running_loss = 0.0
+    start_time = time()
+    print("time_shift",time_shift)
 
     logger.info(f"Training for {epochs} epochs...")
     for epoch in range(epochs):
@@ -381,33 +493,30 @@ def main(args):
         opt.zero_grad()
         accum_counter = 0
         step_loss_accum = 0.0
-        for x, y in loader:
-            x = x.to(device)
+
+        for x_img, y in loader:
+            x_img = x_img.to(device)  # [-1,1]
             y = y.to(device)
-            img_gt = x if x.min() >= 0 else (x + 1) / 2
+            # print("x_img",x_img,"y",y)
+
+            # 记录 GT 图像 [0,1] 用于可视化
+            img_gt = (x_img + 1.0) / 2.0
+
             with torch.no_grad():
-                x = rae.encode(x)
+                x_latent,p = dinov3_vae.encode(x_img)
+                # x_latent = encoder_output.latent  # [B, 1280,16,16]
+            # print("x_latent!!!")
             model_kwargs = dict(y=y)
+
             # with autocast(**autocast_kwargs):
-            loss_tensor = transport.training_losses(model, x, model_kwargs)["loss"]#.mean()
-            pred = transport.training_losses(model, x, model_kwargs)["pred"]
-            noise = transport.training_losses(model, x, model_kwargs)["noise"]
+            loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
+                model=model,
+                x_latent=x_latent,
+                model_kwargs=model_kwargs,
+                time_shift=time_shift,
+            )
 
-
-            img = rae.decode(pred).clip(0, 1)
-            with torch.no_grad():
-                img_dec = rae.decode(x).clip(0, 1)
-
-            from torchvision.utils import save_image
-            # Assume `images` is a tensor of shape (B, 3, H, W)
-            os.makedirs("./onestep", exist_ok=True)
-            for i in range(img.shape[0]):
-                save_image(img[i], f"./onestep/image_{i}_{rank}_{loss_tensor[i].item():.4f}_noise{noise[i].item():.4f}.png")  # Saves as PNG
-                save_image(img_gt[i], f"./onestep/image_gt_{i}_{rank}.png")  # Saves as PNG
-                save_image(img_dec[i], f"./onestep/image_dec_{i}_{rank}.png")  # Saves as PNG
-
-
-
+            # NaN 检测
             is_nan_local = 0 if torch.isfinite(loss_tensor) else 1
             is_nan = torch.tensor(is_nan_local, device=device)
             dist.all_reduce(is_nan, op=dist.ReduceOp.SUM)
@@ -419,7 +528,7 @@ def main(args):
 
                 try:
                     torch.cuda.synchronize()
-                    del loss_tensor, x
+                    del loss_tensor, x_latent
                     gc.collect()
                     torch.cuda.empty_cache()
                     dist.barrier()
@@ -427,7 +536,6 @@ def main(args):
                     latest_path = f"{checkpoint_dir}/latest.pt"
                     checkpoint = torch.load(latest_path, map_location="cpu")
 
-                    # model.module.load_state_dict(checkpoint["model"], strict=True)
                     if "ema" in checkpoint:
                         ema.load_state_dict(checkpoint["ema"])
                     if "model" in checkpoint:
@@ -457,14 +565,15 @@ def main(args):
                     exit(1)
 
             step_loss_accum += loss_tensor.item()
-            (loss_tensor / grad_accum_steps).backward()
+            loss_tensor /= grad_accum_steps
+            loss_tensor.backward()
             accum_counter += 1
 
             if accum_counter < grad_accum_steps:
                 continue
 
             if clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
             opt.step()
             schedl.step()
             update_ema(ema, model.module, decay=ema_decay)
@@ -476,6 +585,34 @@ def main(args):
             accum_counter = 0
             step_loss_accum = 0.0
 
+            # 每 1000 step 重建一张图（只在 rank==0）
+            if rank == 0 and (train_steps % 1000 == 0):
+                with torch.no_grad():
+                    # 用当前 step 的 x-pred latent 做重建
+                    latent_sample = pred_latent[0:1]  # [1, 1280,16,16]
+                    recon = reconstruct_from_latent_with_diffusion(
+                        vae=dinov3_vae,
+                        latent_z=latent_sample,
+                        image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
+                        diffusion_steps=args.vae_diffusion_steps,
+                    )  # [-1,1]
+
+                    recon_img = (recon + 1.0) / 2.0
+                    vis_dir = os.path.join(experiment_dir, "recon")
+                    os.makedirs(vis_dir, exist_ok=True)
+                    save_image(
+                        recon_img,
+                        os.path.join(vis_dir, f"recon_step_{train_steps:07d}.png"),
+                    )
+                    # 也可以顺便存一张 GT
+                    save_image(
+                        img_gt[0:1],
+                        os.path.join(vis_dir, f"gt_step_{train_steps:07d}.png"),
+                    )
+
+                logger.info(f"[step {train_steps}] Saved reconstruction and GT image.")
+
+            # === 每 10 step 打印 & TensorBoard 记录 loss ===
             if train_steps % log_every == 0:
                 torch.cuda.synchronize()
                 end_time = time()
@@ -483,15 +620,31 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / world_size
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                if args.wandb:
-                    wandb_utils.log(
-                        {"train loss": avg_loss, "train steps/sec": steps_per_sec},
-                        step=train_steps,
+
+                if rank == 0:
+                    # 控制台打印
+                    print(
+                        f"(step={train_steps:07d}) "
+                        f"Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f} "
+                        f"Train Grad Norm {grad_norm:.4f}"
                     )
+                    # TensorBoard 记录
+                    if writer is not None:
+                        writer.add_scalar("train/loss", avg_loss, global_step=train_steps)
+                        writer.add_scalar("train/steps_per_sec", steps_per_sec, global_step=train_steps)
+                        writer.add_scalar("train/grad_norm", grad_norm, global_step=train_steps)
+
+                    # 若还想继续用 wandb，这里保留
+                    # if args.wandb:
+                    #     wandb_utils.log(
+                    #         {"train loss": avg_loss, "train steps/sec": steps_per_sec},
+                    #         step=train_steps,
+                    #     )
+
                 running_loss = 0.0
                 log_steps = 0
                 start_time = time()
+            # === end log block ===
 
             if train_steps % ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
@@ -539,32 +692,61 @@ def main(args):
                     logger.info(f"Updated quick resume checkpoint: {latest_path}")
                 dist.barrier()
 
-            if train_steps % sample_every == 0 or train_steps == 1:
-                logger.info("Generating EMA samples...")
-                with torch.no_grad():
-                    # with autocast(**autocast_kwargs):
-                    samples = eval_sampler(zs, model_fn, **sample_model_kwargs)[-1]
-                    dist.barrier()
+        # if accum_counter != 0:
+        #     raise RuntimeError("Gradient accumulation counter not zero at epoch end.")
 
-                    if using_cfg:
-                        samples, _ = samples.chunk(2, dim=0)
-                    samples = rae.decode(samples.to(torch.float32))
-                    out_samples = torch.zeros(
-                        (global_batch_size // grad_accum_steps, 3, args.image_size, args.image_size),
-                        device=device,
-                    )
-                    dist.all_gather_into_tensor(out_samples, samples)
-                    if args.wandb:
-                        wandb_utils.log_image(out_samples, train_steps)
-                logger.info("Generating EMA samples done.")
+        if train_steps % ckpt_every == 0 and train_steps > 0:
+            if rank == 0:
+                checkpoint = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "scheduler": schedl.state_dict(),
+                        "train_steps": train_steps,
+                        "config_path": args.config,
+                        "training_cfg": training_cfg,
+                        "cli_overrides": {
+                            "data_path": args.data_path,
+                            "results_dir": args.results_dir,
+                            "image_size": args.image_size,
+                            "precision": args.precision,
+                            "global_seed": global_seed,
+                        },
+                }
+                checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                torch.save(checkpoint, checkpoint_path)
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
+            dist.barrier()
 
-        if accum_counter != 0:
-            raise RuntimeError("Gradient accumulation counter not zero at epoch end.")
+            if train_steps % 1000 == 0 and train_steps > 0:
+                if rank == 0:
+                    snapshot = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "scheduler": schedl.state_dict(),
+                        "train_steps": train_steps,
+                        "config_path": args.config,
+                        "training_cfg": training_cfg,
+                        "cli_overrides": {
+                            "data_path": args.data_path,
+                            "results_dir": args.results_dir,
+                            "image_size": args.image_size,
+                            "precision": args.precision,
+                            "global_seed": global_seed,
+                        },
+                    }
+                    latest_path = f"{checkpoint_dir}/latest.pt"
+                    torch.save(snapshot, latest_path)
+                    logger.info(f"Updated quick resume checkpoint: {latest_path}")
+                dist.barrier()
+
+        # if accum_counter != 0:
+        #     raise RuntimeError("Gradient accumulation counter not zero at epoch end.")
 
     model.eval()
     logger.info("Done!")
     cleanup()
-
 
 
 if __name__ == "__main__":
@@ -578,5 +760,10 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path to resume training.")
     parser.add_argument("--global-seed", type=int, default=None, help="Override training.global_seed from the config.")
     parser.add_argument("--global-batch-size", type=int, default=None, help="Override training.global_batch_size from the config.")
+
+    # 新增：VAE 相关参数
+    parser.add_argument("--vae-ckpt", type=str, default="/share/project/huangxu/sae_hx/diff_decoder/tuned_enc_vae_26000.pth", help="")
+    parser.add_argument("--vae-diffusion-steps", type=int, default=25, help="Sampling steps for VAE diffusion decoder.")
+
     args = parser.parse_args()
     main(args)

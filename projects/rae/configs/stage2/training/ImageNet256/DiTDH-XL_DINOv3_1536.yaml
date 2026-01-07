@@ -59,7 +59,7 @@ misc:
 training:
   global_seed: 0
   epochs: 1400
-  global_batch_size: 1280 # change to 512
+  global_batch_size: 1024  # change to 512
   grad_accum_steps: 1 # change according to your GPU memory
   ema_decay: 0.9995
   num_workers: 4
