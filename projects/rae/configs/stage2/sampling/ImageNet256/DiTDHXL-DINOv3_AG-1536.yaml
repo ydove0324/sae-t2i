@@ -1,0 +1,77 @@
+stage_1:
+  target: models.rae.stage1.SAE
+  params:
+    ckpt_path: /opt/tiger/vfm/weights/dinov3/models/ema_vae.pth
+    encoder_config_path: /opt/tiger/vfm/models/dinov3-vith16plus-pretrain-lvd1689m
+    encoder_input_size: 256
+    noise_tau: 0
+    reshape_to_2d: true
+    normalization_stat_path: /opt/tiger/vfm/weights/dinov3/configs/main.yaml
+    config_path: /opt/tiger/vfm/models/dino_v3/s16_c1280.yaml
+
+stage_2:
+  target: models.rae.stage2.models.DDT.DiTwDDTHead
+  params:
+    input_size: 16
+    patch_size: 1
+    in_channels: 768
+    hidden_size: [1152, 2048]
+    depth: [28, 2]
+    num_heads: [16, 16]
+    mlp_ratio: 4.0
+    class_dropout_prob: 0.1
+    num_classes: 1000
+    use_qknorm: False
+    use_swiglu: True
+    use_rope: True
+    use_rmsnorm: True
+    wo_shift: False
+    use_pos_embed: True
+  ckpt: 'weights/DiTs/Dinov2/wReg_base/ImageNet256/DiTDH-XL/stage2_model.pt'
+
+
+transport:
+  params:
+    path_type: 'Linear'
+    prediction: 'velocity'
+    time_dist_type: 'uniform'
+
+sampler:
+  mode: ODE
+  params:
+    sampling_method: 'euler'
+    num_steps: 50
+    atol: 1e-6
+    rtol: 1e-3
+    reverse: False
+
+guidance:
+  method: 'autoguidance'
+  scale: 1.42
+  t-min: 0.0
+  t-max: 1.0
+  guidance_model:
+    target: models.rae.stage2.models.DDT.DiTwDDTHead
+    params:
+      input_size: 16
+      patch_size: 1 
+      in_channels: 768
+      hidden_size: [384, 2048]
+      depth: [12, 2]
+      num_heads: [6, 16]
+      mlp_ratio: 4.0
+      class_dropout_prob: 0.1
+      num_classes: 1000
+      use_qknorm: False
+      use_swiglu: True
+      use_rope: True
+      use_rmsnorm: True
+      wo_shift: False
+      use_pos_embed: True
+    ckpt: 'weights/DiTs/Dinov2/wReg_base/ImageNet256/DiTDH-S_ep14/stage2_model.pt'
+
+misc:
+  latent_size: [1280, 16, 16] # [C, H, W]
+  num_classes: 1000
+  time_dist_shift_dim: 327680 # 16*16*768
+  time_dist_shift_base: 4096
