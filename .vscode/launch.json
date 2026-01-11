@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Test with torchrun",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/share/project/huangxu/miniconda3/envs/video-decode/bin/torchrun",
+            "args": [
+            "--nproc_per_node=1",
+            "--nnodes=1",
+            "--node_rank=0",
+            "--master_addr=localhost",
+            "--master_port=19003",
+            "projects/rae/train.py",
+            "--global-batch-size=1",
+            // "--vae_ckpt=/share/project/huangxu/sae/checkpoints_decoder_v4/decoder_step_28000.pth"
+            "--vae-ckpt=/share/project/huangxu/sae_hx/diff_decoder/tuned_enc_vae_26000.pth",
+            "--config=/share/project/huangxu/SAE/projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml",
+            "--data-path=/share/project/datasets/ImageNet/train",
+            "--results-dir=./result",
+            "--precision=fp32",
+            "--ckpt=/share/project/huangxu/SAE/result/checkpoints/0130000.pt",
+            ],
+            "env": {
+            "TORCH_HOME":"/share/project/huangxu/.cache/torch",
+            "WANDB_DISABLED": "true",
+            "WANDB_BASE_URL": "https://api.wandb.ai",
+            "WANDB_MODE": "online",
+            "OMP_NUM_THREADS": "4",
+            "NCCL_IB_DISABLE": "0",
+            "NCCL_SOCKET_IFNAME": "eth0",
+            "GLOO_SOCKET_IFNAME": "eth0",
+            "NCCL_IB_HCA": "mlx5_100,mlx5_101,mlx5_102,mlx5_103,mlx5_104,mlx5_105,mlx5_106,mlx5_107",
+            "NCCL_IB_GID_INDEX": "7"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+            },
+    ]
+  }
+  

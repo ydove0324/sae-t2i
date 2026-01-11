@@ -84,3 +84,55 @@ class ImageNetIdxDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, label
+
+
+class OverfitSingleImageDataset(Dataset):
+    """
+    过拟合用：dataset 里只有一张图片（同一张重复 N 次返回）。
+
+    参数：
+    - image_path: 单张图片路径
+    - length: dataset 的“虚拟长度”（例如 1024，方便你跑很多 step）
+    - label: 固定返回的 label（默认 0）
+    - transform: torchvision transform
+    - cache_in_memory: True 时只读一次图片，后续直接复制（更快更稳定）
+    """
+
+    def __init__(
+        self,
+        image_path: str,
+        length: int = 1024,
+        label: int = 0,
+        transform=None,
+        cache_in_memory: bool = True,
+    ):
+        self.image_path = image_path
+        self.length = int(length)
+        self.label = int(label)
+        self.transform = transform
+        self.cache_in_memory = bool(cache_in_memory)
+
+        if self.length <= 0:
+            raise ValueError("length must be > 0")
+        if not os.path.isfile(self.image_path):
+            raise FileNotFoundError(f"image_path not found: {self.image_path}")
+
+        self._cached_pil = None
+        if self.cache_in_memory:
+            # 只读一次，避免 I/O 抖动
+            self._cached_pil = Image.open(self.image_path).convert("RGB")
+
+    def __len__(self):
+        return self.length
+
+    def _load_pil(self):
+        if self._cached_pil is not None:
+            # 返回一个拷贝，避免 transform 或后续操作意外改到缓存对象
+            return self._cached_pil.copy()
+        return Image.open(self.image_path).convert("RGB")
+
+    def __getitem__(self, idx):
+        img = self._load_pil()
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, self.label

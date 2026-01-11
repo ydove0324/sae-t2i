@@ -7,6 +7,7 @@ A minimal training script for SiT using PyTorch DDP.
 
 import os
 import torch
+from tqdm.std import trange
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -38,7 +39,7 @@ from models.rae.utils.model_utils import instantiate_from_config
 from models.rae.utils import wandb_utils
 from models.rae.utils.optim_utils import build_optimizer, build_scheduler
 from sae_model import AutoencoderKL
-from dataset import ImageNetIdxDataset
+from dataset import ImageNetIdxDataset,OverfitSingleImageDataset
 import gc
 import torch.nn.functional as F
 from torchvision.utils import save_image
@@ -542,10 +543,11 @@ def main(args):
         transforms.ToTensor(),                       # [0,1]
         transforms.Lambda(lambda t: t * 2.0 - 1.0),  # [-1,1]
     ])
-    index_synset_path = "/share/project/datasets/ImageNet/train/index_synset.yaml"
-    dataset = ImageNetIdxDataset(
-        root=args.data_path,
-        index_synset_path=index_synset_path,
+    image_path="/share/project/datasets/ImageNet/train/n10148035/n10148035_30.JPEG"
+    dataset = OverfitSingleImageDataset(
+        image_path=image_path,
+        length=1024*1024,
+        label=0,
         transform=transform,
     )
     sampler = DistributedSampler(
@@ -910,7 +912,7 @@ if __name__ == "__main__":
 
     # 新增：VAE 相关参数
     parser.add_argument("--vae-ckpt", type=str, default="/share/project/huangxu/sae_hx/diff_decoder/tuned_enc_vae_26000.pth", help="")
-    parser.add_argument("--vae-diffusion-steps", type=int, default=50, help="Sampling steps for VAE diffusion decoder.")
+    parser.add_argument("--vae-diffusion-steps", type=int, default=25, help="Sampling steps for VAE diffusion decoder.")
 
     args = parser.parse_args()
     main(args)

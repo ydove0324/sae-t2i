@@ -1,1 +1,4 @@
 result/*
+log/*
+result*
+*.pt
