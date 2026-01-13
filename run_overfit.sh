@@ -38,7 +38,8 @@ torchrun --nnodes=1 --node_rank=0 \
   projects/rae/train_overfit.py \
   --config /share/project/huangxu/SAE/projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml \
   --data-path /share/project/datasets/ImageNet/train \
-  --results-dir ./result_overfit \
+  --results-dir ./result_overfit_2_512 \
   --precision fp32 \
+  --image-size 512 \
   --global-batch-size 1 \
   # --ckpt /opt/tiger/vfm/decoder_only/latest.pt

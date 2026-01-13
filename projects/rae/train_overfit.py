@@ -251,14 +251,14 @@ def compute_train_loss(
 
     # Linear path: x_t = t * ε + (1 - t) * x_0
     x_t = t_broadcast * noise + (1.0 - t_broadcast) * x_latent
-
+    # print("x_t.shape",x_t.shape,model_kwargs)
     model_output = model(x_t, t, **model_kwargs)
 
     # 不 reduce：逐元素 MSE
     loss = F.mse_loss(model_output, x_latent, reduction="none")  # same shape as x_latent
 
     # reweight_scale 乘上去（按 batch 维广播）
-    reweight_scale = torch.clamp_max(1.0 / (t**2 + 1e-8), 10)  # [B]
+    reweight_scale = torch.clamp_max(1.0 / (t**2 + 1e-8), 20)  # [B]
     # print(reweight_scale)
     loss = loss * reweight_scale.view(B, 1, 1, 1)
     loss = loss.mean()
@@ -457,9 +457,9 @@ def main(args):
 
     # ---------------- time_shift & latent size ----------------
     # DINO latent 尺寸固定 (C=1280, H=W=16)
-    latent_size = (1280, 16, 16)
+    latent_size = (1280, (args.image_size // 16), (args.image_size // 16))
     # 你要求：time_shift = sqrt((16 * 16 * 1280) / 4096)
-    shift_dim = 16 * 16 * 1280
+    shift_dim = (args.image_size // 16) * (args.image_size // 16) * 1280
     shift_base = 4096
     time_shift = math.sqrt(shift_dim / shift_base)
 
@@ -543,7 +543,7 @@ def main(args):
         transforms.ToTensor(),                       # [0,1]
         transforms.Lambda(lambda t: t * 2.0 - 1.0),  # [-1,1]
     ])
-    image_path="/share/project/datasets/ImageNet/train/n10148035/n10148035_30.JPEG"
+    image_path="/share/project/huangxu/SAE/dinov3_overfit.png"
     dataset = OverfitSingleImageDataset(
         image_path=image_path,
         length=1024*1024,
@@ -712,7 +712,7 @@ def main(args):
                         dinov3_vae=dinov3_vae,
                         y=y_sample,
                         image_size=args.image_size,
-                        latent_shape=(1280, 16, 16),
+                        latent_shape=(1280,  args.image_size // 16,  args.image_size // 16),
                         stage2_steps=50,
                         vae_diffusion_steps=args.vae_diffusion_steps,
                         time_shift=time_shift,             # 你算出来的那个

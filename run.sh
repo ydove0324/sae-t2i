@@ -38,9 +38,11 @@ torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
   projects/rae/train.py \
   --config /share/project/huangxu/SAE/projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml \
   --data-path /share/project/datasets/ImageNet/train \
-  --results-dir ./result_v4 \
-  --precision fp32 \
+  --results-dir ./result_v5 \
   --global-batch-size 1024 \
-  --vae-ckpt /share/project/huangxu/sae_hx/diff_decoder/frozen_enc_vae_76000.pth
-  # --ckpt /share/project/huangxu/SAE/result/checkpoints/0130000.pt
+  --vae-ckpt /share/project/huangxu/models/SAE/models/ema_vae.pth \
+  --ckpt /share/project/huangxu/SAE/result_v5/checkpoints/latest.pt \
+  --use-cfg \
+  --cfg-prob 0.1 \
+    # --precision fp32 \ 默认
   # --ckpt /opt/tiger/vfm/decoder_only/latest.pt
