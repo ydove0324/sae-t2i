@@ -12,7 +12,6 @@ class CausalAutoencoderOutput(NamedTuple):
     sample: torch.Tensor
     latent: torch.Tensor
     posterior: Optional[DiagonalGaussianDistribution]
-    diffusion_mse_loss: Optional[torch.Tensor]
 
 class CausalEncoderOutput(NamedTuple):
     latent: torch.Tensor
@@ -550,3 +549,9 @@ class AutoencoderKL(nn.Module):
         x = self.decoder(z)
         x = self._denormalize_output(x)
         return CausalDecoderOutput(x)
+    def forward(self, x: torch.FloatTensor) -> CausalAutoencoderOutput:
+        z, p = self.encode(x)
+        assert x.size(-2) // z.size(-2) == self.spatial_downsample_factor
+        assert x.size(-1) // z.size(-1) == self.spatial_downsample_factor
+        x = self.decode(z).sample
+        return CausalAutoencoderOutput(x, z, p)

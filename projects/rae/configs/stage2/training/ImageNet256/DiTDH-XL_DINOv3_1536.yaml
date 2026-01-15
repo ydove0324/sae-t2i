@@ -70,7 +70,7 @@ training:
   final_lr: 0.00002
   beta: [0.9, 0.95]
   wd: 0.0
-  schedule_type: 'constant'
+  schedule_type: 'linear'
   decay_start_epoch: 40
   decay_end_epoch: 800
   clip_grad: 1.0

@@ -136,3 +136,53 @@ class OverfitSingleImageDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, self.label
+
+class SingleClassDataset(Dataset):
+    """
+    只加载指定的一个类别（target_class_index）。
+    用于微调或测试特定类别。
+    """
+    def __init__(self, root: str, index_synset_path: str, target_class_index: int, transform=None):
+        self.root = root
+        self.transform = transform
+        self.target_class_index = int(target_class_index)
+
+        # 1. 读取 index -> synset 的映射
+        self.index2synset, self.synset2index = load_index_synset_map(index_synset_path)
+
+        # 2. 检查这个 index 是否在 yaml 里
+        if self.target_class_index not in self.index2synset:
+            raise ValueError(f"Target index {self.target_class_index} not found in {index_synset_path}")
+
+        # 3. 构造该类别的具体路径
+        target_synset = self.index2synset[self.target_class_index]
+        class_dir = os.path.join(self.root, target_synset)
+
+        if not os.path.isdir(class_dir):
+            raise FileNotFoundError(f"Class directory not found: {class_dir} (synset: {target_synset})")
+
+        self.samples = []
+
+        # 4. 只读取该文件夹下的图片
+        # 使用 sorted 保证顺序一致
+        for fname in sorted(os.listdir(class_dir)):
+            if fname.lower().endswith((".jpeg", ".jpg", ".png", ".bmp", ".webp")):
+                img_path = os.path.join(class_dir, fname)
+                self.samples.append((img_path, self.target_class_index))
+
+        if len(self.samples) == 0:
+            raise RuntimeError(
+                f"No image samples found in {class_dir} for class index {self.target_class_index}"
+            )
+
+        print(f"[SingleClassDataset] Found {len(self.samples)} images for class {self.target_class_index} ({target_synset}).")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        img = Image.open(img_path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label

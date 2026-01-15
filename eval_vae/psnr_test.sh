@@ -14,8 +14,8 @@ torchrun --nproc_per_node=8 \
   --master_port=12732 \
   eval_vae/psnr_test.py \
   --data-path /share/project/datasets/ImageNet/val \
-  --vae-ckpt  /share/project/huangxu/models/SAE/models/ema_vae.pth \
+  --vae-ckpt /share/project/huangxu/SAE/results_vae/cnn_decoder_finetune_v2/step_5000.pth \
   --batch-size 16 \
   --diffusion-steps 4 \
   --max-images 50000 \
-  --output-dir eval_vae/vae_eval_test_cnn
+  --output-dir eval_vae/vae_eval_test_cnn_5000

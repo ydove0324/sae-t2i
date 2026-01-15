@@ -20,7 +20,7 @@ NUM_NODES=12  # 1个Master + 11个Worker
 MASTER_GPUS=8
 WORKER_GPUS_LIST=(8 8 8 8 8 8 8 8 8 8 8)  # 与 WORKER_NODES 数量一致
 MASTER_ADDR="job-427e70d4-bb80-4be6-87bc-101b3e139f7a-master-0"
-MASTER_PORT="27519"
+MASTER_PORT="27529"
 JOB_ID="100"
 
 # 训练脚本路径

@@ -31,15 +31,20 @@ export OMP_NUM_THREADS=4
 # echo "  MASTER_ADDR=$MASTER_ADDR"
 # echo "  MASTER_PORT=$MASTER_PORT"
 
-torchrun --nnodes=1 --node_rank=0 \
-  --nproc-per-node=1 \
-  --master_addr="localhost" \
-  --master_port=19291 \
+# torchrun --nnodes=1 --node_rank=0 \
+#   --nproc-per-node=8 \
+#   --master_addr="localhost" \
+#   --master_port=19291 \
+torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
+  --nproc-per-node=$NUM_GPUS \
+  --master_addr=$MASTER_ADDR \
+  --master_port=$MASTER_PORT \
   projects/rae/train_overfit.py \
   --config /share/project/huangxu/SAE/projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml \
   --data-path /share/project/datasets/ImageNet/train \
-  --results-dir ./result_overfit_2_512 \
+  --results-dir ./result_overfit_552_class \
   --precision fp32 \
-  --image-size 512 \
-  --global-batch-size 1 \
+  --image-size 256 \
+  --global-batch-size 512 \
+  --prediction-mode x
   # --ckpt /opt/tiger/vfm/decoder_only/latest.pt

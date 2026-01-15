@@ -2,31 +2,23 @@
 
 # 分布式训练节点配置
 WORKER_NODES=(
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-3
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-1
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-2
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-0
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-4
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-5
-job-9e1ddf42-fa45-413d-8feb-adcac7c07c99-master-0
-# job-b7373458-0c71-4964-8ac8-f59d684a98e7-worker-3
-# job-b7373458-0c71-4964-8ac8-f59d684a98e7-worker-4
-# job-b7373458-0c71-4964-8ac8-f59d684a98e7-worker-5
-# job-b7373458-0c71-4964-8ac8-f59d684a98e7-worker-6
+job-427e70d4-bb80-4be6-87bc-101b3e139f7a-worker-8 
+job-427e70d4-bb80-4be6-87bc-101b3e139f7a-worker-9 
+job-427e70d4-bb80-4be6-87bc-101b3e139f7a-worker-10 
 )
 
 # 节点配置
-NUM_NODES=8  # 1个Master + 7个Worker
+NUM_NODES=4  # 1个Master + 7个Worker
 MASTER_GPUS=8
-WORKER_GPUS_LIST=(8 8 8 8 8 8 8 8 8 8 8 8 8 8 8)  # 与 WORKER_NODES 数量一致
-MASTER_ADDR="job-f442ddcb-f3c4-495f-9e74-3491927b4c38-master-0"
+WORKER_GPUS_LIST=(8 8 8)  # 与 WORKER_NODES 数量一致
+MASTER_ADDR="job-427e70d4-bb80-4be6-87bc-101b3e139f7a-master-0"
 MASTER_PORT="27519"
 JOB_ID="100"
 
 # 训练脚本路径
-TRAIN_SCRIPT="./run.sh"
-LOG_FILE="log/dinov3_vae_dit_cfg_v6.log"
-TMUX_SESSION="dinov3_vae"
+TRAIN_SCRIPT="train_vae/train_vae.sh"
+LOG_FILE="log/dinov3_vae_cnn_decoder_v1.log"
+TMUX_SESSION="dinov3_vae_cnn_decoder"
 
 # Master节点启动
 echo "Starting training on Master node ($MASTER_GPUS GPUs)"
