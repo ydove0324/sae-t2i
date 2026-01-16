@@ -123,7 +123,7 @@ def load_vae(model_type, vae_checkpoint_path, device):
         "spatial_downsample_factor": 16,
         "use_quant_conv": False,
         "use_post_quant_conv": False,
-        "denormalize_decoder_output": True, # 注意：确认 cnn_decoder 是否支持此参数
+        "denormalize_decoder_output": False, # 注意：确认 cnn_decoder 是否支持此参数
     }
     
     # SAE 可能需要额外的参数

@@ -4,3 +4,5 @@ result*
 *.pt
 *.npz
 *.png
+*.tar
+logs/

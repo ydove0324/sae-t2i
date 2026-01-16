@@ -3,47 +3,64 @@
 
 """
 A minimal training script for SiT using PyTorch DDP.
+
+Features:
+- Stage2 flow-matching training in DINOv3 latent space
+- prediction_mode: x-pred (predict x0) or v-pred (predict v = eps - x0)
+- VAE decoder_type: diffusion_decoder (sae_model.AutoencoderKL) or cnn_decoder (cnn_decoder.AutoencoderKL)
+- dataset_type: overfit_single_image or single_class
+- periodic visualization (generation + recon/noisy/gt)
 """
 
 import os
+import sys
+import math
+import gc
+import argparse
+import logging
+from glob import glob
+from time import time
+from copy import deepcopy
+from collections import OrderedDict
+
+import numpy as np
+from PIL import Image
+
 import torch
-from tqdm.std import trange
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import ImageFolder
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
-import numpy as np
-from collections import OrderedDict
-from PIL import Image
-from copy import deepcopy
-from glob import glob
-from time import time
-import argparse
-import logging
+from torchvision.utils import save_image
 
-import sys
-sys.path.append(".")
-import math
-from torch.cuda.amp import autocast
 from omegaconf import OmegaConf
-# from models.rae.stage1 import RAE
+
+sys.path.append(".")
+
+# the first flag below was False when we tested this script but True makes A100 training a lot faster:
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 from models.rae.stage2.models import Stage2ModelProtocol
-# from models.rae.stage2.transport import create_transport, Sampler
 from models.rae.utils.train_utils import parse_configs
 from models.rae.utils.model_utils import instantiate_from_config
 from models.rae.utils import wandb_utils
 from models.rae.utils.optim_utils import build_optimizer, build_scheduler
-from sae_model import AutoencoderKL
-from dataset import ImageNetIdxDataset, OverfitSingleImageDataset,SingleClassDataset
-import gc
-import torch.nn.functional as F
-from torchvision.utils import save_image
-from torch.utils.tensorboard import SummaryWriter
+
+# === Diffusion decoder VAE ===
+from sae_model import AutoencoderKL as DiffusionAutoencoderKL
+
+# === Datasets ===
+from dataset import ImageNetIdxDataset, OverfitSingleImageDataset, SingleClassDataset
+
+# Optional CNN decoder import for decoder_type="cnn_decoder"
+try:
+    import cnn_decoder
+except ImportError:
+    cnn_decoder = None
 
 
 #################################################################################
@@ -57,7 +74,6 @@ def update_ema(ema_model, model, decay=0.9999):
     """
     ema_params = OrderedDict(ema_model.named_parameters())
     model_params = OrderedDict(model.named_parameters())
-
     for name, param in model_params.items():
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
@@ -81,15 +97,18 @@ def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if dist.get_rank() == 0:
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler(f"{logging_dir}/log.txt") if logging_dir is not None else logging.StreamHandler(),
+            ],
         )
         logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
+    else:
         logger = logging.getLogger(__name__)
         logger.addHandler(logging.NullHandler())
     return logger
@@ -100,24 +119,22 @@ def center_crop_arr(pil_image, image_size):
     Center cropping implementation from ADM.
     """
     while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
+        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
 
     scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
+    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
 
     arr = np.array(pil_image)
     crop_y = (arr.shape[0] - image_size) // 2
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
+
 def normalize_sae(tensor):
     ema_shift_factor = 0.0019670347683131695
     ema_scale_factor = 0.247765451669693
     return (tensor - ema_shift_factor) / ema_scale_factor
+
 
 def denormalize_sae(tensor):
     ema_shift_factor = 0.0019670347683131695
@@ -131,49 +148,83 @@ def denormalize_sae(tensor):
 
 @torch.no_grad()
 def reconstruct_from_latent_with_diffusion(
-    vae: AutoencoderKL,
+    vae,
     latent_z: torch.Tensor,
     image_shape: torch.Size,
     diffusion_steps: int = 25,
+    decoder_type: str = "diffusion_decoder",
 ) -> torch.Tensor:
     """
-    Given latent_z from DINO encoder (or model x-pred in the same latent space),
-    run the full diffusion decoder sampling loop to reconstruct images.
+    Given latent_z from DINO encoder (or model prediction in the same latent space),
+    run the full decoder reconstruction.
+
+    decoder_type:
+      - "diffusion_decoder": use sae_model.AutoencoderKL diffusion_decoder sampling loop
+      - "cnn_decoder":       use cnn_decoder.AutoencoderKL decode() directly (no diffusion loop)
     """
     device = latent_z.device
     z = denormalize_sae(latent_z)
 
-    if getattr(vae, "post_quant_conv", None) is not None and vae.post_quant_conv is not None:
-        z = vae.post_quant_conv(z)
+    if decoder_type == "diffusion_decoder":
+        if getattr(vae, "post_quant_conv", None) is not None and vae.post_quant_conv is not None:
+            z = vae.post_quant_conv(z)
 
-    context = vae.diffusion_decoder.get_context(z)
-    corrected_context = list(reversed(context[:]))
+        context = vae.diffusion_decoder.get_context(z)
+        corrected_context = list(reversed(context[:]))
 
-    diffusion = vae.diffusion_decoder.diffusion
-    diffusion.set_sample_schedule(diffusion_steps, device)
+        diffusion = vae.diffusion_decoder.diffusion
+        diffusion.set_sample_schedule(diffusion_steps, device)
 
-    init_noise = torch.randn(
-        image_shape,
-        device=device,
-        dtype=latent_z.dtype,
-    )
+        init_noise = torch.randn(
+            image_shape,
+            device=device,
+            dtype=latent_z.dtype,
+        )
 
-    recon = diffusion.p_sample_loop(
-        vae=vae,
-        shape=image_shape,
-        context=corrected_context,
-        clip_denoised=True,
-        init_noise=init_noise,
-        eta=0.0,
-    )
+        recon = diffusion.p_sample_loop(
+            vae=vae,
+            shape=image_shape,
+            context=corrected_context,
+            clip_denoised=True,
+            init_noise=init_noise,
+            eta=0.0,
+        )
+        return recon
 
-    return recon
+    elif decoder_type == "cnn_decoder":
+        if not hasattr(vae, "decode"):
+            raise AttributeError("VAE does not have decode(); cnn_decoder requires vae.decode(z).")
+        out = vae.decode(z)
+        recon = out.sample if hasattr(out, "sample") else out
+        return recon
+
+    else:
+        raise ValueError(f"Unknown decoder_type: {decoder_type}")
 
 
 def load_dinov3_vae(
     vae_checkpoint_path: str,
     device: torch.device,
-) -> AutoencoderKL:
+    decoder_type: str = "diffusion_decoder",
+):
+    """
+    Build and load DINOv3 AutoencoderKL.
+
+    decoder_type:
+      - "diffusion_decoder": sae_model.AutoencoderKL
+      - "cnn_decoder":       cnn_decoder.AutoencoderKL
+    """
+    if decoder_type == "cnn_decoder":
+        if cnn_decoder is None:
+            raise ImportError("cnn_decoder module not found, cannot use decoder_type='cnn_decoder'.")
+        AutoencoderClass = cnn_decoder.AutoencoderKL
+        print("[load_dinov3_vae] Using CNN decoder (cnn_decoder.AutoencoderKL).")
+    elif decoder_type == "diffusion_decoder":
+        AutoencoderClass = DiffusionAutoencoderKL
+        print("[load_dinov3_vae] Using diffusion decoder (sae_model.AutoencoderKL).")
+    else:
+        raise ValueError(f"Unknown decoder_type: {decoder_type}")
+
     model_params = {
         "in_channels": 3,
         "out_channels": 3,
@@ -187,14 +238,14 @@ def load_dinov3_vae(
         "spatial_downsample_factor": 16,
         "variational": False,
         "noise_tau": 0.0,
-        "denormalize_decoder_output": True,
+        "denormalize_decoder_output": False,
         "running_mode": "dec",
         "random_masking_channel_ratio": 0.0,
         "target_latent_channels": None,
         "lpips_weight": 0.1,
     }
 
-    vae = AutoencoderKL(**model_params).to(device)
+    vae = AutoencoderClass(**model_params).to(device)
 
     print(f"[load_dinov3_vae] Loading VAE checkpoint from: {vae_checkpoint_path}")
     checkpoint = torch.load(vae_checkpoint_path, map_location="cpu")
@@ -219,8 +270,16 @@ def compute_train_loss(
     x_latent: torch.Tensor,
     model_kwargs: dict,
     time_shift: float,
-    pred_mode: str = "x",  # === MODIFIED ===
+    pred_mode: str = "x",
 ):
+    """
+    Flow matching on linear path:
+      x_t = t * eps + (1 - t) * x0,  t in [0,1]
+
+    pred_mode:
+      - "x": model predicts x0
+      - "v": model predicts v = dx/dt = eps - x0
+    """
     B = x_latent.size(0)
     device = x_latent.device
 
@@ -231,25 +290,22 @@ def compute_train_loss(
     t = (time_shift * t) / (1.0 + (time_shift - 1.0) * t)
     t_broadcast = t.view(B, 1, 1, 1)
 
-    # Linear interpolation: x_t = t * noise + (1 - t) * data
     x_t = t_broadcast * noise + (1.0 - t_broadcast) * x_latent
-    
+
     model_output = model(x_t, t, **model_kwargs)
 
     if pred_mode == "x":
-        # Target is x_0 (x_latent)
         target = x_latent
         loss = F.mse_loss(model_output, target, reduction="none")
         # x-pred reweighting to balance boundaries
-        reweight_scale = torch.clamp_max(1.0 / (t**2 + 1e-8), 20)
+        reweight_scale = torch.clamp_max(1.0 / (t**2 + 1e-8), 20.0)
         loss = loss * reweight_scale.view(B, 1, 1, 1)
-        
+
     elif pred_mode == "v":
-        # Target is velocity v = dx/dt = noise - x_latent
         target = noise - x_latent
         loss = F.mse_loss(model_output, target, reduction="none")
-        # v-pred typically uses uniform weighting (weight=1)
-    
+        # v-pred usually uses uniform weighting
+
     else:
         raise ValueError(f"Unknown pred_mode: {pred_mode}")
 
@@ -261,22 +317,24 @@ def compute_train_loss(
 def sample_latent_linear_50_steps(
     model,
     batch_size: int,
-    latent_shape: tuple,
+    latent_shape: tuple,   # (C,H,W)
     device: torch.device,
     y: torch.Tensor,
     time_shift: float,
     steps: int = 50,
     init_noise: torch.Tensor | None = None,
-    pred_mode: str = "x",  # === MODIFIED ===
+    pred_mode: str = "x",
 ):
     """
-    Sample latent z0 using deterministic solver (x-pred or v-pred).
+    Deterministic solver in latent space, stepping t from 1 -> 0.
+    Supports both x-pred and v-pred.
+
+    Note: this is an Euler-style integrator for v-pred, and DDIM-like update for x-pred.
     """
     model_inner = model.module if hasattr(model, "module") else model
     model_inner.eval()
 
     C, H, W = latent_shape
-
     if init_noise is None:
         x = torch.randn((batch_size, C, H, W), device=device, dtype=torch.float32)
     else:
@@ -288,7 +346,6 @@ def sample_latent_linear_50_steps(
         t = (shift * t_lin) / (1.0 + (shift - 1.0) * t_lin)
         return t.clamp(0.0, 1.0 - 1e-6)
 
-    # Iterate t from 1.0 down to 0.0
     for i in range(steps, 0, -1):
         t_lin = torch.full((batch_size,), i / steps, device=device, dtype=torch.float32)
         t_next_lin = torch.full((batch_size,), (i - 1) / steps, device=device, dtype=torch.float32)
@@ -297,22 +354,24 @@ def sample_latent_linear_50_steps(
         t_next = flow_shift(t_next_lin)
 
         model_out = model_inner(x, t, y=y)
-        
+
         t_scalar = t.view(batch_size, 1, 1, 1)
         t_next_scalar = t_next.view(batch_size, 1, 1, 1)
 
         if pred_mode == "x":
-            # === X-Prediction Solver ===
+            # x-pred DDIM-like step:
             x0_hat = model_out
             eps_hat = (x - (1.0 - t_scalar) * x0_hat) / (t_scalar + 1e-8)
             x = t_next_scalar * eps_hat + (1.0 - t_next_scalar) * x0_hat
-            
+
         elif pred_mode == "v":
-            # === V-Prediction Solver (Euler) ===
-            # ODE: dx/dt = v. We step from t to t_next (dt < 0)
+            # v-pred Euler step for ODE dx/dt = v:
             v_pred = model_out
             dt = t_next_scalar - t_scalar
             x = x + v_pred * dt
+
+        else:
+            raise ValueError(f"Unknown pred_mode: {pred_mode}")
 
     return x
 
@@ -328,7 +387,8 @@ def stage2_sample_and_reconstruct(
     vae_diffusion_steps: int = 25,
     time_shift: float = 1.0,
     device: torch.device | None = None,
-    pred_mode: str = "x",  # === MODIFIED ===
+    pred_mode: str = "x",
+    decoder_type: str = "diffusion_decoder",
 ):
     if device is None:
         device = y.device
@@ -336,7 +396,6 @@ def stage2_sample_and_reconstruct(
     B = y.shape[0]
     y = y.to(device)
 
-    # 1) latent sampling
     z0_hat = sample_latent_linear_50_steps(
         model=model,
         batch_size=B,
@@ -348,14 +407,13 @@ def stage2_sample_and_reconstruct(
         pred_mode=pred_mode,
     )
 
-    # 2) diffusion reconstruct to image
     img = reconstruct_from_latent_with_diffusion(
         vae=dinov3_vae,
         latent_z=z0_hat,
         image_shape=torch.Size([B, 3, image_size, image_size]),
         diffusion_steps=vae_diffusion_steps,
+        decoder_type=decoder_type,
     )
-
     return img, z0_hat
 
 
@@ -364,7 +422,6 @@ def stage2_sample_and_reconstruct(
 #################################################################################
 
 def main(args):
-    """Trains a new SiT model using config-driven hyperparameters + DINO VAE."""
     if not torch.cuda.is_available():
         raise RuntimeError("Training currently requires at least one GPU.")
 
@@ -383,22 +440,22 @@ def main(args):
             return {}
         return OmegaConf.to_container(cfg_section, resolve=True)
 
-    misc = to_dict(misc_config)
     training_cfg = to_dict(training_config)
 
     grad_accum_steps = int(training_cfg.get("grad_accum_steps", 1))
     clip_grad = float(training_cfg.get("clip_grad", 1.0))
     ema_decay = float(training_cfg.get("ema_decay", 0.9995))
     epochs = int(training_cfg.get("epochs", 1400))
-    if args.global_batch_size is not None:
-        global_batch_size = args.global_batch_size
-    else:
-        global_batch_size = int(training_cfg.get("global_batch_size", 1024))
     num_workers = int(training_cfg.get("num_workers", 4))
     log_every = int(training_cfg.get("log_every", 100))
     ckpt_every = int(training_cfg.get("ckpt_every", 5_000))
     default_seed = int(training_cfg.get("global_seed", 0))
     global_seed = args.global_seed if args.global_seed is not None else default_seed
+
+    if args.global_batch_size is not None:
+        global_batch_size = args.global_batch_size
+    else:
+        global_batch_size = int(training_cfg.get("global_batch_size", 1024))
 
     if args.image_size % 16 != 0:
         raise ValueError("Image size must be divisible by 16 for the VAE encoder (downsample_factor=16).")
@@ -406,9 +463,10 @@ def main(args):
     # ---------------- DDP init ----------------
     dist.init_process_group("nccl")
     world_size = dist.get_world_size()
-    
+
     if global_batch_size % (world_size * grad_accum_steps) != 0:
         raise ValueError("Global batch size must be divisible by world_size * grad_accum_steps.")
+
     rank = dist.get_rank()
     device_idx = rank % torch.cuda.device_count()
     torch.cuda.set_device(device_idx)
@@ -421,10 +479,11 @@ def main(args):
         print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
     micro_batch_size = global_batch_size // (world_size * grad_accum_steps)
+
     use_bf16 = args.precision == "bf16"
     if use_bf16 and not torch.cuda.is_bf16_supported():
         raise ValueError("Requested bf16 precision, but the current CUDA device does not support bfloat16.")
-    
+
     # ---------------- time_shift & latent size ----------------
     shift_dim = (args.image_size // 16) * (args.image_size // 16) * 1280
     shift_base = 4096
@@ -439,10 +498,9 @@ def main(args):
         model_string_name = model_target.split(".")[-1]
         precision_suffix = f"-{args.precision}" if args.precision == "bf16" else ""
 
-        # Include pred_mode in name
         experiment_name = (
             f"{experiment_index:03d}-{model_string_name}-"
-            f"flowmatch-{args.prediction_mode}pred{precision_suffix}-acc{grad_accum_steps}"
+            f"flowmatch-{args.prediction_mode}pred-{args.decoder_type}{precision_suffix}-acc{grad_accum_steps}"
         )
 
         experiment_dir = os.path.join(args.results_dir, "experiment")
@@ -452,7 +510,8 @@ def main(args):
 
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
-        logger.info(f"Prediction Mode: {args.prediction_mode.upper()}") # Log pred mode
+        logger.info(f"Prediction Mode: {args.prediction_mode.upper()}")
+        logger.info(f"Decoder Type: {args.decoder_type}")
 
         # TensorBoard
         tb_dir = os.path.join(experiment_dir, "tensorboard")
@@ -470,8 +529,8 @@ def main(args):
         writer = None
 
     # ---------------- load DINO VAE ----------------
-    dinov3_vae = load_dinov3_vae(args.vae_ckpt, device)
-    
+    dinov3_vae = load_dinov3_vae(args.vae_ckpt, device, decoder_type=args.decoder_type)
+
     # ---------------- Stage2 model ----------------
     model: Stage2ModelProtocol = instantiate_from_config(model_config).to(device)
     ema = deepcopy(model).to(device)
@@ -507,20 +566,27 @@ def main(args):
         transforms.ToTensor(),                       # [0,1]
         transforms.Lambda(lambda t: t * 2.0 - 1.0),  # [-1,1]
     ])
-    # image_path="/share/project/huangxu/SAE/dinov3_overfit.png"
-    # dataset = OverfitSingleImageDataset(
-    #     image_path=image_path,
-    #     length=1024*1024,
-    #     label=0,
-    #     transform=transform,
-    # )
+
     index_synset_path = "/share/project/datasets/ImageNet/train/index_synset.yaml"
-    dataset = SingleClassDataset(
-        root=args.data_path, 
-        index_synset_path=index_synset_path, 
-        target_class_index=552, 
-        transform=transform
-    )
+
+    if args.dataset_type == "overfit_single_image":
+        image_path = args.overfit_image_path
+        dataset = OverfitSingleImageDataset(
+            image_path=image_path,
+            length=args.overfit_length,
+            label=args.overfit_label,
+            transform=transform,
+        )
+    elif args.dataset_type == "single_class":
+        dataset = SingleClassDataset(
+            root=args.data_path,
+            index_synset_path=index_synset_path,
+            target_class_index=args.single_class_index,
+            transform=transform,
+        )
+    else:
+        raise ValueError(f"Unknown dataset_type: {args.dataset_type}")
+
     sampler = DistributedSampler(
         dataset,
         num_replicas=world_size,
@@ -528,6 +594,7 @@ def main(args):
         shuffle=True,
         seed=global_seed,
     )
+
     loader = DataLoader(
         dataset,
         batch_size=micro_batch_size,
@@ -537,19 +604,22 @@ def main(args):
         pin_memory=True,
         drop_last=True,
     )
-    logger.info(f"Dataset contains {len(dataset):,} images")
-    
+
+    logger.info(f"Dataset contains {len(dataset):,} samples")
     loader_batches = len(loader)
-    steps_per_epoch = loader_batches // grad_accum_steps
+    steps_per_epoch = max(1, loader_batches // grad_accum_steps)
     schedl, sched_msg = build_scheduler(opt, steps_per_epoch, training_cfg, sched_state)
-    
+
     # Init EMA
-    update_ema(ema, model.module, decay=0)
+    update_ema(ema, model.module, decay=0.0)
     model.train()
     ema.eval()
 
     logger.info(f"Training for {epochs} epochs...")
-    log_every = 10
+    # You overwrote log_every to 10 in your first script; keep configurable but default to config value.
+    if args.force_log_every is not None:
+        log_every = int(args.force_log_every)
+
     log_steps = 0
     running_loss = 0.0
     start_time = time()
@@ -564,16 +634,14 @@ def main(args):
             x_img = x_img.to(device)
             y = y.to(device)
 
-            # GT [0,1] for vis
             img_gt = (x_img + 1.0) / 2.0
 
             with torch.no_grad():
-                x_latent, p = dinov3_vae.encode(x_img)
+                x_latent, _p = dinov3_vae.encode(x_img)
                 x_latent = normalize_sae(x_latent)
 
             model_kwargs = dict(y=y)
 
-            # === MODIFIED: Pass pred_mode ===
             loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
                 model=model,
                 x_latent=x_latent,
@@ -582,21 +650,20 @@ def main(args):
                 pred_mode=args.prediction_mode,
             )
 
-            # NaN Check
+            # NaN check across ranks
             is_nan_local = 0 if torch.isfinite(loss_tensor) else 1
             is_nan = torch.tensor(is_nan_local, device=device)
             dist.all_reduce(is_nan, op=dist.ReduceOp.SUM)
 
             if is_nan.item() > 0:
                 if rank == 0:
-                    logger.warning(f"[step {train_steps}] NaN detected! Resuming...")
+                    logger.warning(f"[step {train_steps}] NaN detected! Skipping step.")
                 dist.barrier()
-                # ... (Resume logic same as before, simplified for brevity but functional logic is implied) ...
-                # For this snippet I'm keeping it simple, assuming robust training data.
+                opt.zero_grad(set_to_none=True)
                 continue
 
             step_loss_accum += loss_tensor.item()
-            loss_tensor /= grad_accum_steps
+            loss_tensor = loss_tensor / grad_accum_steps
             loss_tensor.backward()
             accum_counter += 1
 
@@ -606,12 +673,12 @@ def main(args):
             if clip_grad > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
             else:
-                grad_norm = 0.0
-                
+                grad_norm = torch.tensor(0.0, device=device)
+
             opt.step()
             schedl.step()
             update_ema(ema, model.module, decay=ema_decay)
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
 
             running_loss += step_loss_accum / grad_accum_steps
             log_steps += 1
@@ -620,38 +687,37 @@ def main(args):
             step_loss_accum = 0.0
 
             # ---------------- Visualization ----------------
-            show_time = 50
+            show_time = args.vis_every
             DEBUG = False
             if rank == 0 and ((train_steps % show_time == 0) or DEBUG):
                 with torch.no_grad():
                     y_sample = y[:1]
-                    
-                    # 1. Full Sampling (Generation)
+
+                    # 1) Full sampling (generation)
                     img_gen, z_gen = stage2_sample_and_reconstruct(
                         model=model,
                         dinov3_vae=dinov3_vae,
                         y=y_sample,
                         image_size=args.image_size,
                         latent_shape=(1280, args.image_size // 16, args.image_size // 16),
-                        stage2_steps=50,
+                        stage2_steps=args.stage2_steps,
                         vae_diffusion_steps=args.vae_diffusion_steps,
                         time_shift=time_shift,
                         device=device,
-                        pred_mode=args.prediction_mode, # === MODIFIED ===
+                        pred_mode=args.prediction_mode,
+                        decoder_type=args.decoder_type,
                     )
 
                     img_gen_01 = (img_gen + 1.0) / 2.0
                     vis_dir = os.path.join(experiment_dir, "samples")
                     os.makedirs(vis_dir, exist_ok=True)
-                    save_image(img_gen_01, os.path.join(vis_dir, f"gen_step_{train_steps:07d}.png"))
+                    save_image(img_gen_01.clamp(0, 1), os.path.join(vis_dir, f"gen_step_{train_steps:07d}.png"))
 
-                    # 2. One-step Reconstruction Monitor
-                    # Need to convert model output (x or v) to x0 for reconstruction
+                    # 2) One-step reconstruction monitor
                     if args.prediction_mode == "x":
                         x0_pred_step = pred_latent[0:1]
                     else:
-                        # v = noise - x0  => x0 = noise - v
-                        # noise from compute_train_loss is [B,...], take [0:1]
+                        # v = eps - x0  => x0 = eps - v
                         x0_pred_step = noise[0:1] - pred_latent[0:1]
 
                     recon = reconstruct_from_latent_with_diffusion(
@@ -659,50 +725,55 @@ def main(args):
                         latent_z=x0_pred_step,
                         image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
                         diffusion_steps=args.vae_diffusion_steps,
+                        decoder_type=args.decoder_type,
                     )
-                    
-                    # Original Noisy Input Reconstruction
-                    # x_t = t*noise + (1-t)*x0
-                    x_latent_noisy = x_latent[0:1] * (1 - t_sample[0]) + noise[0:1] * t_sample[0]
+
+                    # Original noisy latent reconstruction monitor
+                    # x_t = t*eps + (1-t)*x0
+                    t0 = t_sample[0].view(1, 1, 1, 1)
+                    x_latent_noisy = x_latent[0:1] * (1.0 - t0) + noise[0:1] * t0
+
                     x_recon_noisy = reconstruct_from_latent_with_diffusion(
                         vae=dinov3_vae,
                         latent_z=x_latent_noisy,
                         image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
                         diffusion_steps=args.vae_diffusion_steps,
+                        decoder_type=args.decoder_type,
                     )
 
                     recon_img = (recon + 1.0) / 2.0
                     x_recon_img = (x_recon_noisy + 1.0) / 2.0
-                    
+
                     vis_dir_recon = os.path.join(experiment_dir, "recon")
                     os.makedirs(vis_dir_recon, exist_ok=True)
-                    
-                    t_val = int(t_sample[0].item() * 1000)
-                    save_image(x_recon_img, os.path.join(vis_dir_recon, f"noisy_step_{train_steps:07d}_t{t_val}.png"))
-                    save_image(recon_img, os.path.join(vis_dir_recon, f"recon_step_{train_steps:07d}_t{t_val}.png"))
-                    save_image(img_gt[0:1], os.path.join(vis_dir_recon, f"gt_step_{train_steps:07d}.png"))
 
-                logger.info(f"[step {train_steps}] Saved reconstruction and GT image.")
+                    t_val = int(t_sample[0].item() * 1000)
+                    save_image(x_recon_img.clamp(0, 1), os.path.join(vis_dir_recon, f"noisy_step_{train_steps:07d}_t{t_val}.png"))
+                    save_image(recon_img.clamp(0, 1), os.path.join(vis_dir_recon, f"recon_step_{train_steps:07d}_t{t_val}.png"))
+                    save_image(img_gt[0:1].clamp(0, 1), os.path.join(vis_dir_recon, f"gt_step_{train_steps:07d}.png"))
+
+                logger.info(f"[step {train_steps}] Saved generation/reconstruction images.")
 
             # ---------------- Logging ----------------
             if train_steps % log_every == 0:
                 torch.cuda.synchronize()
                 end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                steps_per_sec = log_steps / max(1e-9, (end_time - start_time))
+
+                avg_loss = torch.tensor(running_loss / max(1, log_steps), device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / world_size
 
                 if rank == 0:
                     print(
-                        f"(step={train_steps:07d}) Mode={args.prediction_mode} "
+                        f"(step={train_steps:07d}) Mode={args.prediction_mode} Decoder={args.decoder_type} "
                         f"Loss: {avg_loss:.4f}, Steps/Sec: {steps_per_sec:.2f} "
-                        f"Grad Norm {grad_norm:.4f}"
+                        f"GradNorm: {float(grad_norm):.4f}"
                     )
                     if writer is not None:
                         writer.add_scalar("train/loss", avg_loss, global_step=train_steps)
                         writer.add_scalar("train/steps_per_sec", steps_per_sec, global_step=train_steps)
-                        writer.add_scalar("train/grad_norm", grad_norm, global_step=train_steps)
+                        writer.add_scalar("train/grad_norm", float(grad_norm), global_step=train_steps)
 
                 running_loss = 0.0
                 log_steps = 0
@@ -717,7 +788,7 @@ def main(args):
                         "opt": opt.state_dict(),
                         "scheduler": schedl.state_dict(),
                         "train_steps": train_steps,
-                        "args": args,
+                        "args": vars(args),
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
@@ -732,7 +803,7 @@ def main(args):
                         "opt": opt.state_dict(),
                         "scheduler": schedl.state_dict(),
                         "train_steps": train_steps,
-                        "args": args,
+                        "args": vars(args),
                     }
                     latest_path = f"{checkpoint_dir}/latest.pt"
                     torch.save(snapshot, latest_path)
@@ -757,11 +828,51 @@ if __name__ == "__main__":
     parser.add_argument("--global-batch-size", type=int, default=None, help="Override training.global_batch_size from the config.")
 
     # VAE Args
-    parser.add_argument("--vae-ckpt", type=str, default="/share/project/huangxu/sae_hx/diff_decoder/tuned_enc_vae_26000.pth", help="")
+    parser.add_argument(
+        "--vae-ckpt",
+        type=str,
+        default="/share/project/huangxu/sae_hx/diff_decoder/tuned_enc_vae_26000.pth",
+        help="VAE checkpoint path",
+    )
     parser.add_argument("--vae-diffusion-steps", type=int, default=25, help="Sampling steps for VAE diffusion decoder.")
-    
-    # === Prediction Mode ===
-    parser.add_argument("--prediction-mode", type=str, choices=["x", "v"], default="x", help="Prediction mode: 'x' (predict x0) or 'v' (predict velocity).")
+
+    # === NEW: decoder type ===
+    parser.add_argument(
+        "--decoder-type",
+        type=str,
+        default="cnn_decoder",
+        choices=["diffusion_decoder", "cnn_decoder"],
+        help="Choose VAE decoder type: 'diffusion_decoder' (sae_model.AutoencoderKL) or 'cnn_decoder' (cnn_decoder.AutoencoderKL).",
+    )
+
+    # Dataset choice
+    parser.add_argument(
+        "--dataset-type",
+        type=str,
+        choices=["overfit_single_image", "single_class"],
+        default="single_class",
+        help="Choose dataset: 'overfit_single_image' or 'single_class'.",
+    )
+    # overfit options
+    parser.add_argument("--overfit-image-path", type=str, default="/share/project/huangxu/SAE/dinov3_overfit.png")
+    parser.add_argument("--overfit-length", type=int, default=1024 * 1024)
+    parser.add_argument("--overfit-label", type=int, default=0)
+    # single-class options
+    parser.add_argument("--single-class-index", type=int, default=552)
+
+    # Prediction Mode
+    parser.add_argument(
+        "--prediction-mode",
+        type=str,
+        choices=["x", "v"],
+        default="x",
+        help="Prediction mode: 'x' (predict x0) or 'v' (predict velocity v=eps-x0).",
+    )
+
+    # sampling/vis knobs
+    parser.add_argument("--vis-every", type=int, default=50, help="Save visualization every N train steps.")
+    parser.add_argument("--stage2-steps", type=int, default=50, help="Stage2 sampling steps for visualization/generation.")
+    parser.add_argument("--force-log-every", type=int, default=None, help="Force log_every override (else use config).")
 
     args = parser.parse_args()
     main(args)

@@ -8,14 +8,16 @@ unset PET_NNODES
 unset PET_NODE_RANK
 unset PET_MASTER_ADDR
 
+VAE_CKPT="/share/project/huangxu/models/SAE/diffusion_decoder/kl100/ema_vae.pth"
+
 torchrun --nproc_per_node=8 \
   --node_rank=0 \
   --master_addr="localhost" \
   --master_port=12732 \
   eval_vae/psnr_test.py \
   --data-path /share/project/datasets/ImageNet/val \
-  --vae-ckpt /share/project/huangxu/SAE/results_vae/cnn_decoder_finetune_v2/step_5000.pth \
-  --batch-size 16 \
+  --vae-ckpt $VAE_CKPT \
+  --batch-size 32 \
   --diffusion-steps 4 \
   --max-images 50000 \
-  --output-dir eval_vae/vae_eval_test_cnn_5000
+  --output-dir eval_vae/vae_eval_test_ema_cnn_kl100

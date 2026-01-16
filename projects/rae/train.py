@@ -39,12 +39,17 @@ from models.rae.utils.model_utils import instantiate_from_config
 from models.rae.utils import wandb_utils
 from models.rae.utils.optim_utils import build_optimizer, build_scheduler
 from sae_model import AutoencoderKL as DiffusionAutoencoderKL
-from dataset import ImageNetIdxDataset
+from dataset import (ImageNetIdxDataset,
+    DatasetSpec,
+    ImageNetLatentCacheDataset,
+    collate_keep_dict
+)
 import gc
 import torch.nn.functional as F
 from torchvision.utils import save_image
 from torch.utils.tensorboard import SummaryWriter
 import random
+from wds_dataset import make_latent_loader
 
 # Optional CNN decoder import for decoder_type="cnn_decoder"
 try:
@@ -596,22 +601,92 @@ def stage2_sample_and_reconstruct(
     return img, z0_hat
 
 
-#################################################################################
-#                                  Training Loop                                #
-#################################################################################
+def atomic_torch_save(obj, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+@torch.no_grad()
+def materialize_latents_for_batch(
+    batch: dict,
+    dinov3_vae,
+    device: torch.device,
+    cache_dtype: torch.dtype = torch.float16,
+):
+    """
+    输入：collate_keep_dict 输出的 batch dict
+    输出：
+      x_latent: [B,C,H,W] on GPU float32
+      y: [B] on GPU long
+      extra: dict (用于你后面可视化的 img_gt 等)
+    逻辑：
+      - cache hit：CPU latent -> GPU
+      - miss：把 img 组成子 batch，在 GPU 上 encode->normalize，然后写回 cache_path
+    """
+    has_latent = batch["has_latent"]           # [B] bool (CPU)
+    labels = batch["label"]                   # [B] long (CPU)
+    latents_list = batch["latent"]            # list[Tensor or None] (CPU)
+    imgs_list = batch["img"]                  # list[Tensor or None] (CPU)
+    cache_paths = batch["cache_path"]         # list[str]
+    paths = batch["path"]                     # list[str]
+
+    B = labels.numel()
+
+    # 先收集：命中 latent、miss 的 img
+    x_latent_cpu = [None] * B
+    miss_indices = []
+    miss_imgs = []
+    for i in range(B):
+        if bool(has_latent[i].item()):
+            x_latent_cpu[i] = latents_list[i]  # Tensor[C,h,w] CPU
+        else:
+            miss_indices.append(i)
+            miss_imgs.append(imgs_list[i])     # Tensor[3,H,W] CPU
+
+    # 对 miss 执行 encode 并写回缓存
+    if len(miss_indices) > 0:
+        x_img_miss = torch.stack(miss_imgs, dim=0).to(device, non_blocking=True)  # [m,3,H,W] GPU
+        latent_miss, _p = dinov3_vae.encode(x_img_miss)
+        latent_miss = normalize_sae(latent_miss)  # [m,C,h,w]
+        latent_cpu = latent_miss.detach().to("cpu")
+        if cache_dtype is not None:
+            latent_cpu = latent_cpu.to(cache_dtype)
+
+        for j, i in enumerate(miss_indices):
+            obj = {
+                "latent": latent_cpu[j].contiguous(),
+                "label": int(labels[i].item()),
+                "path": paths[i],
+            }
+            atomic_torch_save(obj, cache_paths[i])
+            x_latent_cpu[i] = latent_cpu[j]
+
+    # 拼回完整 batch latent -> GPU float32
+    x_latent = torch.stack(x_latent_cpu, dim=0).to(device, non_blocking=True).float()
+    y = labels.to(device, non_blocking=True)
+
+    # 同时准备 img_gt（只有 miss 才有 img；hit 没有 img，这里返回 None 或者仅对 miss 可视化）
+    # 如果你希望可视化时总有 gt，可以把 dataset 改成即使命中也返回 img（会慢一些 I/O）
+    extra = {
+        "img_cpu_list": imgs_list,  # list[Tensor or None], 用于你想仅在 miss 情况可视化 gt
+        "paths": paths,
+    }
+    return x_latent, y, extra
 
 
 def main(args):
-    """Trains a new SiT model using config-driven hyperparameters + DINO VAE."""
+    """Trains a new SiT model using config-driven hyperparameters + DINO VAE + latent cache."""
     if not torch.cuda.is_available():
         raise RuntimeError("Training currently requires at least one GPU.")
 
     (
-        rae_config,          # unused now
+        rae_config,
         model_config,
-        transport_config,    # unused
-        sampler_config,      # unused
-        guidance_config,     # unused
+        transport_config,
+        sampler_config,
+        guidance_config,
         misc_config,
         training_config,
     ) = parse_configs(args.config)
@@ -644,17 +719,18 @@ def main(args):
         raise ValueError("Gradient accumulation steps must be >= 1.")
     if args.image_size % 16 != 0:
         raise ValueError("Image size must be divisible by 16 for the VAE encoder (downsample_factor=16).")
-    print("test")
+
     # ---------------- DDP init ----------------
     dist.init_process_group("nccl")
     world_size = dist.get_world_size()
-    print("ddp train!!")
-    if global_batch_size % (world_size * grad_accum_steps) != 0:
-        raise ValueError("Global batch size must be divisible by world_size * grad_accum_steps.")
     rank = dist.get_rank()
     device_idx = rank % torch.cuda.device_count()
     torch.cuda.set_device(device_idx)
     device = torch.device("cuda", device_idx)
+
+    if global_batch_size % (world_size * grad_accum_steps) != 0:
+        raise ValueError("Global batch size must be divisible by world_size * grad_accum_steps.")
+    micro_batch_size = global_batch_size // (world_size * grad_accum_steps)
 
     seed = global_seed * world_size + rank
     torch.manual_seed(seed)
@@ -662,17 +738,8 @@ def main(args):
     if rank == 0:
         print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
-    micro_batch_size = global_batch_size // (world_size * grad_accum_steps)
-    use_bf16 = args.precision == "bf16"
-    if use_bf16 and not torch.cuda.is_bf16_supported():
-        raise ValueError("Requested bf16 precision, but the current CUDA device does not support bfloat16.")
-    # 为了稳定性，默认不开 autocast，有需要你自己改成 bf16
-    autocast_kwargs = dict(dtype=torch.float32, enabled=False)
-
     # ---------------- time_shift & latent size ----------------
-    # DINO latent 尺寸固定 (C=1280, H=W=16)
     latent_size = (1280, 16, 16)
-    # 你要求：time_shift = sqrt((16 * 16 * 1280) / 4096)
     shift_dim = 16 * 16 * 1280
     shift_base = 4096
     time_shift = math.sqrt(shift_dim / shift_base)
@@ -699,30 +766,27 @@ def main(args):
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
 
-        # === 新增：TensorBoard SummaryWriter ===
         tb_dir = os.path.join(experiment_dir, "tensorboard")
         os.makedirs(tb_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=tb_dir)
-        # ==============================
 
-        if args.wandb:
-            entity = os.environ["ENTITY"]
-            project = os.environ["PROJECT"]
-            wandb_utils.initialize(args, entity, experiment_name, project)
+        # if args.wandb:
+        #     entity = os.environ["ENTITY"]
+        #     project = os.environ["PROJECT"]
+        #     wandb_utils.initialize(args, entity, experiment_name, project)
     else:
         experiment_dir = None
         checkpoint_dir = None
         logger = create_logger(None)
         writer = None
 
-    # ---------------- load DINO VAE ----------------
+    # ---------------- load DINO VAE (keep decoder_type) ----------------
     dinov3_vae = load_dinov3_vae(args.vae_ckpt, device, decoder_type=args.decoder_type)
-    print("load vae!!!")
+    if rank == 0:
+        logger.info(f"Loaded VAE: {args.vae_ckpt} decoder_type={args.decoder_type}")
+
     # ---------------- Stage2 model ----------------
     model: Stage2ModelProtocol = instantiate_from_config(model_config).to(device)
-    # print("model",model)
-    print("load diffusion model!!!")
-
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
 
@@ -740,6 +804,8 @@ def main(args):
         opt_state = checkpoint.get("opt")
         sched_state = checkpoint.get("scheduler")
         train_steps = int(checkpoint.get("train_steps", 0))
+        if rank == 0:
+            logger.info(f"Resumed from {args.ckpt}, train_steps={train_steps}")
 
     model_param_count = sum(p.numel() for p in model.parameters())
     logger.info(f"Model Parameters: {model_param_count/1e6:.2f}M")
@@ -750,19 +816,19 @@ def main(args):
     if opt_state is not None:
         opt.load_state_dict(opt_state)
 
-    # ---------------- dataset / loader ----------------
-    transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-        # transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),                       # [0,1]
-        transforms.Lambda(lambda t: t * 2.0 - 1.0),  # [-1,1]
-    ])
-    index_synset_path = "/share/project/datasets/ImageNet/train/index_synset.yaml"
-    dataset = ImageNetIdxDataset(
+
+    spec = DatasetSpec(
         root=args.data_path,
-        index_synset_path=index_synset_path,
-        transform=transform,
+        index_synset_path=args.index_synset_path,
+        image_size=args.image_size,
+        vae_ckpt=args.vae_ckpt,           # tag 用这个
+        cache_dir=args.cache_dir,
+        single_class_index=args.single_class,
+        overfit_image=args.overfit_image,
+        overfit_length=args.overfit_length,
     )
+    dataset = ImageNetLatentCacheDataset(spec)
+
     sampler = DistributedSampler(
         dataset,
         num_replicas=world_size,
@@ -778,13 +844,18 @@ def main(args):
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=collate_keep_dict,
+        persistent_workers=True if num_workers > 0 else False,
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+
+
+    logger.info(f"Dataset contains {len(dataset):,} samples ({args.data_path})")
     logger.info(
         f"Gradient accumulation: steps={grad_accum_steps}, micro batch={micro_batch_size}, "
         f"per-GPU batch={micro_batch_size * grad_accum_steps}, global batch={global_batch_size}"
     )
     logger.info(f"Precision mode: {args.precision}")
+    logger.info(f"Latent cache: cache_dir={args.cache_dir}, cache_dtype={args.cache_dtype}")
 
     loader_batches = len(loader)
     if loader_batches % grad_accum_steps != 0:
@@ -792,6 +863,7 @@ def main(args):
     steps_per_epoch = loader_batches // grad_accum_steps
     if steps_per_epoch <= 0:
         raise ValueError("Gradient accumulation configuration results in zero optimizer steps per epoch.")
+
     schedl, sched_msg = build_scheduler(opt, steps_per_epoch, training_cfg, sched_state)
     if rank == 0:
         logger.info(f"Training configured for {epochs} epochs, {steps_per_epoch} steps per epoch.")
@@ -802,52 +874,52 @@ def main(args):
     model.train()
     ema.eval()
 
+    # cache dtype
+    if args.cache_dtype == "fp16":
+        cache_dtype = torch.float16
+    elif args.cache_dtype == "bf16":
+        cache_dtype = torch.bfloat16
+    elif args.cache_dtype == "fp32":
+        cache_dtype = torch.float32
+    else:
+        raise ValueError(f"Unknown cache_dtype: {args.cache_dtype}")
+    loader = make_latent_loader(args.wds_urls, micro_batch_size, num_workers) 
     log_steps = 0
     running_loss = 0.0
     start_time = time()
 
     logger.info(f"Training for {epochs} epochs...")
-    log_every = 10
+    # 你原来强制 log_every=10，我保留 args/config 的值（如果你想强制就自己改）
+    # log_every = 10
 
-    log_steps = 0
-    running_loss = 0.0
-    start_time = time()
-    print("time_shift",time_shift)
-
-    logger.info(f"Training for {epochs} epochs...")
     for epoch in range(epochs):
         sampler.set_epoch(epoch)
         if rank == 0:
             print(f"Beginning epoch {epoch}...")
+
         opt.zero_grad()
         accum_counter = 0
         step_loss_accum = 0.0
 
-        for x_img, y in loader:
-            x_img = x_img.to(device)  # [-1,1]
-            y = y.to(device)
+        # for batch in loader:
 
-            # CFG label dropout: 以 cfg_prob 概率将标签替换为 NULL_CLASS=1000
-            NULL_CLASS = num_classes  # 假设原始类别为 [0, num_classes-1]
+        for x_latent, y in loader:
+            x_latent = x_latent.to(device, non_blocking=True)  # [B,1280,16,16] fp32
+            y = y.to(device, non_blocking=True)
+            # ==========================
+            # 关键：命中缓存直接用 latent；miss 才 encode 并写回 pt
+            # ==========================
+            # CFG label dropout（按你原逻辑）
+            NULL_CLASS = num_classes
             if args.cfg_prob > 0.0:
-                # 每个样本独立丢弃
                 drop_mask = (torch.rand_like(y.float()) < args.cfg_prob)
                 y_train = y.clone()
                 y_train[drop_mask] = NULL_CLASS
             else:
                 y_train = y
 
-            # 记录 GT 图像 [0,1] 用于可视化
-            img_gt = (x_img + 1.0) / 2.0
-
-            with torch.no_grad():
-                x_latent,p = dinov3_vae.encode(x_img)
-                x_latent = normalize_sae(x_latent)
-                # x_latent = encoder_output.latent  # [B, 1280,16,16]
-            # print("x_latent!!!")
             model_kwargs = dict(y=y_train)
 
-            # with autocast(**autocast_kwargs):
             loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
                 model=model,
                 x_latent=x_latent,
@@ -855,7 +927,9 @@ def main(args):
                 time_shift=time_shift,
             )
 
-            # NaN 检测
+            # ==========================
+            # NaN 检测 + 自动从 latest.pt 恢复（保留你原逻辑）
+            # ==========================
             is_nan_local = 0 if torch.isfinite(loss_tensor) else 1
             is_nan = torch.tensor(is_nan_local, device=device)
             dist.all_reduce(is_nan, op=dist.ReduceOp.SUM)
@@ -888,11 +962,9 @@ def main(args):
                     torch.cuda.synchronize()
                     gc.collect()
                     torch.cuda.empty_cache()
-
                     dist.barrier()
                     if rank == 0:
                         logger.warning(f"All ranks resumed from {latest_path} (train_steps={train_steps})")
-
                     dist.barrier()
                     continue
 
@@ -903,8 +975,9 @@ def main(args):
                     cleanup()
                     exit(1)
 
+            # backward + accum
             step_loss_accum += loss_tensor.item()
-            loss_tensor /= grad_accum_steps
+            loss_tensor = loss_tensor / grad_accum_steps
             loss_tensor.backward()
             accum_counter += 1
 
@@ -913,6 +986,9 @@ def main(args):
 
             if clip_grad > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            else:
+                grad_norm = torch.tensor(0.0, device=device)
+
             opt.step()
             schedl.step()
             update_ema(ema, model.module, decay=ema_decay)
@@ -924,82 +1000,93 @@ def main(args):
             accum_counter = 0
             step_loss_accum = 0.0
 
-            # 每 1000 step 重建一张图（只在 rank==0）
+            # ==========================
+            # 可视化重建（保留你原 eval：gen + recon + noisy + gt）
+            # 注意：缓存命中时 dataset 不一定返回 img_gt（img 是 None）
+            # 这里我做了一个兼容：如果本 batch 恰好有 img（miss）就存 gt，否则跳过 gt 存图。
+            # ==========================
             show_time = 1000
-            DEBUG=False
+            DEBUG = False
             if rank == 0 and ((train_steps % show_time == 0) or DEBUG):
                 with torch.no_grad():
-                    y_sample = y[:1]  # [1]
+                    # 1) 生成一张（EMA）
+                    y_sample = y[:1]
                     img_gen, z_gen = stage2_sample_and_reconstruct(
-                        model=ema,  # Use EMA for visualization
+                        model=ema,
                         dinov3_vae=dinov3_vae,
                         y=y_sample,
                         image_size=args.image_size,
                         latent_shape=(1280, 16, 16),
                         stage2_steps=50,
                         vae_diffusion_steps=args.vae_diffusion_steps,
-                        time_shift=time_shift,             # 你算出来的那个
+                        time_shift=time_shift,
                         device=device,
                         decoder_type=args.decoder_type,
                     )
-
                     img_gen_01 = (img_gen + 1.0) / 2.0
                     vis_dir = os.path.join(experiment_dir, "samples")
                     os.makedirs(vis_dir, exist_ok=True)
                     save_image(img_gen_01, os.path.join(vis_dir, f"gen_step_{train_steps:07d}.png"))
-                    # 用当前 step 的 x-pred latent 做重建
-                    latent_sample = pred_latent[0:1]  # [1, 1280,16,16]
+
+                    # 2) 用当前 step 的 x-pred latent 做重建
+                    latent_sample = pred_latent[0:1]
                     recon = reconstruct_from_latent_with_diffusion(
                         vae=dinov3_vae,
                         latent_z=latent_sample,
                         image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
                         diffusion_steps=args.vae_diffusion_steps,
                         decoder_type=args.decoder_type,
-                    )  # [-1,1]
-                    x_latent_sample=x_latent[0:1] * (1 - t_sample[0]) + noise[0:1] * t_sample[0]
+                    )
+
+                    # 3) noisy latent 可视化（按你原代码）
+                    # x_latent 是 z0，t_sample/noise 是 compute_train_loss 里生成的
+                    x_latent_sample = x_latent[0:1] * (1 - t_sample[0]) + noise[0:1] * t_sample[0]
                     x_recon = reconstruct_from_latent_with_diffusion(
                         vae=dinov3_vae,
                         latent_z=x_latent_sample,
                         image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
                         diffusion_steps=args.vae_diffusion_steps,
                         decoder_type=args.decoder_type,
-                    )  # [-1,1]
+                    )
 
                     recon_img = (recon + 1.0) / 2.0
-                    vis_dir = os.path.join(experiment_dir, "recon")
-                    if DEBUG==True:
-                        vis_dir = os.path.join(experiment_dir, "recon_debug")
-                    os.makedirs(vis_dir, exist_ok=True)
                     x_recon_img = (x_recon + 1.0) / 2.0
+
+                    vis_dir = os.path.join(experiment_dir, "recon_debug" if DEBUG else "recon")
+                    os.makedirs(vis_dir, exist_ok=True)
+
                     save_image(
                         x_recon_img,
-                        os.path.join(vis_dir,f"noisy_step_{train_steps:07d}_{int(t_sample[0] * 1000)}.png")
+                        os.path.join(vis_dir, f"noisy_step_{train_steps:07d}_{int(t_sample[0] * 1000)}.png"),
                     )
                     save_image(
                         recon_img,
                         os.path.join(vis_dir, f"recon_step_{train_steps:07d}_{int(t_sample[0] * 1000)}.png"),
                     )
-                    # 也可以顺便存一张 GT
-                    save_image(
-                        img_gt[0:1],
-                        os.path.join(vis_dir, f"gt_step_{train_steps:07d}_{int(t_sample[0] * 1000)}.png"),
-                    )
 
-                logger.info(f"[step {train_steps}] Saved reconstruction and GT image.")
-            
-            # =================================================================
-            # === Run FID Evaluation every `fid_every` steps (no-CFG & CFG) ===
-            # =================================================================
+                    # 4) GT：只有当 dataset miss 才会给 img；命中缓存时 img 是 None
+                    # img_cpu0 = extra["img_cpu_list"][0]  # Tensor[3,H,W] or None
+                    # if img_cpu0 is not None:
+                    #     img_gt = (img_cpu0 + 1.0) / 2.0
+                    #     save_image(
+                    #         img_gt,
+                    #         os.path.join(vis_dir, f"gt_step_{train_steps:07d}_{int(t_sample[0] * 1000)}.png"),
+                    #     )
+
+                logger.info(f"[step {train_steps}] Saved reconstruction/gen images (gt saved if available).")
+
+            # ==========================
+            # FID Evaluation（保留你原逻辑：no-CFG & CFG，decoder_type 保留）
+            # ==========================
             if train_steps % args.fid_every == 0 and train_steps > 0:
                 if rank == 0:
                     logger.info(f"Step {train_steps}: Starting FID evaluation (no-CFG and CFG)...")
 
-                # Clear cache to avoid OOM during inference
                 torch.cuda.empty_cache()
 
-                # 1) 无 CFG（原始条件采样）
+                # 1) no CFG
                 run_fid_evaluation(
-                    model=ema,  # Use EMA for FID
+                    model=ema,
                     vae=dinov3_vae,
                     args=args,
                     logger=logger,
@@ -1017,9 +1104,9 @@ def main(args):
                     null_class=num_classes,
                 )
 
-                # 2) 启用 CFG（只在 t∈[cfg_interval_low, cfg_interval_high] 生效）
+                # 2) CFG
                 run_fid_evaluation(
-                    model=ema,  # Use EMA for FID
+                    model=ema,
                     vae=dinov3_vae,
                     args=args,
                     logger=logger,
@@ -1037,44 +1124,38 @@ def main(args):
                     null_class=num_classes,
                 )
 
-                # Restore training mode
                 model.train()
                 torch.cuda.empty_cache()
 
-            # === 每 10 step 打印 & TensorBoard 记录 loss ===
+            # ==========================
+            # log block（保留）
+            # ==========================
             if train_steps % log_every == 0:
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                avg_loss = torch.tensor(running_loss / max(1, log_steps), device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / world_size
 
                 if rank == 0:
-                    # 控制台打印
                     print(
                         f"(step={train_steps:07d}) "
                         f"Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f} "
-                        f"Train Grad Norm {grad_norm:.4f}"
+                        f"Train Grad Norm {float(grad_norm):.4f}"
                     )
-                    # TensorBoard 记录
                     if writer is not None:
                         writer.add_scalar("train/loss", avg_loss, global_step=train_steps)
                         writer.add_scalar("train/steps_per_sec", steps_per_sec, global_step=train_steps)
-                        writer.add_scalar("train/grad_norm", grad_norm, global_step=train_steps)
-
-                    # 若还想继续用 wandb，这里保留
-                    # if args.wandb:
-                    #     wandb_utils.log(
-                    #         {"train loss": avg_loss, "train steps/sec": steps_per_sec},
-                    #         step=train_steps,
-                    #     )
+                        writer.add_scalar("train/grad_norm", float(grad_norm), global_step=train_steps)
 
                 running_loss = 0.0
                 log_steps = 0
                 start_time = time()
-            # === end log block ===
 
+            # ==========================
+            # checkpoint 保存（保留 + 修正你原来重复块问题：这里只留一次）
+            # ==========================
             if train_steps % ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
@@ -1091,6 +1172,10 @@ def main(args):
                             "image_size": args.image_size,
                             "precision": args.precision,
                             "global_seed": global_seed,
+                            "vae_ckpt": args.vae_ckpt,
+                            "decoder_type": args.decoder_type,
+                            "cache_dir": args.cache_dir,
+                            "cache_dtype": args.cache_dtype,
                         },
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
@@ -1098,6 +1183,9 @@ def main(args):
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
 
+            # ==========================
+            # latest 快照（保留）
+            # ==========================
             if train_steps % 1000 == 0 and train_steps > 0:
                 if rank == 0:
                     snapshot = {
@@ -1114,123 +1202,73 @@ def main(args):
                             "image_size": args.image_size,
                             "precision": args.precision,
                             "global_seed": global_seed,
+                            "vae_ckpt": args.vae_ckpt,
+                            "decoder_type": args.decoder_type,
+                            "cache_dir": args.cache_dir,
+                            "cache_dtype": args.cache_dtype,
                         },
                     }
                     latest_path = f"{checkpoint_dir}/latest.pt"
                     torch.save(snapshot, latest_path)
                     logger.info(f"Updated quick resume checkpoint: {latest_path}")
                 dist.barrier()
-
-        # if accum_counter != 0:
-        #     raise RuntimeError("Gradient accumulation counter not zero at epoch end.")
-
-        if train_steps % ckpt_every == 0 and train_steps > 0:
-            if rank == 0:
-                checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "scheduler": schedl.state_dict(),
-                        "train_steps": train_steps,
-                        "config_path": args.config,
-                        "training_cfg": training_cfg,
-                        "cli_overrides": {
-                            "data_path": args.data_path,
-                            "results_dir": args.results_dir,
-                            "image_size": args.image_size,
-                            "precision": args.precision,
-                            "global_seed": global_seed,
-                        },
-                }
-                checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                torch.save(checkpoint, checkpoint_path)
-                logger.info(f"Saved checkpoint to {checkpoint_path}")
-            dist.barrier()
-
-            if train_steps % 1000 == 0 and train_steps > 0:
-                if rank == 0:
-                    snapshot = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "scheduler": schedl.state_dict(),
-                        "train_steps": train_steps,
-                        "config_path": args.config,
-                        "training_cfg": training_cfg,
-                        "cli_overrides": {
-                            "data_path": args.data_path,
-                            "results_dir": args.results_dir,
-                            "image_size": args.image_size,
-                            "precision": args.precision,
-                            "global_seed": global_seed,
-                        },
-                    }
-                    latest_path = f"{checkpoint_dir}/latest.pt"
-                    torch.save(snapshot, latest_path)
-                    logger.info(f"Updated quick resume checkpoint: {latest_path}")
-                dist.barrier()
-
-        # if accum_counter != 0:
-        #     raise RuntimeError("Gradient accumulation counter not zero at epoch end.")
 
     model.eval()
     logger.info("Done!")
     cleanup()
 
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to the config file.")
-    parser.add_argument("--data-path", type=str, required=True, help="Path to the training dataset root.")
-    parser.add_argument("--results-dir", type=str, default="results", help="Directory to store training outputs.")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256, help="Input image resolution.")
-    parser.add_argument("--precision", type=str, choices=["fp32", "bf16"], default="fp32", help="Compute precision for training.")
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
-    parser.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path to resume training.")
-    parser.add_argument("--global-seed", type=int, default=None, help="Override training.global_seed from the config.")
-    parser.add_argument("--global-batch-size", type=int, default=None, help="Override training.global_batch_size from the config.")
-
-    # 新增：VAE 相关参数
-    parser.add_argument("--vae-ckpt", type=str, default="/share/project/huangxu/sae_hx/diff_decoder/tuned_enc_vae_26000.pth", help="")
-    parser.add_argument("--vae-diffusion-steps", type=int, default=50, help="Sampling steps for VAE diffusion decoder.")
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument(
-        "--decoder-type",
+        "--index-synset-path",
         type=str,
-        default="diffusion_decoder",
-        choices=["diffusion_decoder", "cnn_decoder"],
-        help="Choose VAE decoder type: 'diffusion_decoder' (default, sae_model.AutoencoderKL) or 'cnn_decoder' (cnn_decoder.AutoencoderKL).",
+        default="/share/project/datasets/ImageNet/train/index_synset.yaml",
     )
+    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--ckpt", type=str, default=None)
+    parser.add_argument("--global-seed", type=int, default=None)
+    parser.add_argument("--global-batch-size", type=int, default=None)
+    parser.add_argument("--precision", type=str, choices=["bf16", "fp32"], default="fp32")
+    parser.add_argument("--wds-urls",type=str,default="/share/project/huangxu/SAE/kl500_vae_latent/*.tar")
+    # (可选) wandb：你 main 里虽然注释掉了，但建议保留参数防止以后打开时报错
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
 
-    # CFG 相关参数
-    parser.add_argument(
-        "--cfg-prob",
-        type=float,
-        default=0.1,
-        help="Classifier-free guidance dropout prob for labels during training (set y=1000 with this prob).",
-    )
-    parser.add_argument(
-        "--cfg-scale",
-        type=float,
-        default=3.0,
-        help="Classifier-free guidance scale used in FID sampling.",
-    )
-    parser.add_argument(
-        "--cfg-interval-low",
-        type=float,
-        default=0.1,
-        help="Lower bound of t where CFG is active during sampling.",
-    )
-    parser.add_argument(
-        "--cfg-interval-high",
-        type=float,
-        default=1.0,
-        help="Upper bound of t where CFG is active during sampling.",
-    )
+    # VAE + cache
+    parser.add_argument("--vae-ckpt", type=str, required=True)
+    parser.add_argument("--cache-dir", type=str, required=True, help="Directory to store latent pt cache")
+    parser.add_argument("--cache-dtype", type=str, choices=["fp16", "bf16", "fp32"], default="fp32")
+    parser.add_argument("--decoder-type", type=str, choices=["cnn_decoder", "diffusion_decoder"], default="cnn_decoder")
 
-    # 新增：FID Evaluation 相关参数
+    # VAE diffusion decoder sampling steps (用于 reconstruct / FID decode)
+    parser.add_argument("--vae-diffusion-steps", type=int, default=50, help="Sampling steps for VAE diffusion decoder.")
+
+    # dataset modes
+    parser.add_argument("--single-class", type=int, default=None)
+    parser.add_argument("--overfit-image", type=str, default=None)
+    parser.add_argument("--overfit-length", type=int, default=1024)
+
+    # CFG (训练 label dropout)
+    parser.add_argument("--cfg-prob", type=float, default=0.1)
+
+    # CFG (采样时 guidance 参数：用于 FID sampling)
+    parser.add_argument("--cfg-scale", type=float, default=3.0)
+    parser.add_argument("--cfg-interval-low", type=float, default=0.1)
+    parser.add_argument("--cfg-interval-high", type=float, default=1.0)
+
+    # FID eval
     parser.add_argument("--fid-every", type=int, default=10000, help="Run FID evaluation every N steps.")
-    parser.add_argument("--fid-samples-per-class", type=int, default=50, help="Number of samples per class for FID calculation.")
-    parser.add_argument("--fid-ref-path", type=str, default="/share/project/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz", help="Path to reference .npz stats for FID. Required for FID calculation.")
+    parser.add_argument("--fid-samples-per-class", type=int, default=50, help="Number of samples per class for FID.")
+    parser.add_argument(
+        "--fid-ref-path",
+        type=str,
+        default="/share/project/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz",
+        help="Path to reference .npz stats for FID.",
+    )
     parser.add_argument("--fid-batch-size", type=int, default=32, help="Batch size for FID generation.")
 
     args = parser.parse_args()

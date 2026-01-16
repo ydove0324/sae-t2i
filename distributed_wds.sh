@@ -2,16 +2,9 @@
 
 # 分布式训练节点配置
 WORKER_NODES=(
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-3
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-1
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-2
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-0
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-4
-job-f442ddcb-f3c4-495f-9e74-3491927b4c38-worker-5
+job-5ca8fa4e-4e2d-4eba-9720-e850d50e118e-master-0
+job-5bb88e20-e119-448d-8ee6-13732210c58f-master-0
 job-9e1ddf42-fa45-413d-8feb-adcac7c07c99-master-0
-job-b313c970-bd84-43a2-b1e2-210f5a34d452-master-0
-job-b313c970-bd84-43a2-b1e2-210f5a34d452-worker-1
-job-b313c970-bd84-43a2-b1e2-210f5a34d452-worker-0
 # job-b7373458-0c71-4964-8ac8-f59d684a98e7-worker-3
 # job-b7373458-0c71-4964-8ac8-f59d684a98e7-worker-4
 # job-b7373458-0c71-4964-8ac8-f59d684a98e7-worker-5
@@ -19,18 +12,18 @@ job-b313c970-bd84-43a2-b1e2-210f5a34d452-worker-0
 )
 
 # 节点配置
-NUM_NODES=11  # 1个Master + 7个Worker
+NUM_NODES=4  # 1个Master + 7个Worker
 MASTER_GPUS=8
 WORKER_GPUS_LIST=(8 8 8 8 8 8 8 8 8 8 8 8 8 8 8)  # 与 WORKER_NODES 数量一致
-MASTER_ADDR="job-f442ddcb-f3c4-495f-9e74-3491927b4c38-master-0"
-MASTER_PORT="27530"
+MASTER_ADDR="job-4d210284-abc8-485e-bcc3-8b48d3e37ab1-master-0"
+MASTER_PORT="27535"
 JOB_ID="100"
 
 # 训练脚本路径
-TRAIN_SCRIPT="./eval_fid.sh"
+TRAIN_SCRIPT="./build_wds.sh"
 # 修改：使用日志目录
-LOG_DIR="log/dinov3_eval_logs"
-TMUX_SESSION="dinov3_vae_eval"
+LOG_DIR="log/dinov3_build_wds"
+TMUX_SESSION="dinov3_build_wds"
 
 # 创建日志目录
 mkdir -p "$LOG_DIR"

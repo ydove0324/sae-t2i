@@ -30,26 +30,20 @@ export OMP_NUM_THREADS=4
 # echo "  NODE_RANK=$NODE_RANK"
 # echo "  MASTER_ADDR=$MASTER_ADDR"
 # echo "  MASTER_PORT=$MASTER_PORT"
-VAE_CKPT="/share/project/huangxu/models/SAE/diffusion_decoder/kl100/ema_vae.pth"
+VAE_CKPT="/share/project/huangxu/models/SAE/diffusion_decoder/kl100/vae.pth"
 
-torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
-  --nproc-per-node=$NUM_GPUS \
-  --master_addr=$MASTER_ADDR \
-  --master_port=$MASTER_PORT \
-  projects/rae/train.py \
+torchrun --nnodes=1 --node_rank=0 \
+  --nproc-per-node=1 \
+  --master_addr="localhost" \
+  --master_port=19291 \
+  projects/rae/train_overfit.py \
   --config /share/project/huangxu/SAE/projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml \
   --data-path /share/project/datasets/ImageNet/train \
-  --results-dir ./result_cfg_v7 \
-  --global-batch-size 512 \
   --vae-ckpt $VAE_CKPT \
-  --decoder-type cnn_decoder \
-  --global-seed 1031 \
-  --cfg-prob 0.1  \
-  --cache-dir /share/project/huangxu/SAE/cache \
-  --wds-urls "/share/project/huangxu/SAE/kl100_vae_latent/*.tar"
-  # --ckpt /share/project/huangxu/SAE/result_cfg_v7/checkpoints/latest.pt \
-
-
-    # --vae-ckpt /share/project/huangxu/models/SAE/models/ema_vae.pth \
-    # --precision fp32 \ 默认
+  --results-dir ./result_overfit_kl100_v \
+  --precision fp32 \
+  --image-size 256 \
+  --global-batch-size 1 \
+  --prediction-mode v \
+  --dataset-type overfit_single_image
   # --ckpt /opt/tiger/vfm/decoder_only/latest.pt

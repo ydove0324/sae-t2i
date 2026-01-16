@@ -272,6 +272,78 @@ def reconstruct_from_latent_with_diffusion(vae, latent_z, image_shape, diffusion
 
     return recon
 
+
+from torchdiffeq import odeint
+
+from torchdiffeq import odeint
+import torch
+
+@torch.no_grad()
+def sample_latent_dopri5(
+    model,
+    batch_size,
+    latent_shape,
+    device,
+    y,
+    time_shift,
+    # 这些是 dopri5 的精度参数
+    rtol=1e-5,
+    atol=1e-5,
+    # 防止 t=0 奇点
+    eps_time=1e-5,
+    # 可选：限制最大内部步数，防止发疯
+    max_num_steps=1000,
+):
+    model.eval()
+    C, H, W = latent_shape
+    x0 = torch.randn((batch_size, C, H, W), device=device, dtype=torch.float32)
+
+    shift = float(time_shift)
+
+    # 你的 time shift 映射
+    def flow_shift(t_lin: torch.Tensor) -> torch.Tensor:
+        t = (shift * t_lin) / (1.0 + (shift - 1.0) * t_lin)
+        return t
+
+    # 直接在“真实 t”上积分，且 t ∈ [eps, 1-eps]
+    t_start = flow_shift(torch.tensor(1.0, device=device))
+    t_end   = flow_shift(torch.tensor(0.0, device=device))
+
+    # clamp 避免 t 真到 0 或 1
+    t_start = torch.clamp(t_start, min=eps_time, max=1.0 - eps_time)
+    t_end   = torch.clamp(t_end,   min=eps_time, max=1.0 - eps_time)
+
+    # 从噪声端 -> 干净端（反向）
+    t_span = torch.stack([t_start, t_end]).to(torch.float32)
+
+    def ode_rhs(t_scalar, x):
+        # torchdiffeq 会传一个标量 t
+        t = torch.full((batch_size,), t_scalar, device=device, dtype=torch.float32)
+        # 再次 clamp，双保险
+        t = t.clamp(min=eps_time, max=1.0 - eps_time)
+
+        x0_hat = model(x, t, y=y)
+
+        t4 = t.view(batch_size, 1, 1, 1)
+        eps_hat = (x - (1.0 - t4) * x0_hat) / (t4 + 1e-8)
+
+        # 对应 x(t) = t*eps + (1-t)*x0  => dx/dt = eps - x0
+        return eps_hat - x0_hat
+
+    x_traj = odeint(
+        ode_rhs,
+        x0,
+        t_span,
+        method="dopri5",
+        rtol=rtol,
+        atol=atol,
+        options={"max_num_steps": max_num_steps},
+    )
+
+    return x_traj[-1]
+
+
+
 @torch.no_grad()
 def sample_latent_linear_steps(model, batch_size, latent_shape, device, y, time_shift, steps=50):
     model.eval()
@@ -292,6 +364,65 @@ def sample_latent_linear_steps(model, batch_size, latent_shape, device, y, time_
         eps_hat = (x - (1.0 - t4) * x0_hat) / (t4 + 1e-8)
         t_next4 = t_next.view(batch_size, 1, 1, 1)
         x = t_next4 * eps_hat + (1.0 - t_next4) * x0_hat
+    return x
+
+@torch.no_grad()
+def sample_latent_heun_steps(
+    model,
+    batch_size,
+    latent_shape,
+    device,
+    y,
+    time_shift,
+    steps=50,
+    eps_time=1e-5,   # 避免 t=0 奇点
+):
+    """
+    Heun (RK2) sampler on ODE: dx/dt = eps_hat(x,t) - x0_hat(x,t)
+    Time runs from 1 -> 0 (noise -> clean). We discretize on t_lin then map by flow_shift.
+    """
+    model.eval()
+    C, H, W = latent_shape
+    x = torch.randn((batch_size, C, H, W), device=device, dtype=torch.float32)
+
+    shift = float(time_shift)
+
+    def flow_shift(t_lin: torch.Tensor) -> torch.Tensor:
+        t = (shift * t_lin) / (1.0 + (shift - 1.0) * t_lin)
+        return t.clamp(eps_time, 1.0 - eps_time)
+
+    def drift(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        compute f(x,t) = eps_hat - x0_hat, where x0_hat = model(x,t)
+        """
+        x0_hat = model(x, t, y=y)
+        t4 = t.view(batch_size, 1, 1, 1)
+        eps_hat = (x - (1.0 - t4) * x0_hat) / (t4 + 1e-8)
+        return eps_hat - x0_hat
+
+    # integrate from t_lin = 1 -> 0
+    for i in range(steps, 0, -1):
+        t_lin = torch.full((batch_size,), i / steps, device=device, dtype=torch.float32)
+        t_next_lin = torch.full((batch_size,), (i - 1) / steps, device=device, dtype=torch.float32)
+
+        t = flow_shift(t_lin)
+        t_next = flow_shift(t_next_lin)
+
+        # dt is negative (since t decreases)
+        dt = (t_next - t).view(batch_size, 1, 1, 1)  # shape [B,1,1,1]
+
+        # Heun:
+        K1 = drift(x, t)
+
+        # predictor: x_p = x + dt*K1
+        x_p = x + dt * K1
+
+
+        K2 = drift(x_p, t_next)
+
+        # corrector: x_{n+1} = x + dt*(K1+K2)/2
+        x = x + dt * 0.5 * (K1 + K2)
+
     return x
 
 # ---------------------------
@@ -401,6 +532,16 @@ def main():
             
             # Stage 2 Sampling
             z0_hat = sample_latent_linear_steps(stage2, curr_batch, (1280, 16, 16), device, y, time_shift, args.stage2_steps)
+            # z0_hat = sample_latent_heun_steps(
+            #     stage2,
+            #     curr_batch,
+            #     (1280, 16, 16),
+            #     device,
+            #     y,
+            #     time_shift,
+            #     steps=args.stage2_steps,
+            #     eps_time=1e-5,
+            # )
             
             # VAE Decode (传递 decoder_type 参数)
             imgs = reconstruct_from_latent_with_diffusion(

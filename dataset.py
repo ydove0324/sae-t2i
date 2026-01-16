@@ -2,6 +2,13 @@ import yaml
 import os
 from torch.utils.data import Dataset
 from PIL import Image
+import hashlib
+from dataclasses import dataclass
+from typing import Optional, List, Tuple, Dict, Any
+
+import torch
+from torchvision import transforms
+from PIL import Image
 def load_index_synset_map(index_synset_path: str):
     """
     读取 index_synset.yaml，构造:
@@ -186,3 +193,188 @@ class SingleClassDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
         return img, label
+
+IMG_EXTS = (".jpeg", ".jpg", ".png", ".bmp", ".webp")
+
+def center_crop_arr(pil_image, image_size):
+    while min(*pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
+
+    scale = image_size / min(*pil_image.size)
+    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
+
+    import numpy as np
+    arr = np.array(pil_image)
+    crop_y = (arr.shape[0] - image_size) // 2
+    crop_x = (arr.shape[1] - image_size) // 2
+    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+
+
+def build_transform(image_size: int):
+    return transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size)),
+        transforms.ToTensor(),                      # [0,1]
+        transforms.Lambda(lambda t: t * 2.0 - 1.0), # [-1,1]
+    ])
+
+
+def load_index_synset_map(index_synset_path: str):
+    with open(index_synset_path, "r") as f:
+        data = yaml.safe_load(f)
+
+    index2synset = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            index2synset[int(k)] = str(v)
+    elif isinstance(data, list):
+        for idx, v in enumerate(data):
+            index2synset[idx] = str(v)
+    else:
+        raise ValueError(f"Unsupported index_synset format: {type(data)}")
+
+    synset2index = {syn: idx for idx, syn in index2synset.items()}
+    return index2synset, synset2index
+
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def make_cache_tag(vae_ckpt: str, image_size: int, normalize_tag: str = "normalize_sae_v1") -> str:
+    # 让不同 VAE/分辨率/归一化方式的缓存互不冲突
+    base = f"{os.path.basename(vae_ckpt)}|{image_size}|{normalize_tag}"
+    return _sha1(base)[:16]
+
+
+def sample_cache_relpath(img_path: str, tag: str) -> str:
+    # 加入 mtime/size：图片被替换时自动失效
+    try:
+        st = os.stat(img_path)
+        mtime = int(st.st_mtime)
+        size = int(st.st_size)
+    except FileNotFoundError:
+        mtime = 0
+        size = 0
+    key = _sha1(f"{tag}|{img_path}|mtime={mtime}|size={size}")
+    return os.path.join(key[:2], f"{key}.pt")
+
+
+@dataclass
+class DatasetSpec:
+    root: Optional[str]
+    index_synset_path: Optional[str]
+    image_size: int
+    vae_ckpt: str
+    cache_dir: str
+    single_class_index: Optional[int] = None
+    overfit_image: Optional[str] = None
+    overfit_length: int = 1024
+
+
+class ImageNetLatentCacheDataset(Dataset):
+    """
+    行为：
+      - __getitem__ 先查 cache：
+          命中 -> 返回 {"has_latent": True, "latent": [C,H,W], "label": int, "path": str}
+          未命中 -> 返回 {"has_latent": False, "img": [3,H,W], "label": int, "path": str}
+    注意：
+      - 这里只做 “查缓存 + 读图”，不做 GPU encode
+      - 缓存文件格式：torch.save({"latent": Tensor[C,H,W], "label": int, "path": str})
+    """
+    def __init__(self, spec: DatasetSpec):
+        self.spec = spec
+        self.transform = build_transform(spec.image_size)
+
+        self.tag = make_cache_tag(spec.vae_ckpt, spec.image_size)
+        self.cache_root = os.path.join(spec.cache_dir, f"latents_{self.tag}")
+        os.makedirs(self.cache_root, exist_ok=True)
+
+        # 生成 samples: List[(img_path, label)]
+        self.samples: List[Tuple[str, int]] = []
+
+        if spec.overfit_image is not None:
+            if not os.path.isfile(spec.overfit_image):
+                raise FileNotFoundError(f"overfit_image not found: {spec.overfit_image}")
+            for _ in range(int(spec.overfit_length)):
+                self.samples.append((spec.overfit_image, 0))
+
+        else:
+            if spec.root is None or spec.index_synset_path is None:
+                raise ValueError("root and index_synset_path are required for imagenet/single_class modes")
+
+            index2synset, synset2index = load_index_synset_map(spec.index_synset_path)
+
+            if spec.single_class_index is not None:
+                idx = int(spec.single_class_index)
+                if idx not in index2synset:
+                    raise ValueError(f"single_class_index {idx} not in yaml")
+                synset = index2synset[idx]
+                class_dir = os.path.join(spec.root, synset)
+                if not os.path.isdir(class_dir):
+                    raise FileNotFoundError(f"class dir not found: {class_dir}")
+                for fname in sorted(os.listdir(class_dir)):
+                    if fname.lower().endswith(IMG_EXTS):
+                        self.samples.append((os.path.join(class_dir, fname), idx))
+            else:
+                for entry in os.scandir(spec.root):
+                    if not entry.is_dir():
+                        continue
+                    synset = entry.name
+                    if not synset.startswith("n"):
+                        continue
+                    if synset not in synset2index:
+                        continue
+                    label = synset2index[synset]
+                    for fname in os.listdir(entry.path):
+                        if fname.lower().endswith(IMG_EXTS):
+                            self.samples.append((os.path.join(entry.path, fname), label))
+
+        if len(self.samples) == 0:
+            raise RuntimeError("No samples found.")
+
+        print(f"[ImageNetLatentCacheDataset] samples={len(self.samples)} cache_root={self.cache_root}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def cache_path_for(self, img_path: str) -> str:
+        rel = sample_cache_relpath(img_path, self.tag)
+        return os.path.join(self.cache_root, rel)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        img_path, label = self.samples[idx]
+        cache_path = self.cache_path_for(img_path)
+
+        if os.path.exists(cache_path):
+            obj = torch.load(cache_path, map_location="cpu")
+            # obj["latent"] expected [C,H,W] tensor
+            return {
+                "has_latent": True,
+                "latent": obj["latent"],
+                "label": int(obj.get("label", label)),
+                "path": img_path,
+                "cache_path": cache_path,
+            }
+
+        # cache miss: read image tensor and return
+        img = Image.open(img_path).convert("RGB")
+        img = self.transform(img)
+        return {
+            "has_latent": False,
+            "img": img,
+            "label": int(label),
+            "path": img_path,
+            "cache_path": cache_path,
+        }
+
+
+def collate_keep_dict(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # 保持 dict 结构，main 里自己拆
+    return {
+        "has_latent": torch.tensor([b["has_latent"] for b in batch], dtype=torch.bool),
+        "latent": [b.get("latent", None) for b in batch],
+        "img": [b.get("img", None) for b in batch],
+        "label": torch.tensor([b["label"] for b in batch], dtype=torch.long),
+        "path": [b["path"] for b in batch],
+        "cache_path": [b["cache_path"] for b in batch],
+    }

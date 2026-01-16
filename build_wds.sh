@@ -20,17 +20,6 @@ torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
     --nproc-per-node=$NUM_GPUS \
     --master_addr=$MASTER_ADDR \
     --master_port=$MASTER_PORT \
-    inference_ddp.py \
-    --config "/share/project/huangxu/SAE/projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml" \
-    --ckpt "/share/project/huangxu/SAE/result_v5/checkpoints/0150000.pt" \
-    --vae-ckpt "/share/project/huangxu/models/SAE/models/ema_vae.pth" \
-    --out "result_v5/imagenet_50k_150000_diff_100step_cnn_decoder" \
-    --samples-per-class 50 \
-    --batch-size 16 \
-    --stage2-steps 100 \
-    --vae-diffusion-steps 10 \
-    --use-ema \
-    --ref-path "/share/project/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz" \
-    --decoder-type "cnn_decoder" \
-    --eval-only \
-    # --calc-fid \
+    build_imagenet_wds.py \
+    --out /share/project/huangxu/SAE/kl100_vae_latent/latents \
+    --vae_ckpt "/share/project/huangxu/models/SAE/diffusion_decoder/kl100/ema_vae.pth" \
