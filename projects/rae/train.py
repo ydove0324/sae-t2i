@@ -38,7 +38,12 @@ from models.rae.utils.train_utils import parse_configs
 from models.rae.utils.model_utils import instantiate_from_config
 from models.rae.utils import wandb_utils
 from models.rae.utils.optim_utils import build_optimizer, build_scheduler
-from sae_model import AutoencoderKL as DiffusionAutoencoderKL
+from models.rae.utils.vae_utils import (
+    load_dinov3_vae,
+    normalize_sae,
+    denormalize_sae,
+    reconstruct_from_latent_with_diffusion,
+)
 from dataset import (ImageNetIdxDataset,
     DatasetSpec,
     ImageNetLatentCacheDataset,
@@ -50,12 +55,6 @@ from torchvision.utils import save_image
 from torch.utils.tensorboard import SummaryWriter
 import random
 from wds_dataset import make_latent_loader
-
-# Optional CNN decoder import for decoder_type="cnn_decoder"
-try:
-    import cnn_decoder
-except ImportError:
-    cnn_decoder = None
 
 # === FID Imports ===
 try:
@@ -135,15 +134,6 @@ def center_crop_arr(pil_image, image_size):
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
-def normalize_sae(tensor):
-    ema_shift_factor = 0.0019670347683131695
-    ema_scale_factor = 0.247765451669693
-    return (tensor - ema_shift_factor) / ema_scale_factor
-
-def denormalize_sae(tensor):
-    ema_shift_factor = 0.0019670347683131695
-    ema_scale_factor = 0.247765451669693
-    return tensor * ema_scale_factor + ema_shift_factor
 
 #################################################################################
 #                             FID Helper Functions                              #
@@ -323,125 +313,6 @@ def run_fid_evaluation(
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
-
-@torch.no_grad()
-def reconstruct_from_latent_with_diffusion(
-    vae,
-    latent_z: torch.Tensor,
-    image_shape: torch.Size,
-    diffusion_steps: int = 25,
-    decoder_type: str = "diffusion_decoder",
-) -> torch.Tensor:
-    """
-    Given latent_z from DINO encoder (or model x-pred in the same latent space),
-    run the full decoder sampling loop to reconstruct images.
-
-    decoder_type:
-      - "diffusion_decoder": 使用 sae_model.AutoencoderKL 中的 diffusion_decoder
-      - "cnn_decoder":       使用 cnn_decoder.AutoencoderKL 的 decode（无 diffusion loop）
-    """
-    device = latent_z.device
-    z = denormalize_sae(latent_z)
-
-    if decoder_type == "diffusion_decoder":
-        # 如果有 post_quant_conv，则与训练时保持一致
-        if getattr(vae, "post_quant_conv", None) is not None and vae.post_quant_conv is not None:
-            z = vae.post_quant_conv(z)
-
-        # 用 diffusion decoder 的 compressor 获得多尺度 context
-        context = vae.diffusion_decoder.get_context(z)
-        # 与 forward 一致：反转 context 顺序
-        corrected_context = list(reversed(context[:]))
-
-        diffusion = vae.diffusion_decoder.diffusion
-        diffusion.set_sample_schedule(diffusion_steps, device)
-
-        # 从纯高斯噪声开始采样
-        init_noise = torch.randn(
-            image_shape,
-            device=device,
-            dtype=latent_z.dtype,
-        )
-
-        recon = diffusion.p_sample_loop(
-            vae=vae,
-            shape=image_shape,
-            context=corrected_context,
-            clip_denoised=True,
-            init_noise=init_noise,
-            eta=0.0,  # DDIM deterministic sampling
-        )
-    else:
-        # CNN decoder: 直接 decode，不经过 diffusion loop
-        if not hasattr(vae, "decode"):
-            raise AttributeError("VAE does not have a decode method required for cnn_decoder.")
-        recon = vae.decode(z).sample
-
-    return recon
-
-
-def load_dinov3_vae(
-    vae_checkpoint_path: str,
-    device: torch.device,
-    decoder_type: str = "diffusion_decoder",
-):
-    """
-    构建并加载 DINOv3 AutoencoderKL。
-
-    decoder_type:
-      - "diffusion_decoder": 使用 sae_model.AutoencoderKL（带 diffusion decoder）
-      - "cnn_decoder":       使用 cnn_decoder.AutoencoderKL（纯 CNN decoder）
-    """
-    if decoder_type == "cnn_decoder":
-        if cnn_decoder is None:
-            raise ImportError("cnn_decoder module not found, cannot use decoder_type='cnn_decoder'.")
-        AutoencoderClass = cnn_decoder.AutoencoderKL
-        print("[load_dinov3_vae] Using CNN decoder (cnn_decoder.AutoencoderKL).")
-    elif decoder_type == "diffusion_decoder":
-        AutoencoderClass = DiffusionAutoencoderKL
-        print("[load_dinov3_vae] Using diffusion decoder (sae_model.AutoencoderKL).")
-    else:
-        raise ValueError(f"Unknown decoder_type: {decoder_type}")
-
-    model_params = {
-        "in_channels": 3,
-        "out_channels": 3,
-        "enc_block_out_channels": [128, 256, 384, 512, 768],
-        "dec_block_out_channels": [1280, 1024, 512, 256, 128],
-        "enc_layers_per_block": 2,
-        "dec_layers_per_block": 3,
-        "latent_channels": 1280,
-        "use_quant_conv": False,
-        "use_post_quant_conv": False,
-        "spatial_downsample_factor": 16,
-        "variational": False,
-        "noise_tau": 0.0,
-        "denormalize_decoder_output": True,
-        "running_mode": "dec",
-        "random_masking_channel_ratio": 0.0,
-        "target_latent_channels": None,
-        "lpips_weight": 0.1,
-    }
-
-    vae = AutoencoderClass(**model_params).to(device)
-
-    print(f"[load_dinov3_vae] Loading VAE checkpoint from: {vae_checkpoint_path}")
-    checkpoint = torch.load(vae_checkpoint_path, map_location="cpu")
-
-    if "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    elif "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    else:
-        state_dict = checkpoint
-
-    missing, unexpected = vae.load_state_dict(state_dict, strict=False)
-    print(f"[load_dinov3_vae] Loaded VAE. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
-
-    vae.eval()
-    requires_grad(vae, False)
-    return vae
-
 
 def compute_train_loss(
     model,

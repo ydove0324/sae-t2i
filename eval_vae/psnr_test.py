@@ -21,6 +21,14 @@ os.environ["TORCH_HOME"] = "/share/project/huangxu/.cache/torch"
 # 添加当前目录以导入项目模块
 sys.path.append(".")
 
+# 导入 VAE 工具函数
+from models.rae.utils.vae_utils import (
+    load_dinov3_vae,
+    normalize_sae,
+    denormalize_sae,
+    reconstruct_from_latent_with_diffusion,
+)
+
 # 尝试导入 pytorch-fid
 try:
     from pytorch_fid import fid_score
@@ -63,17 +71,6 @@ def center_crop_arr(pil_image, image_size):
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
-# SAE 特有的归一化
-def normalize_sae(tensor):
-    ema_shift_factor = 0.0019670347683131695
-    ema_scale_factor = 0.247765451669693
-    return (tensor - ema_shift_factor) / ema_scale_factor
-
-def denormalize_sae(tensor):
-    ema_shift_factor = 0.0019670347683131695
-    ema_scale_factor = 0.247765451669693
-    return tensor * ema_scale_factor + ema_shift_factor
-
 def calculate_batch_psnr(img1, img2):
     """
     img1, img2: Tensor [-1, 1]
@@ -88,113 +85,6 @@ def calculate_batch_psnr(img1, img2):
     mse = torch.clamp(mse, min=1e-10)
     psnr = 10 * torch.log10(1.0 / mse)
     return psnr.sum().item(), psnr.shape[0]
-
-# ==========================================
-#              Model Loading
-# ==========================================
-
-def load_vae(model_type, vae_checkpoint_path, device):
-    # 动态导入
-    if model_type == "CNN":
-        if dist.get_rank() == 0: print(">> Mode: CNN. Importing from cnn_decoder...")
-        try:
-            from cnn_decoder import AutoencoderKL
-        except ImportError:
-            print("Error: cnn_decoder.py not found.")
-            sys.exit(1)
-    else:
-        if dist.get_rank() == 0: print(">> Mode: DIFFUSION. Importing from sae_model...")
-        try:
-            from sae_model import AutoencoderKL
-        except ImportError:
-            print("Error: sae_model.py not found.")
-            sys.exit(1)
-
-    # 这里的参数根据你的模型具体情况调整
-    # 如果 CNN 和 SAE 参数不一致，可以用 if model_type == ... 来区分
-    model_params = {
-        "in_channels": 3,
-        "out_channels": 3,
-        "enc_block_out_channels": [128, 256, 384, 512, 768],
-        "dec_block_out_channels": [1280, 1024, 512, 256, 128],
-        "enc_layers_per_block": 2,
-        "dec_layers_per_block": 3,
-        "latent_channels": 1280,
-        "spatial_downsample_factor": 16,
-        "use_quant_conv": False,
-        "use_post_quant_conv": False,
-        "denormalize_decoder_output": False, # 注意：确认 cnn_decoder 是否支持此参数
-    }
-    
-    # SAE 可能需要额外的参数
-    if model_type == "DIFFUSION":
-        model_params.update({
-            "variational": False,
-            "running_mode": "dec",
-        })
-
-    vae = AutoencoderKL(**model_params).to(device)
-    
-    if dist.get_rank() == 0:
-        print(f"Loading Checkpoint: {vae_checkpoint_path}")
-    
-    checkpoint = torch.load(vae_checkpoint_path, map_location="cpu")
-    if "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    elif "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    else:
-        state_dict = checkpoint
-
-    vae.load_state_dict(state_dict, strict=False)
-    vae.eval()
-    for p in vae.parameters():
-        p.requires_grad = False
-        
-    return vae
-
-# ==========================================
-#           Reconstruction Strategies
-# ==========================================
-
-@torch.no_grad()
-def reconstruct_with_cnn(vae, z_raw):
-    # CNN Decoder: 直接 decode
-    # 注意：某些 VAE 实现返回 (recon, posterior) 或者只是 recon
-    out = vae.decode(z_raw)
-    if isinstance(out, tuple):
-        return out[0]
-    return out
-
-@torch.no_grad()
-def reconstruct_with_diffusion(vae, z_raw, image_shape, diffusion_steps):
-    device = z_raw.device
-    
-    # SAE Process: Normalize -> (Optional Post Quant) -> Diffusion
-    z = normalize_sae(z_raw) 
-    latent_in = denormalize_sae(z)
-
-    if getattr(vae, "post_quant_conv", None) is not None:
-        latent_in = vae.post_quant_conv(latent_in)
-
-    # 准备 Context
-    context = vae.diffusion_decoder.get_context(latent_in)
-    corrected_context = list(reversed(context[:]))
-
-    diffusion = vae.diffusion_decoder.diffusion
-    diffusion.set_sample_schedule(diffusion_steps, device)
-
-    init_noise = torch.randn(image_shape, device=device, dtype=z.dtype)
-
-    recon = diffusion.p_sample_loop(
-        vae=vae,
-        shape=image_shape,
-        context=corrected_context,
-        clip_denoised=True,
-        init_noise=init_noise,
-        eta=0.0, 
-    )
-    return recon
 
 # ==========================================
 #                   Main
@@ -239,7 +129,8 @@ def main():
     dist.barrier()
 
     # 3. 加载模型
-    vae = load_vae(args.type, args.vae_ckpt, device)
+    decoder_type = "cnn_decoder" if args.type == "CNN" else "diffusion_decoder"
+    vae = load_dinov3_vae(args.vae_ckpt, device, decoder_type=decoder_type, verbose=(rank == 0))
 
     # 4. 数据集与 Sampler
     transform = transforms.Compose([
@@ -284,16 +175,19 @@ def main():
         B = x_img.shape[0]
 
         with torch.no_grad():
-            # Encoder 部分通常是一样的
-            z_raw, _ = vae.encode(x_img) 
+            # Encoder
+            z_raw, _ = vae.encode(x_img,sample_posterior=False)
+            # Normalize for latent space
+            z_normalized = normalize_sae(z_raw)
 
-            # Decoder 部分根据类型分支
-            if args.type == "CNN":
-                x_recon = reconstruct_with_cnn(vae, z_raw)
-            else:
-                x_recon = reconstruct_with_diffusion(
-                    vae, z_raw, x_img.shape, diffusion_steps=args.diffusion_steps
-                )
+            # Decoder (using unified reconstruct function)
+            x_recon = reconstruct_from_latent_with_diffusion(
+                vae=vae,
+                latent_z=z_normalized,
+                image_shape=x_img.shape,
+                diffusion_steps=args.diffusion_steps,
+                decoder_type=decoder_type,
+            )
 
         # 统计 PSNR
         batch_psnr_sum, batch_n = calculate_batch_psnr(x_img, x_recon)

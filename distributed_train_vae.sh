@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 
 # 分布式训练节点配置
+# nohup bash train_vae/train_vae.sh > log/lora_rank256_vfloss_0p01_frozen_dinov3.log 2>&1 < /dev/null &
 WORKER_NODES=(
-job-427e70d4-bb80-4be6-87bc-101b3e139f7a-worker-8 
-job-427e70d4-bb80-4be6-87bc-101b3e139f7a-worker-9 
-job-427e70d4-bb80-4be6-87bc-101b3e139f7a-worker-10 
+job-18f25148-acb0-43d7-8564-98fe2e809e60-worker-0
+job-18f25148-acb0-43d7-8564-98fe2e809e60-worker-1
+job-18f25148-acb0-43d7-8564-98fe2e809e60-worker-2
 )
 
 # 节点配置
 NUM_NODES=4  # 1个Master + 7个Worker
 MASTER_GPUS=8
 WORKER_GPUS_LIST=(8 8 8)  # 与 WORKER_NODES 数量一致
-MASTER_ADDR="job-427e70d4-bb80-4be6-87bc-101b3e139f7a-master-0"
+MASTER_ADDR="job-18f25148-acb0-43d7-8564-98fe2e809e60-master-0"
 MASTER_PORT="27519"
 JOB_ID="100"
 
 # 训练脚本路径
 TRAIN_SCRIPT="train_vae/train_vae.sh"
-LOG_FILE="log/dinov3_vae_cnn_decoder_v1.log"
+LOG_FILE="log/dinov3_vae_cnn_decoder_vf_loss_lora_rank32.log"
 TMUX_SESSION="dinov3_vae_cnn_decoder"
 
 # Master节点启动
@@ -40,8 +41,8 @@ for i in "${!WORKER_NODES[@]}"; do
     echo "Starting training on $NODE ($WORKER_GPUS GPUs, node_rank=$WORKER_RANK)"
         ssh $NODE 'bash -c "
         source /share/project/huangxu/miniconda3/bin/activate && \
-        conda activate video-decode && \
-        cd /share/project/huangxu/SAE && \
+        conda activate sae && \
+        cd /share/project/huangxu/workspace/SAE && \
         # Kill existing tmux session if it exists
         tmux kill-session -t '$TMUX_SESSION' 2>/dev/null || true && \
         # First create tmux session with environment variables
@@ -53,7 +54,7 @@ for i in "${!WORKER_NODES[@]}"; do
             -e NUM_GPUS='"$WORKER_GPUS"' \
             -e JOB_ID='"$JOB_ID"' \
         # Then send commands to the session
-        tmux send-keys -t '$TMUX_SESSION' \"source /share/project/huangxu/miniconda3/bin/activate && conda activate video-decode && cd /share/project/huangxu/SAE && bash '"$TRAIN_SCRIPT"'\" C-m 
+        tmux send-keys -t '$TMUX_SESSION' \"source /share/project/huangxu/miniconda3/bin/activate && conda activate sae && cd /share/project/huangxu/workspace/SAE && bash '"$TRAIN_SCRIPT"'\" C-m 
     " ' &
 done
 

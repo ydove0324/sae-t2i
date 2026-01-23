@@ -1,12 +1,22 @@
+# cnn_decoder.py
+import math
+import contextlib
+from typing import NamedTuple, Optional, Tuple
+
 import torch
 import torch.nn.functional as F
-from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from torch import nn
-from typing import Literal, NamedTuple, Optional, Tuple
-import math
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+# your dinov3 import
 import sys
-sys.path.append('/share/project/huangxu/sae/SAE')
+sys.path.append('/share/project/huangxu/workspace/SAE')
 from models.dino_v3.modeling_dino_v3 import DINOv3ViTModel
+
+
+# =========================
+# Outputs
+# =========================
 
 class CausalAutoencoderOutput(NamedTuple):
     sample: torch.Tensor
@@ -20,111 +30,228 @@ class CausalEncoderOutput(NamedTuple):
 class CausalDecoderOutput(NamedTuple):
     sample: torch.Tensor
 
-class CausalDiffusionDecoderOutput(NamedTuple):
-    sample: torch.Tensor
-    mse_loss: torch.Tensor
+
+# =========================
+# LoRA Modules
+# =========================
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r: int = 32, alpha: int = 32, dropout: float = 0.0, enabled: bool = True):
+        super().__init__()
+        assert isinstance(base, nn.Linear)
+        self.base = base
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / max(r, 1)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.enabled = enabled
+
+        self.lora_down = nn.Linear(base.in_features, r, bias=False)
+        self.lora_up = nn.Linear(r, base.out_features, bias=False)
+
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, x):
+        out = self.base(x)
+        if self.enabled and self.r > 0:
+            out = out + self.lora_up(self.dropout(self.lora_down(x))) * self.scaling
+        return out
+
+
+class LoRAConv2d(nn.Module):
+    """
+    LoRA for Conv2d, best for patch-embed conv:
+      down: Conv2d(in->r, kernel=k, stride=s)
+      up:   Conv2d(r->out, kernel=1)
+    """
+    def __getattr__(self, name):
+        # nn.Module 自己的属性先走默认逻辑
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        # 再兜底到 base（比如 padding_mode 等）
+        return getattr(self.base, name)
+
+    @property
+    def weight(self):
+        return self.base.weight
+
+    @property
+    def bias(self):
+        return self.base.bias
+
+    def __init__(self, base: nn.Conv2d, r: int = 32, alpha: int = 32, dropout: float = 0.0, enabled: bool = True):
+        super().__init__()
+        assert isinstance(base, nn.Conv2d)
+        self.base = base
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / max(r, 1)
+        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.enabled = enabled
+
+        self.lora_down = nn.Conv2d(
+            base.in_channels, r,
+            kernel_size=base.kernel_size,
+            stride=base.stride,
+            padding=base.padding,
+            dilation=base.dilation,
+            groups=base.groups,
+            bias=False,
+        )
+        self.lora_up = nn.Conv2d(r, base.out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, x):
+        out = self.base(x)
+        if self.enabled and self.r > 0:
+            out = out + self.lora_up(self.dropout(self.lora_down(x))) * self.scaling
+        return out
+
+
+def _set_lora_enabled(module: nn.Module, enabled: bool):
+    for m in module.modules():
+        if isinstance(m, (LoRALinear, LoRAConv2d)):
+            m.enabled = enabled
+
+
+@contextlib.contextmanager
+def lora_disabled(module: nn.Module):
+    prev = []
+    for m in module.modules():
+        if isinstance(m, (LoRALinear, LoRAConv2d)):
+            prev.append((m, m.enabled))
+            m.enabled = False
+    try:
+        yield
+    finally:
+        for m, e in prev:
+            m.enabled = e
+
+
+def add_lora_to_dinov3(dino_model: nn.Module, r: int = 32, alpha: int = 32, dropout: float = 0.0):
+    """
+    Targets:
+      - dino_model.embeddings.patch_embeddings (Conv2d)
+      - each block.attention.{q_proj,k_proj,v_proj} (Linear)
+    """
+    # patch embed
+    pe = dino_model.embeddings.patch_embeddings
+    dino_model.embeddings.patch_embeddings = LoRAConv2d(pe, r=r, alpha=alpha, dropout=dropout, enabled=True)
+
+    # qkv
+    for blk in dino_model.layer:
+        attn = blk.attention
+        attn.q_proj = LoRALinear(attn.q_proj, r=r, alpha=alpha, dropout=dropout, enabled=True)
+        attn.k_proj = LoRALinear(attn.k_proj, r=r, alpha=alpha, dropout=dropout, enabled=True)
+        attn.v_proj = LoRALinear(attn.v_proj, r=r, alpha=alpha, dropout=dropout, enabled=True)
+
+    return dino_model
+
+
+# =========================
+# Feature alignment losses (VF loss)
+# =========================
+
+def vf_marginal_cos_loss(z_map: torch.Tensor, f_map: torch.Tensor, m1: float = 0.1, eps: float = 1e-6) -> torch.Tensor:
+    """
+    z_map,f_map: [B,C,H,W]
+    Lmcos = mean ReLU(1 - m1 - cos(z,f))
+    """
+    z = F.normalize(z_map, dim=1, eps=eps)
+    f = F.normalize(f_map, dim=1, eps=eps)
+    cos = (z * f).sum(dim=1)  # [B,H,W]
+    return F.relu(1.0 - m1 - cos).mean()
+
+
+def vf_mdms_loss(
+    z_map: torch.Tensor,
+    f_map: torch.Tensor,
+    m2: float = 0.1,
+    max_tokens: int = 32,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Pair-wise distance-matrix similarity with random token sampling.
+    z_map,f_map: [B,C,H,W]
+    - Flatten to tokens N=H*W
+    - Randomly sample K=min(N,max_tokens) positions (shared across batch)
+    - Compare cosine-sim matrices:
+        Lmdms = mean ReLU(|sim_z - sim_f| - m2)
+    """
+    B, C, H, W = z_map.shape
+    N = H * W
+    K = min(N, max_tokens)
+    if K <= 1:
+        return torch.zeros((), device=z_map.device, dtype=z_map.dtype)
+
+    # tokens: [B,N,C]
+    z = z_map.flatten(2).transpose(1, 2).contiguous()
+    f = f_map.flatten(2).transpose(1, 2).contiguous()
+
+    # sample shared indices for efficiency
+    idx = torch.randperm(N, device=z.device)[:K]
+    z = z[:, idx, :]
+    f = f[:, idx, :]
+
+    z = F.normalize(z, dim=-1, eps=eps)
+    f = F.normalize(f, dim=-1, eps=eps)
+
+    sim_z = torch.bmm(z, z.transpose(1, 2))  # [B,K,K]
+    sim_f = torch.bmm(f, f.transpose(1, 2))  # [B,K,K]
+
+    diff = (sim_z - sim_f).abs()
+    return F.relu(diff - m2).mean()
+
+
+# =========================
+# Utilities
+# =========================
 
 def mask_channels(tensor, mask_ratio=0.1, channel_dim=1):
-    """
-    Randomly sets a percentage of channels in the input tensor to zero.
-    
-    Args:
-        tensor (torch.Tensor): The input tensor.
-        mask_ratio (float): The fraction of channels to mask (0.0 to 1.0).
-        channel_dim (int): The dimension representing the channels.
-        
-    Returns:
-        torch.Tensor: A new tensor with masked channels.
-    """
-    # Clone to avoid modifying the original tensor in-place
     output = tensor.clone()
-    
-    # Get the total number of channels
     num_channels = tensor.shape[channel_dim]
-    
-    # Calculate how many channels to mask
     num_masked = int(num_channels * mask_ratio)
-    
     if num_masked == 0:
-        return output
-    
-    # Generate random permutation of channel indices and pick the first 'num_masked'
-    mask_indices = torch.randperm(num_channels)[:num_masked]
-    
-    # Create a simplified index object to access the dynamic channel dimension
-    # This creates a slice(None) [equivalent to :] for every dimension
+        return output, None
+    mask_indices = torch.randperm(num_channels, device=tensor.device)[:num_masked]
     idx = [slice(None)] * tensor.ndim
-    
-    # Replace the slice for the channel dimension with our specific indices
     idx[channel_dim] = mask_indices
-    
-    # Set the selected channels to zero
     output[idx] = 0
-    
     return output, mask_indices
 
 
+# =========================
+# Blocks for CNN decoder
+# =========================
+
 class ResnetBlock2D(nn.Module):
-    r"""
-    A Resnet block.
-
-    Parameters:
-        in_channels (`int`): The number of channels in the input.
-        out_channels (`int`, *optional*, default to be `None`):
-            The number of output channels for the first conv2d layer.
-            If None, same as `in_channels`.
-        dropout (`float`, *optional*, defaults to `0.0`): The dropout probability to use.
-    """
-
-    def __init__(
-        self, *, in_channels: int, out_channels: Optional[int] = None, dropout: float = 0.0
-    ):
+    def __init__(self, *, in_channels: int, out_channels: Optional[int] = None, dropout: float = 0.0):
         super().__init__()
-        self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
-        self.out_channels = out_channels
 
         self.nonlinearity = nn.SiLU()
-
-        self.norm1 = torch.nn.GroupNorm(
-            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
-        )
-
+        self.norm1 = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
-        self.norm2 = torch.nn.GroupNorm(
-            num_groups=32, num_channels=out_channels, eps=1e-6, affine=True
-        )
-
-        self.dropout = torch.nn.Dropout(dropout)
+        self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
+        self.dropout = nn.Dropout(dropout)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
 
-        self.use_in_shortcut = self.in_channels != out_channels
-
         self.conv_shortcut = None
-        if self.use_in_shortcut:
-            self.conv_shortcut = nn.Conv2d(
-                in_channels, out_channels, kernel_size=1, stride=1, padding=0
-            )
+        if in_channels != out_channels:
+            self.conv_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        hidden = input_tensor
-
-        hidden = self.norm1(hidden)
-        hidden = self.nonlinearity(hidden)
-        hidden = self.conv1(hidden)
-
-        hidden = self.norm2(hidden)
-        hidden = self.nonlinearity(hidden)
-        hidden = self.dropout(hidden)
-        hidden = self.conv2(hidden)
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(self.nonlinearity(self.norm1(x)))
+        h = self.conv2(self.dropout(self.nonlinearity(self.norm2(h))))
         if self.conv_shortcut is not None:
-            input_tensor = self.conv_shortcut(input_tensor)
-
-        output_tensor = input_tensor + hidden
-
-        return output_tensor
+            x = self.conv_shortcut(x)
+        return x + h
 
 
 class Upsample2D(nn.Module):
@@ -150,81 +277,6 @@ class Upsample2D(nn.Module):
         hidden_states = self.conv(hidden_states)
 
         return hidden_states
-
-
-class FinalBlock2D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, num_layers: int, dropout: float = 0.0):
-        super().__init__()
-        resnets = []
-
-        for i in range(num_layers):
-            in_channels = in_channels if i == 0 else out_channels
-            resnets.append(
-                ResnetBlock2D(in_channels=in_channels, out_channels=out_channels, dropout=dropout)
-            )
-
-        self.resnets = nn.ModuleList(resnets)
-
-    def forward(self, hidden_states: torch.Tensor):
-        for resnet in self.resnets:
-            hidden_states = resnet(hidden_states)
-        return hidden_states
-
-
-# align the normalization for imageNet
-class ScalingLayer2D(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # [-1, 1]
-        # dataloader 已经做了 mean=0.5, std=0.5 的 normalization
-        # 这里再做一次后就可以跟 ImageNet 的 normalization 对齐
-        self.register_buffer("shift", torch.Tensor([-0.030, -0.088, -0.188])[None, :, None, None])
-        self.register_buffer("scale", torch.Tensor([0.458, 0.448, 0.450])[None, :, None, None])
-
-    def forward(self, inp):
-        return (inp - self.shift) / self.scale
-
-
-class Encoder2D(nn.Module):
-    """
-    The Encoder part of the VAE, leveraging a pretrained DINOv3 ViT model
-    to extract a rich latent representation from an image.
-    """
-    def __init__(self):
-        super().__init__()
-
-        # Define a local path for the DINOv3 model files.
-        # This path must contain: model.safetensors, config.json, preprocessor_config.json
-        # For this self-contained example, these files will be virtually created if not found.
-        dinov3_model_dir = "/share/project/huangxu/models/dinov3"
-        
-        import os
-        # Ensure the directory exists for the placeholder model
-        os.makedirs(dinov3_model_dir, exist_ok=True)
-        # Create dummy config files if they don't exist, as `from_pretrained` might check
-        for fname in ["config.json", "preprocessor_config.json"]:
-            fpath = os.path.join(dinov3_model_dir, fname)
-            if not os.path.exists(fpath):
-                with open(fpath, "w") as f:
-                    f.write("{}") # Write an empty JSON object
-        
-        # Initialize the DINOv3 model (using our placeholder here)
-        self.dino_v3 = DINOv3ViTModel.from_pretrained(
-            pretrained_model_name_or_path=dinov3_model_dir,
-            use_safetensors=True, # Or False, depending on your actual model
-        )
-
-        self.normalization_layer = ScalingLayer2D()
-
-    def forward(self, sample: torch.Tensor):
-        """
-        Forward pass for the Encoder:
-        1. Normalize the input image.
-        2. Pass through the DINOv3 model.
-        """
-        normalized_sample = self.normalization_layer(sample)
-        pred_vit7b = self.dino_v3(pixel_values=normalized_sample)
-        return pred_vit7b
 
 
 class UpDecoderBlock2D(nn.Module):
@@ -258,6 +310,24 @@ class UpDecoderBlock2D(nn.Module):
 
         hidden_states = self.upsampler(hidden_states)
 
+        return hidden_states
+
+class FinalBlock2D(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, num_layers: int, dropout: float = 0.0):
+        super().__init__()
+        resnets = []
+
+        for i in range(num_layers):
+            in_channels = in_channels if i == 0 else out_channels
+            resnets.append(
+                ResnetBlock2D(in_channels=in_channels, out_channels=out_channels, dropout=dropout)
+            )
+
+        self.resnets = nn.ModuleList(resnets)
+
+    def forward(self, hidden_states: torch.Tensor):
+        for resnet in self.resnets:
+            hidden_states = resnet(hidden_states)
         return hidden_states
 
 
@@ -358,128 +428,260 @@ class Decoder2D(nn.Module):
         return sample
 
 
-class AutoencoderKL(nn.Module):
-    r"""
-    A VAE model with KL loss for encoding images into latents
-    and decoding latent representations into images.
+# =========================
+# Normalization for DINO input
+# =========================
+
+class ScalingLayer2D(nn.Module):
     """
+    input: [-1,1] (after dataset transform t*2-1)
+    output: aligned to ImageNet normalization for DINO (approx)
+    """
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("shift", torch.Tensor([-0.030, -0.088, -0.188])[None, :, None, None])
+        self.register_buffer("scale", torch.Tensor([0.458, 0.448, 0.450])[None, :, None, None])
 
-    _supports_gradient_checkpointing = True
-    _no_split_modules = ["ResnetBlock2D"]
+    def forward(self, x):
+        return (x - self.shift) / self.scale
 
+
+# =========================
+# Encoder (DINOv3 + LoRA)
+# =========================
+
+class Encoder2D(nn.Module):
+    def __init__(self, dinov3_model_dir: str, lora_rank=32, lora_alpha=32, lora_dropout=0.0, enable_lora=True):
+        super().__init__()
+        self.dino_v3 = DINOv3ViTModel.from_pretrained(
+            pretrained_model_name_or_path=dinov3_model_dir,
+            use_safetensors=True,
+        )
+        add_lora_to_dinov3(self.dino_v3, r=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
+        _set_lora_enabled(self.dino_v3, enable_lora)
+
+        self.normalization_layer = ScalingLayer2D()
+
+    def set_lora_enabled(self, enabled: bool):
+        _set_lora_enabled(self.dino_v3, enabled)
+
+    @contextlib.contextmanager
+    def lora_disabled(self):
+        with lora_disabled(self.dino_v3):
+            yield
+
+    def forward(self, x: torch.Tensor):
+        x = self.normalization_layer(x)
+        return self.dino_v3(pixel_values=x)
+
+
+# =========================
+# AutoencoderKL (DINO encoder + CNN decoder)
+# =========================
+
+def _grad_norm(loss, params, eps=1e-12):
+    grads = torch.autograd.grad(loss, params, retain_graph=True, create_graph=False, allow_unused=True)
+    norms = []
+    for g in grads:
+        if g is not None:
+            norms.append(g.detach().norm())
+    if len(norms) == 0:
+        return torch.tensor(0.0, device=loss.device)
+    return torch.norm(torch.stack(norms))  # L2 over per-param norms
+
+class AutoencoderKL(nn.Module):
     def __init__(
         self,
-        in_channels: int = 3,
+        dinov3_model_dir: str,
+        image_size: int = 256,
+        patch_size: int = 16,
         out_channels: int = 3,
-        enc_block_out_channels: Tuple[int] = (64,),
-        dec_block_out_channels: Tuple[int] = (64,),
-        enc_layers_per_block: int = 1,
-        dec_layers_per_block: int = 1,
-        latent_channels: int = 4,
-        use_quant_conv: bool = True,
-        use_post_quant_conv: bool = True,
+
+        latent_channels: int = 1280,             # DINO hidden size
+        target_latent_channels: Optional[int] = None,
+
+        # extra downsample factor (total must be 16 * 2^k)
+        spatial_downsample_factor: int = 16,
+
+        # decoder channels, number of upsample stages = len(block_out_channels)-1
+        dec_block_out_channels: Tuple[int, ...] = (1280, 1024, 512, 256, 128),
+        dec_layers_per_block: int = 2,
+        decoder_dropout: float = 0.0,
         gradient_checkpointing: bool = False,
-        spatial_downsample_factor: int = 1,
+
+        # VAE behavior
         variational: bool = True,
-        latent_as_rep: bool = True,
-        noise_tau: float = 0.8,
-        denormalize_decoder_output: bool = True,
-        running_mode: str = "dec",
-        random_masking_channel_ratio: float = 0.1,
-        target_latent_channels: Optional[int] = None,  # 新增：目标 latent channel 数，用于 channel 降维
-        *args,
-        **kwargs,
+        kl_weight: float = 1e-6,
+
+        # regularization
+        noise_tau: float = 0.0,
+        random_masking_channel_ratio: float = 0.0,
+
+        # LoRA
+        lora_rank: int = 32,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.0,
+        enable_lora: bool = True,
+
+        # VF loss hyper
+        vf_margin_cos: float = 0.1,
+        vf_margin_dms: float = 0.3,
+        vf_max_tokens: int = 32,
+        vf_hyper: float = 1.0,
+        vf_use_adaptive_weight: bool = True,
+        vf_weight_clamp: float = 1e4,
+        training_mode:str = "enc_dec",
+        denormalize_decoder_output=True,
     ):
         super().__init__()
 
-        assert 2 ** (len(dec_block_out_channels) - 1) == spatial_downsample_factor
-
-        self.spatial_downsample_factor = spatial_downsample_factor
+        self.image_size = image_size
+        self.patch_size = patch_size
         self.variational = variational
-        self.latent_as_rep = latent_as_rep
+        self.kl_weight = kl_weight
         self.noise_tau = noise_tau
-        self.denormalize_decoder_output = denormalize_decoder_output
         self.random_masking_channel_ratio = random_masking_channel_ratio
-        
-        # Channel 降维设置：如果 target_latent_channels 未指定或等于 latent_channels，则不做 channel 降维
+
+        self.vf_margin_cos = vf_margin_cos
+        self.vf_margin_dms = vf_margin_dms
+        self.vf_max_tokens = vf_max_tokens
+        self.vf_hyper = vf_hyper
+        self.vf_use_adaptive_weight = vf_use_adaptive_weight
+        self.vf_weight_clamp = vf_weight_clamp
+
         self.original_latent_channels = latent_channels
         self.target_latent_channels = target_latent_channels if target_latent_channels is not None else latent_channels
-        self.use_channel_downsample = self.target_latent_channels != latent_channels
+        self.use_channel_downsample = (self.target_latent_channels != latent_channels)
+        self.denormalize_decoder_output = denormalize_decoder_output
 
-        print(f"here is the random mask ratio {self.random_masking_channel_ratio}")
+        # Encoder
+        self.encoder = Encoder2D(
+            dinov3_model_dir=dinov3_model_dir,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            enable_lora=enable_lora,
+        )
+        # if training_mode == "dec":
+        #     self.encoder.eval()
+
+        # extra spatial downsample after ViT 16x factor
+        assert spatial_downsample_factor % 16 == 0, "spatial_downsample_factor must be 16 * 2^k"
+        extra_factor = spatial_downsample_factor // 16
+        assert extra_factor & (extra_factor - 1) == 0, "only allow 16 * 2^k"
+        extra_steps = int(math.log2(extra_factor)) if extra_factor > 1 else 0
+
+        self.latent_downsample_layers = nn.ModuleList([
+            nn.Conv2d(latent_channels, latent_channels, kernel_size=3, stride=2, padding=1)
+            for _ in range(extra_steps)
+        ])
+
+        # optional channel downsample
+        self.channel_downsample_conv = None
+        effective_c = latent_channels
         if self.use_channel_downsample:
-            print(f"[DINO_VAE] Channel downsample enabled: {latent_channels} -> {self.target_latent_channels}")
+            self.channel_downsample_conv = nn.Conv2d(latent_channels, self.target_latent_channels, kernel_size=1, stride=1, padding=0)
+            effective_c = self.target_latent_channels
 
-        # pass init params to Encoder
-        self.encoder = Encoder2D()
+        # VAE moments head: feature -> (mu, logvar)
+        self.to_moments = nn.Conv2d(effective_c, 2 * effective_c, kernel_size=1, stride=1, padding=0)
 
-        # Channel 降维的 1x1 卷积层
-        if self.use_channel_downsample:
-            # Encoder 端: 1280 -> target_latent_channels（降维）
-            self.channel_downsample_conv = nn.Conv2d(
-                latent_channels, self.target_latent_channels, kernel_size=1, stride=1, padding=0
-            )
-            decoder_in_channels = self.target_latent_channels  # decoder 直接接收降维后的特征
-        else:
-            self.channel_downsample_conv = None
-            decoder_in_channels = latent_channels
-
-        # pass init params to Decoder
+        # Decoder
         self.decoder = Decoder2D(
-            in_channels=decoder_in_channels,
+            in_channels=effective_c,
             out_channels=out_channels,
             block_out_channels=dec_block_out_channels,
             layers_per_block=dec_layers_per_block,
             gradient_checkpointing=gradient_checkpointing,
         )
 
-        # quant_conv 需要根据是否有 channel downsample 来调整
-        effective_latent_channels = self.target_latent_channels if self.use_channel_downsample else latent_channels
-        self.quant_conv = (
-            nn.Conv2d(2 * effective_latent_channels, 2 * effective_latent_channels, 1) if use_quant_conv else None
-        )
-        self.post_quant_conv = (
-            nn.Conv2d(effective_latent_channels, effective_latent_channels, 1) if use_post_quant_conv else None
-        )
-
-        self.running_mode = running_mode
-
-        # Additional latent downsampling after DINO's fixed 16x16 grid.
-        # Only support total factors of 16 * 2^k (i.e., 16x, 32x, 64x, ...).
-        assert (
-            self.spatial_downsample_factor % 16 == 0
-        ), "spatial_downsample_factor 必须是 16 的整数倍 (16×2^k)"
-        extra_factor = self.spatial_downsample_factor // 16
-        # extra_factor must be power of two
-        assert (
-            extra_factor & (extra_factor - 1) == 0
-        ), "仅支持 16× 的 2 的幂倍数（例如 16/32/64）"
-        extra_steps = 0 if extra_factor == 0 else int(math.log2(extra_factor))
-
-        # latent_downsample_layers 在 channel downsample 之前操作，所以使用原始 latent_channels
-        self.latent_downsample_layers = nn.ModuleList(
-            [
-                nn.Conv2d(
-                    latent_channels, latent_channels, kernel_size=3, stride=2, padding=1
-                )
-                for _ in range(extra_steps)
-            ]
-        )
-
-        # If running in decoder-only mode, freeze DINOv3 parameters only
-        if self.running_mode == "dec":
-            print(f"[DINO_VAE] running mode = {self.running_mode} only decoder is trained")
-            for p in self.encoder.dino_v3.parameters():
-                p.requires_grad = False
-
     def _noising(self, tensor: torch.Tensor) -> torch.Tensor:
+        # sigma per-sample
         noise_sigma = self.noise_tau * torch.rand(
             (tensor.shape[0],) + (1,) * (tensor.dim() - 1),
             device=tensor.device,
             dtype=tensor.dtype,
         )
-        noise = noise_sigma * torch.randn_like(tensor)
-        return tensor + noise
+        return tensor + noise_sigma * torch.randn_like(tensor)
+
+    def _extract_patch_map(self, pred) -> torch.Tensor:
+        """
+        pred.last_hidden_state: [B, 1 + R + N, C]
+        return patch map: [B, C, S, S]
+        """
+        # robust prefix length
+        cls_len = 1
+        reg_len = 0
+        if hasattr(self.encoder.dino_v3, "config") and hasattr(self.encoder.dino_v3.config, "num_register_tokens"):
+            reg_len = int(self.encoder.dino_v3.config.num_register_tokens)
+        else:
+            reg_len = 4  # fallback
+        tokens = pred.last_hidden_state[:, cls_len + reg_len:, :]  # [B,N,C]
+
+        B, N, C = tokens.shape
+        S = int(math.sqrt(N))
+        assert S * S == N, f"patch token count N={N} is not square; check image size/patch size."
+        feat = tokens.transpose(1, 2).contiguous().view(B, C, S, S)
+        return feat
+
+    def get_vf_ref_param(self):
+        for n, p in self.encoder.dino_v3.named_parameters():
+            if ("lora_up" in n) or ("lora_down" in n):
+                if p.requires_grad:
+                    return p
+        return self.encoder.dino_v3.embeddings.patch_embeddings.weight  # fallback
+
+    def encode_features(self, x: torch.Tensor, use_lora: bool = True) -> torch.Tensor:
+        if use_lora:
+            pred = self.encoder(x)
+        else:
+            with torch.no_grad():
+                with self.encoder.lora_disabled():
+                    pred = self.encoder(x)
+        feat = self._extract_patch_map(pred)  # [B,C,S,S] (C=1280)
+        return feat
+
+    def compute_vf_loss(self, z_feat: torch.Tensor, f_feat: torch.Tensor) -> torch.Tensor:
+        lmcos = vf_marginal_cos_loss(z_feat, f_feat, m1=self.vf_margin_cos)
+        lmdms = vf_mdms_loss(z_feat, f_feat, m2=self.vf_margin_dms, max_tokens=self.vf_max_tokens)
+        return lmcos + lmdms
+
+    def adaptive_weight(self, loss_rec, loss_vf, params, eps=1e-6):
+        n_rec = _grad_norm(loss_rec, params)
+        n_vf  = _grad_norm(loss_vf,  params)
+        if (n_rec == 0) or (n_vf == 0):
+            return torch.tensor(1.0, device=loss_rec.device, dtype=loss_rec.dtype)
+        w = (n_rec / (n_vf + eps)).clamp(0.0, self.vf_weight_clamp).detach()
+        return w
+
+    def encode(self, x: torch.Tensor,sample_posterior: bool | None = None) -> CausalEncoderOutput:
+        feat = self.encode_features(x, use_lora=True)  # [B,1280,S,S]
+
+        # extra downsample
+        for conv in self.latent_downsample_layers:
+            feat = conv(feat)
+
+        # channel downsample
+        if self.channel_downsample_conv is not None:
+            feat = self.channel_downsample_conv(feat)
+
+        moments = self.to_moments(feat)  # [B,2C,H,W]
+
+        posterior = DiagonalGaussianDistribution(moments, deterministic=False)
+
+        if sample_posterior is None:
+            sample_posterior = self.training
+
+        z = posterior.sample() if sample_posterior else posterior.mode()
+
+        if self.random_masking_channel_ratio > 0.0:
+            z, _ = mask_channels(z, mask_ratio=self.random_masking_channel_ratio, channel_dim=1)
+
+        if self.training and self.noise_tau > 0:
+            z = self._noising(z)
+
+        return CausalEncoderOutput(latent=z, posterior=posterior)
+    
 
     def _denormalize_output(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self.denormalize_decoder_output:
@@ -491,67 +693,12 @@ class AutoencoderKL(nn.Module):
         imagenet_std = torch.Tensor([0.229, 0.224, 0.225])[None, :, None, None].to(device)
         return (tensor * imagenet_std + imagenet_mean)
 
-    def forward(self, x: torch.FloatTensor) -> CausalAutoencoderOutput:
-        z, p = self.encode(x)
-        assert x.size(-2) // z.size(-2) == self.spatial_downsample_factor
-        assert x.size(-1) // z.size(-1) == self.spatial_downsample_factor
-        x = self.decode(z).sample
-        return CausalAutoencoderOutput(x, z, p)
-
-    def encode(self, x: torch.FloatTensor) -> CausalEncoderOutput:
-        # print(f"here is the input data device: {x.device}")
-        # print(f"here is the encoder device: {self.encoder.device}")
-
-        # for name, param in self.encoder.base_model.named_parameters():
-        #     print(f"参数 {name} 所在设备: {param.device}")
-
-        if self.running_mode == "dec":
-            # print(f"[DINO_VAE] running mode = {self.running_mode} only decoder is trained")
-            with torch.no_grad():
-                pred_vit7b = self.encoder(x)  # return a baseresponse
-        else:
-            # print(f"[DINO_VAE] running mode = {self.running_mode} both encoder and decoder are trained")
-            pred_vit7b = self.encoder(x)
-
-        cls_len = 1  # cls_token 通常只有1个
-        register_len = 4  # 注册token的数量
-
-        # 2. 切片获取 patch_embeddings
-        patch_embeddings_restored = pred_vit7b.last_hidden_state[:, cls_len + register_len :, :]
-
-        restored_tensor = patch_embeddings_restored.transpose(1, 2).view(
-            patch_embeddings_restored.shape[0], -1, 16, 16
-        )
-
-        # Apply optional extra latent downsampling (stride=2 convs) - 空间下采样
-        for conv in self.latent_downsample_layers:
-            restored_tensor = conv(restored_tensor)
-
-        # Apply channel downsampling if enabled - 通道降维
-        if self.channel_downsample_conv is not None:
-            restored_tensor = self.channel_downsample_conv(restored_tensor)
-
-        if self.training and self.noise_tau > 0:
-            restored_tensor = self._noising(restored_tensor)
-
-        h = self.quant_conv(restored_tensor) if self.quant_conv is not None else restored_tensor
-        p = DiagonalGaussianDistribution(h, deterministic=not self.variational)
-        # z = p.sample() if self.variational else p.mode()
-        # Apply the mask
-        if self.random_masking_channel_ratio > 0.0:
-            h_masked, indices_zeroed = mask_channels(restored_tensor, mask_ratio=self.random_masking_channel_ratio, channel_dim=1)
-            return CausalEncoderOutput(h_masked, p)
-        else:
-            return CausalEncoderOutput(h, p)
-
-    def decode(self, z: torch.FloatTensor) -> CausalDecoderOutput:
-        z = self.post_quant_conv(z) if self.post_quant_conv is not None else z
+    def decode(self, z: torch.Tensor) -> CausalDecoderOutput:
         x = self.decoder(z)
         x = self._denormalize_output(x)
         return CausalDecoderOutput(x)
-    def forward(self, x: torch.FloatTensor) -> CausalAutoencoderOutput:
-        z, p = self.encode(x)
-        assert x.size(-2) // z.size(-2) == self.spatial_downsample_factor
-        assert x.size(-1) // z.size(-1) == self.spatial_downsample_factor
-        x = self.decode(z).sample
-        return CausalAutoencoderOutput(x, z, p)
+
+    def forward(self, x: torch.Tensor) -> CausalAutoencoderOutput:
+        enc = self.encode(x)
+        dec = self.decode(enc.latent)
+        return CausalAutoencoderOutput(dec.sample, enc.latent, enc.posterior)

@@ -30,6 +30,9 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy, MixedPrecision, StateDictType, FullStateDictConfig
+from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
@@ -49,18 +52,16 @@ from models.rae.utils.train_utils import parse_configs
 from models.rae.utils.model_utils import instantiate_from_config
 from models.rae.utils import wandb_utils
 from models.rae.utils.optim_utils import build_optimizer, build_scheduler
-
-# === Diffusion decoder VAE ===
-from sae_model import AutoencoderKL as DiffusionAutoencoderKL
+from models.rae.utils.vae_utils import (
+    load_dinov3_vae,
+    normalize_sae,
+    denormalize_sae,
+    reconstruct_from_latent_with_diffusion,
+)
 
 # === Datasets ===
 from dataset import ImageNetIdxDataset, OverfitSingleImageDataset, SingleClassDataset
-
-# Optional CNN decoder import for decoder_type="cnn_decoder"
-try:
-    import cnn_decoder
-except ImportError:
-    cnn_decoder = None
+from torch.amp import autocast
 
 
 #################################################################################
@@ -71,11 +72,35 @@ except ImportError:
 def update_ema(ema_model, model, decay=0.9999):
     """
     Step the EMA model towards the current model.
+    Supports EMA on CPU and model on GPU.
     """
     ema_params = OrderedDict(ema_model.named_parameters())
     model_params = OrderedDict(model.named_parameters())
+    ema_device = next(ema_model.parameters()).device
     for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+        # 如果 EMA 在 CPU 上，需要先把 model 参数复制到 CPU
+        param_data = param.data.to(ema_device) if param.device != ema_device else param.data
+        ema_params[name].mul_(decay).add_(param_data, alpha=1 - decay)
+
+
+@torch.no_grad()
+def update_ema_fsdp(ema_model, fsdp_model, decay=0.9999):
+    """
+    Update EMA from FSDP wrapped model.
+    Uses summon_full_params to get full parameters from FSDP shards.
+    """
+    ema_device = next(ema_model.parameters()).device
+    
+    # 使用 summon_full_params 临时获取完整参数
+    with FSDP.summon_full_params(fsdp_model, writeback=False, recurse=True):
+        model_inner = fsdp_model.module if hasattr(fsdp_model, 'module') else fsdp_model
+        ema_params = OrderedDict(ema_model.named_parameters())
+        model_params = OrderedDict(model_inner.named_parameters())
+        
+        for name, param in model_params.items():
+            if name in ema_params:
+                param_data = param.data.to(ema_device) if param.device != ema_device else param.data
+                ema_params[name].mul_(decay).add_(param_data, alpha=1 - decay)
 
 
 def requires_grad(model, flag=True):
@@ -91,6 +116,36 @@ def cleanup():
     End DDP training.
     """
     dist.destroy_process_group()
+
+
+def unwrap_model(model):
+    """
+    获取 DDP 或 FSDP 包装模型的内部原始模型。
+    """
+    if isinstance(model, FSDP):
+        return model.module
+    elif isinstance(model, DDP):
+        return model.module
+    elif hasattr(model, "module"):
+        return model.module
+    return model
+
+
+def get_model_state_dict(model):
+    """
+    获取模型状态字典，兼容 DDP 和 FSDP。
+    对于 FSDP，需要使用 full_state_dict 来收集所有分片。
+    """
+    if isinstance(model, FSDP):
+        # FSDP 需要特殊处理来收集完整的状态字典
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            return model.state_dict()
+    elif isinstance(model, DDP):
+        return model.module.state_dict()
+    elif hasattr(model, "module"):
+        return model.module.state_dict()
+    return model.state_dict()
 
 
 def create_logger(logging_dir):
@@ -130,140 +185,9 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
-def normalize_sae(tensor):
-    ema_shift_factor = 0.0019670347683131695
-    ema_scale_factor = 0.247765451669693
-    return (tensor - ema_shift_factor) / ema_scale_factor
-
-
-def denormalize_sae(tensor):
-    ema_shift_factor = 0.0019670347683131695
-    ema_scale_factor = 0.247765451669693
-    return tensor * ema_scale_factor + ema_shift_factor
-
-
 #################################################################################
 #                         Latent & Diffusion Sampling Logic                     #
 #################################################################################
-
-@torch.no_grad()
-def reconstruct_from_latent_with_diffusion(
-    vae,
-    latent_z: torch.Tensor,
-    image_shape: torch.Size,
-    diffusion_steps: int = 25,
-    decoder_type: str = "diffusion_decoder",
-) -> torch.Tensor:
-    """
-    Given latent_z from DINO encoder (or model prediction in the same latent space),
-    run the full decoder reconstruction.
-
-    decoder_type:
-      - "diffusion_decoder": use sae_model.AutoencoderKL diffusion_decoder sampling loop
-      - "cnn_decoder":       use cnn_decoder.AutoencoderKL decode() directly (no diffusion loop)
-    """
-    device = latent_z.device
-    z = denormalize_sae(latent_z)
-
-    if decoder_type == "diffusion_decoder":
-        if getattr(vae, "post_quant_conv", None) is not None and vae.post_quant_conv is not None:
-            z = vae.post_quant_conv(z)
-
-        context = vae.diffusion_decoder.get_context(z)
-        corrected_context = list(reversed(context[:]))
-
-        diffusion = vae.diffusion_decoder.diffusion
-        diffusion.set_sample_schedule(diffusion_steps, device)
-
-        init_noise = torch.randn(
-            image_shape,
-            device=device,
-            dtype=latent_z.dtype,
-        )
-
-        recon = diffusion.p_sample_loop(
-            vae=vae,
-            shape=image_shape,
-            context=corrected_context,
-            clip_denoised=True,
-            init_noise=init_noise,
-            eta=0.0,
-        )
-        return recon
-
-    elif decoder_type == "cnn_decoder":
-        if not hasattr(vae, "decode"):
-            raise AttributeError("VAE does not have decode(); cnn_decoder requires vae.decode(z).")
-        out = vae.decode(z)
-        recon = out.sample if hasattr(out, "sample") else out
-        return recon
-
-    else:
-        raise ValueError(f"Unknown decoder_type: {decoder_type}")
-
-
-def load_dinov3_vae(
-    vae_checkpoint_path: str,
-    device: torch.device,
-    decoder_type: str = "diffusion_decoder",
-):
-    """
-    Build and load DINOv3 AutoencoderKL.
-
-    decoder_type:
-      - "diffusion_decoder": sae_model.AutoencoderKL
-      - "cnn_decoder":       cnn_decoder.AutoencoderKL
-    """
-    if decoder_type == "cnn_decoder":
-        if cnn_decoder is None:
-            raise ImportError("cnn_decoder module not found, cannot use decoder_type='cnn_decoder'.")
-        AutoencoderClass = cnn_decoder.AutoencoderKL
-        print("[load_dinov3_vae] Using CNN decoder (cnn_decoder.AutoencoderKL).")
-    elif decoder_type == "diffusion_decoder":
-        AutoencoderClass = DiffusionAutoencoderKL
-        print("[load_dinov3_vae] Using diffusion decoder (sae_model.AutoencoderKL).")
-    else:
-        raise ValueError(f"Unknown decoder_type: {decoder_type}")
-
-    model_params = {
-        "in_channels": 3,
-        "out_channels": 3,
-        "enc_block_out_channels": [128, 256, 384, 512, 768],
-        "dec_block_out_channels": [1280, 1024, 512, 256, 128],
-        "enc_layers_per_block": 2,
-        "dec_layers_per_block": 3,
-        "latent_channels": 1280,
-        "use_quant_conv": False,
-        "use_post_quant_conv": False,
-        "spatial_downsample_factor": 16,
-        "variational": False,
-        "noise_tau": 0.0,
-        "denormalize_decoder_output": False,
-        "running_mode": "dec",
-        "random_masking_channel_ratio": 0.0,
-        "target_latent_channels": None,
-        "lpips_weight": 0.1,
-    }
-
-    vae = AutoencoderClass(**model_params).to(device)
-
-    print(f"[load_dinov3_vae] Loading VAE checkpoint from: {vae_checkpoint_path}")
-    checkpoint = torch.load(vae_checkpoint_path, map_location="cpu")
-
-    if "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    elif "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    else:
-        state_dict = checkpoint
-
-    missing, unexpected = vae.load_state_dict(state_dict, strict=False)
-    print(f"[load_dinov3_vae] Loaded VAE. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
-
-    vae.eval()
-    requires_grad(vae, False)
-    return vae
-
 
 def compute_train_loss(
     model,
@@ -331,8 +255,10 @@ def sample_latent_linear_50_steps(
 
     Note: this is an Euler-style integrator for v-pred, and DDIM-like update for x-pred.
     """
-    model_inner = model.module if hasattr(model, "module") else model
-    model_inner.eval()
+    # 对于 FSDP/DDP 模型，直接使用包装后的模型进行推理
+    # FSDP 在 forward 时会自动 all-gather 参数
+    was_training = model.training
+    model.eval()
 
     C, H, W = latent_shape
     if init_noise is None:
@@ -353,7 +279,7 @@ def sample_latent_linear_50_steps(
         t = flow_shift(t_lin)
         t_next = flow_shift(t_next_lin)
 
-        model_out = model_inner(x, t, y=y)
+        model_out = model(x, t, y=y)
 
         t_scalar = t.view(batch_size, 1, 1, 1)
         t_next_scalar = t_next.view(batch_size, 1, 1, 1)
@@ -372,6 +298,10 @@ def sample_latent_linear_50_steps(
 
         else:
             raise ValueError(f"Unknown pred_mode: {pred_mode}")
+
+    # 恢复模型原来的训练状态
+    if was_training:
+        model.train()
 
     return x
 
@@ -447,7 +377,7 @@ def main(args):
     ema_decay = float(training_cfg.get("ema_decay", 0.9995))
     epochs = int(training_cfg.get("epochs", 1400))
     num_workers = int(training_cfg.get("num_workers", 4))
-    log_every = int(training_cfg.get("log_every", 100))
+    log_every = int(training_cfg.get("log_every", 10))
     ckpt_every = int(training_cfg.get("ckpt_every", 5_000))
     default_seed = int(training_cfg.get("global_seed", 0))
     global_seed = args.global_seed if args.global_seed is not None else default_seed
@@ -464,7 +394,7 @@ def main(args):
     dist.init_process_group("nccl")
     world_size = dist.get_world_size()
 
-    if global_batch_size % (world_size * grad_accum_steps) != 0:
+    if (global_batch_size * args.fsdp_size) % (world_size * grad_accum_steps) != 0:
         raise ValueError("Global batch size must be divisible by world_size * grad_accum_steps.")
 
     rank = dist.get_rank()
@@ -478,7 +408,7 @@ def main(args):
     if rank == 0:
         print(f"Starting rank={rank}, seed={seed}, world_size={world_size}.")
 
-    micro_batch_size = global_batch_size // (world_size * grad_accum_steps)
+    micro_batch_size = global_batch_size * args.fsdp_size // (world_size * grad_accum_steps)
 
     use_bf16 = args.precision == "bf16"
     if use_bf16 and not torch.cuda.is_bf16_supported():
@@ -533,8 +463,13 @@ def main(args):
 
     # ---------------- Stage2 model ----------------
     model: Stage2ModelProtocol = instantiate_from_config(model_config).to(device)
-    ema = deepcopy(model).to(device)
+    
+    # EMA 可以放在 CPU 上以节省 GPU 显存
+    ema_device = torch.device("cpu") if args.ema_cpu else device
+    ema = deepcopy(model).to(ema_device)
     requires_grad(ema, False)
+    if args.ema_cpu:
+        logger.info("EMA model kept on CPU to save GPU memory.")
 
     opt_state = None
     sched_state = None
@@ -554,11 +489,36 @@ def main(args):
     model_param_count = sum(p.numel() for p in model.parameters())
     logger.info(f"Model Parameters: {model_param_count/1e6:.2f}M")
 
-    model = DDP(model, device_ids=[device_idx], gradient_as_bucket_view=False)
+    # 根据 fsdp_size 选择 DDP 或 FSDP
+    if args.fsdp_size > 1:
+        # 使用 FSDP 分割优化器状态，节省显存
+        fsdp_mixed_precision = None
+        if args.precision == "bf16":
+            fsdp_mixed_precision = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+                buffer_dtype=torch.bfloat16,
+            )
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            mixed_precision=fsdp_mixed_precision,
+            device_id=device_idx,
+            use_orig_params=True,  # 允许访问原始参数，方便 optimizer
+        )
+        logger.info(f"Using FSDP with sharding_strategy=FULL_SHARD, fsdp_size={args.fsdp_size}")
+    else:
+        model = DDP(model, device_ids=[device_idx], gradient_as_bucket_view=False)
+        logger.info("Using DDP")
 
     opt, opt_msg = build_optimizer(model.parameters(), training_cfg)
     if opt_state is not None:
         opt.load_state_dict(opt_state)
+
+    # ---------------- AMP 设置 ----------------
+    use_amp = args.precision == "bf16"
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    logger.info(f"AMP enabled: {use_amp}, dtype: {amp_dtype}")
 
     # ---------------- dataset / loader ----------------
     transform = transforms.Compose([
@@ -611,7 +571,11 @@ def main(args):
     schedl, sched_msg = build_scheduler(opt, steps_per_epoch, training_cfg, sched_state)
 
     # Init EMA
-    update_ema(ema, model.module, decay=0.0)
+    use_fsdp = args.fsdp_size > 1
+    if use_fsdp:
+        update_ema_fsdp(ema, model, decay=0.0)
+    else:
+        update_ema(ema, unwrap_model(model), decay=0.0)
     model.train()
     ema.eval()
 
@@ -635,20 +599,20 @@ def main(args):
             y = y.to(device)
 
             img_gt = (x_img + 1.0) / 2.0
-
+            # print("step",train_steps)
             with torch.no_grad():
                 x_latent, _p = dinov3_vae.encode(x_img)
                 x_latent = normalize_sae(x_latent)
-
             model_kwargs = dict(y=y)
 
-            loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
-                model=model,
-                x_latent=x_latent,
-                model_kwargs=model_kwargs,
-                time_shift=time_shift,
-                pred_mode=args.prediction_mode,
-            )
+            with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
+                    model=model,
+                    x_latent=x_latent,
+                    model_kwargs=model_kwargs,
+                    time_shift=time_shift,
+                    pred_mode=args.prediction_mode,
+                )
 
             # NaN check across ranks
             is_nan_local = 0 if torch.isfinite(loss_tensor) else 1
@@ -677,7 +641,10 @@ def main(args):
 
             opt.step()
             schedl.step()
-            update_ema(ema, model.module, decay=ema_decay)
+            if use_fsdp:
+                update_ema_fsdp(ema, model, decay=ema_decay)
+            else:
+                update_ema(ema, unwrap_model(model), decay=ema_decay)
             opt.zero_grad(set_to_none=True)
 
             running_loss += step_loss_accum / grad_accum_steps
@@ -687,13 +654,15 @@ def main(args):
             step_loss_accum = 0.0
 
             # ---------------- Visualization ----------------
+            # 注意：FSDP 模型的 forward 需要所有 rank 同时执行
+            # 所以所有 rank 都要参与采样，只让 rank 0 保存图片
             show_time = args.vis_every
             DEBUG = False
-            if rank == 0 and ((train_steps % show_time == 0) or DEBUG):
+            if (rank // args.fsdp_size == 0) and ((train_steps % show_time == 0) or DEBUG):
                 with torch.no_grad():
                     y_sample = y[:1]
 
-                    # 1) Full sampling (generation)
+                    # 1) Full sampling (generation) - 所有 rank 都执行
                     img_gen, z_gen = stage2_sample_and_reconstruct(
                         model=model,
                         dinov3_vae=dinov3_vae,
@@ -708,51 +677,53 @@ def main(args):
                         decoder_type=args.decoder_type,
                     )
 
-                    img_gen_01 = (img_gen + 1.0) / 2.0
-                    vis_dir = os.path.join(experiment_dir, "samples")
-                    os.makedirs(vis_dir, exist_ok=True)
-                    save_image(img_gen_01.clamp(0, 1), os.path.join(vis_dir, f"gen_step_{train_steps:07d}.png"))
+                    # 只有 rank 0 保存图片
+                    if rank == 0:
+                        img_gen_01 = (img_gen + 1.0) / 2.0
+                        vis_dir = os.path.join(experiment_dir, "samples")
+                        os.makedirs(vis_dir, exist_ok=True)
+                        save_image(img_gen_01.clamp(0, 1), os.path.join(vis_dir, f"gen_step_{train_steps:07d}.png"))
 
-                    # 2) One-step reconstruction monitor
-                    if args.prediction_mode == "x":
-                        x0_pred_step = pred_latent[0:1]
-                    else:
-                        # v = eps - x0  => x0 = eps - v
-                        x0_pred_step = noise[0:1] - pred_latent[0:1]
+                        # 2) One-step reconstruction monitor
+                        if args.prediction_mode == "x":
+                            x0_pred_step = pred_latent[0:1]
+                        else:
+                            # v = eps - x0  => x0 = eps - v
+                            x0_pred_step = noise[0:1] - pred_latent[0:1]
 
-                    recon = reconstruct_from_latent_with_diffusion(
-                        vae=dinov3_vae,
-                        latent_z=x0_pred_step,
-                        image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
-                        diffusion_steps=args.vae_diffusion_steps,
-                        decoder_type=args.decoder_type,
-                    )
+                        recon = reconstruct_from_latent_with_diffusion(
+                            vae=dinov3_vae,
+                            latent_z=x0_pred_step,
+                            image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
+                            diffusion_steps=args.vae_diffusion_steps,
+                            decoder_type=args.decoder_type,
+                        )
 
-                    # Original noisy latent reconstruction monitor
-                    # x_t = t*eps + (1-t)*x0
-                    t0 = t_sample[0].view(1, 1, 1, 1)
-                    x_latent_noisy = x_latent[0:1] * (1.0 - t0) + noise[0:1] * t0
+                        # Original noisy latent reconstruction monitor
+                        # x_t = t*eps + (1-t)*x0
+                        t0 = t_sample[0].view(1, 1, 1, 1)
+                        x_latent_noisy = x_latent[0:1] * (1.0 - t0) + noise[0:1] * t0
 
-                    x_recon_noisy = reconstruct_from_latent_with_diffusion(
-                        vae=dinov3_vae,
-                        latent_z=x_latent_noisy,
-                        image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
-                        diffusion_steps=args.vae_diffusion_steps,
-                        decoder_type=args.decoder_type,
-                    )
+                        x_recon_noisy = reconstruct_from_latent_with_diffusion(
+                            vae=dinov3_vae,
+                            latent_z=x_latent_noisy,
+                            image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
+                            diffusion_steps=args.vae_diffusion_steps,
+                            decoder_type=args.decoder_type,
+                        )
 
-                    recon_img = (recon + 1.0) / 2.0
-                    x_recon_img = (x_recon_noisy + 1.0) / 2.0
+                        recon_img = (recon + 1.0) / 2.0
+                        x_recon_img = (x_recon_noisy + 1.0) / 2.0
 
-                    vis_dir_recon = os.path.join(experiment_dir, "recon")
-                    os.makedirs(vis_dir_recon, exist_ok=True)
+                        vis_dir_recon = os.path.join(experiment_dir, "recon")
+                        os.makedirs(vis_dir_recon, exist_ok=True)
 
-                    t_val = int(t_sample[0].item() * 1000)
-                    save_image(x_recon_img.clamp(0, 1), os.path.join(vis_dir_recon, f"noisy_step_{train_steps:07d}_t{t_val}.png"))
-                    save_image(recon_img.clamp(0, 1), os.path.join(vis_dir_recon, f"recon_step_{train_steps:07d}_t{t_val}.png"))
-                    save_image(img_gt[0:1].clamp(0, 1), os.path.join(vis_dir_recon, f"gt_step_{train_steps:07d}.png"))
+                        t_val = int(t_sample[0].item() * 1000)
+                        save_image(x_recon_img.clamp(0, 1), os.path.join(vis_dir_recon, f"noisy_step_{train_steps:07d}_t{t_val}.png"))
+                        save_image(recon_img.clamp(0, 1), os.path.join(vis_dir_recon, f"recon_step_{train_steps:07d}_t{t_val}.png"))
+                        save_image(img_gt[0:1].clamp(0, 1), os.path.join(vis_dir_recon, f"gt_step_{train_steps:07d}.png"))
 
-                logger.info(f"[step {train_steps}] Saved generation/reconstruction images.")
+                        logger.info(f"[step {train_steps}] Saved generation/reconstruction images.")
 
             # ---------------- Logging ----------------
             if train_steps % log_every == 0:
@@ -781,9 +752,10 @@ def main(args):
 
             # ---------------- Checkpointing ----------------
             if train_steps % ckpt_every == 0 and train_steps > 0:
+                model_state = get_model_state_dict(model)
                 if rank == 0:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": model_state,
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "scheduler": schedl.state_dict(),
@@ -796,9 +768,10 @@ def main(args):
                 dist.barrier()
 
             if train_steps % 1000 == 0 and train_steps > 0:
+                model_state = get_model_state_dict(model)
                 if rank == 0:
                     snapshot = {
-                        "model": model.module.state_dict(),
+                        "model": model_state,
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "scheduler": schedl.state_dict(),
@@ -873,6 +846,10 @@ if __name__ == "__main__":
     parser.add_argument("--vis-every", type=int, default=50, help="Save visualization every N train steps.")
     parser.add_argument("--stage2-steps", type=int, default=50, help="Stage2 sampling steps for visualization/generation.")
     parser.add_argument("--force-log-every", type=int, default=None, help="Force log_every override (else use config).")
+
+    # FSDP for memory optimization
+    parser.add_argument("--fsdp-size", type=int, default=1, help="FSDP sharding size. 1=disabled (use DDP), >1=enable FSDP to shard optimizer states.")
+    parser.add_argument("--ema-cpu", action="store_true", help="Keep EMA model on CPU to save GPU memory.")
 
     args = parser.parse_args()
     main(args)

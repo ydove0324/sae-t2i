@@ -30,20 +30,24 @@ export OMP_NUM_THREADS=4
 # echo "  NODE_RANK=$NODE_RANK"
 # echo "  MASTER_ADDR=$MASTER_ADDR"
 # echo "  MASTER_PORT=$MASTER_PORT"
-VAE_CKPT="/share/project/huangxu/models/SAE/diffusion_decoder/kl100/vae.pth"
+# VAE_CKPT="/share/project/huangxu/models/SAE/diffusion_decoder/kl100/vae.pth"
+VAE_CKPT="results_vae/cnn_decoder_finetune_vf_loss0p01_lora_rank256_eval_mode_ganloss0p01_frozen_dinov3/step_35000.pth"
 
 torchrun --nnodes=1 --node_rank=0 \
-  --nproc-per-node=1 \
+  --nproc-per-node=4 \
   --master_addr="localhost" \
   --master_port=19291 \
   projects/rae/train_overfit.py \
-  --config /share/project/huangxu/SAE/projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml \
+  --config /share/project/huangxu/workspace/SAE/projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml \
   --data-path /share/project/datasets/ImageNet/train \
   --vae-ckpt $VAE_CKPT \
-  --results-dir ./result_overfit_kl100_v \
-  --precision fp32 \
+  --results-dir ./result_overfit_vf_loss0p01_ganloss0p01_frozen_dinov3_lora_rank256_step35000 \
+  --precision bf16 \
   --image-size 256 \
   --global-batch-size 1 \
-  --prediction-mode v \
-  --dataset-type overfit_single_image
+  --prediction-mode x \
+  --dataset-type overfit_single_image \
+  --overfit-image-path overfit_image.png \
+  --fsdp-size 4 \
+  # --ema-cpu
   # --ckpt /opt/tiger/vfm/decoder_only/latest.pt

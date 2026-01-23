@@ -8,7 +8,8 @@ unset PET_NNODES
 unset PET_NODE_RANK
 unset PET_MASTER_ADDR
 
-VAE_CKPT="/share/project/huangxu/models/SAE/diffusion_decoder/kl100/ema_vae.pth"
+# VAE_CKPT="/share/project/huangxu/models/SAE/models/ema_vae.pth"
+VAE_CKPT="results_vae/cnn_decoder_finetune_vf_loss0p01_lora_rank256_eval_mode_ganloss0p01_kl1e-8/step_60000.pth"
 
 torchrun --nproc_per_node=8 \
   --node_rank=0 \
@@ -20,4 +21,4 @@ torchrun --nproc_per_node=8 \
   --batch-size 32 \
   --diffusion-steps 4 \
   --max-images 50000 \
-  --output-dir eval_vae/vae_eval_test_ema_cnn_kl100
+  --output-dir eval_vae/vae_lora_rank256_vfloss_0p01_ganloss0p01_kl1e-8_60000step
