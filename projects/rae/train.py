@@ -681,6 +681,10 @@ def main(args):
     else:  # siglip2
         default_dec_block_out_channels = (768, 512, 256, 128, 64)
     
+    # LoRA rank: 0 means no LoRA layers at all
+    effective_lora_rank = 0 if args.no_lora else args.lora_rank
+    effective_lora_alpha = 0 if args.no_lora else args.lora_alpha
+    
     vae_model_params = {
         "encoder_type": args.encoder_type,
         "image_size": args.image_size,
@@ -689,13 +693,14 @@ def main(args):
         "latent_channels": latent_channels,
         "target_latent_channels": None,
         "spatial_downsample_factor": 16,
-        "lora_rank": 256,
-        "lora_alpha": 256,
+        "lora_rank": effective_lora_rank,
+        "lora_alpha": effective_lora_alpha,
         "dec_block_out_channels": default_dec_block_out_channels,
         "dec_layers_per_block": 3,
         "decoder_dropout": 0.0,
         "gradient_checkpointing": False,
-        "denormalize_decoder_output": False,
+        "denormalize_decoder_output": args.denormalize_decoder_output,
+        "skip_to_moments": args.skip_to_moments,
     }
     
     # Add encoder-specific params
@@ -710,6 +715,7 @@ def main(args):
         encoder_type=args.encoder_type,
         decoder_type=args.decoder_type,
         model_params=vae_model_params,
+        skip_to_moments=args.skip_to_moments,
     )
     
     # Get normalization function based on encoder_type
@@ -1177,6 +1183,12 @@ if __name__ == "__main__":
         help="SigLIP2 model name from HuggingFace.",
     )
     
+    # LoRA
+    parser.add_argument("--no-lora", action="store_true", help="Do not use LoRA in VAE encoder (for loading non-LoRA checkpoints).")
+    parser.add_argument("--lora-rank", type=int, default=256, help="LoRA rank (ignored if --no-lora is set).")
+    parser.add_argument("--lora-alpha", type=int, default=256, help="LoRA alpha (ignored if --no-lora is set).")
+    parser.add_argument("--skip-to-moments", action="store_true", help="Skip loading to_moments layer (for old checkpoints without it).")
+    
     # Decoder type
     parser.add_argument("--decoder-type", type=str, choices=["cnn_decoder", "diffusion_decoder"], default="cnn_decoder")
 
@@ -1211,6 +1223,9 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale", type=float, default=3.0)
     parser.add_argument("--cfg-interval-low", type=float, default=0.1)
     parser.add_argument("--cfg-interval-high", type=float, default=1.0)
+
+    # VAE denormalize
+    parser.add_argument("--denormalize-decoder-output", action="store_true", help="Denormalize decoder output in VAE.")
 
     # FID eval
     parser.add_argument("--fid-every", type=int, default=10000, help="Run FID evaluation every N steps.")
