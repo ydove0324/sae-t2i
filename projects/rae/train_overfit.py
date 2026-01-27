@@ -54,8 +54,11 @@ from models.rae.utils import wandb_utils
 from models.rae.utils.optim_utils import build_optimizer, build_scheduler
 from models.rae.utils.vae_utils import (
     load_dinov3_vae,
+    load_vae,
     normalize_sae,
     denormalize_sae,
+    get_normalize_fn,
+    get_denormalize_fn,
     reconstruct_from_latent_with_diffusion,
 )
 
@@ -319,6 +322,7 @@ def stage2_sample_and_reconstruct(
     device: torch.device | None = None,
     pred_mode: str = "x",
     decoder_type: str = "diffusion_decoder",
+    encoder_type: str = "dinov3",
 ):
     if device is None:
         device = y.device
@@ -343,6 +347,7 @@ def stage2_sample_and_reconstruct(
         image_shape=torch.Size([B, 3, image_size, image_size]),
         diffusion_steps=vae_diffusion_steps,
         decoder_type=decoder_type,
+        encoder_type=encoder_type,
     )
     return img, z0_hat
 
@@ -415,7 +420,9 @@ def main(args):
         raise ValueError("Requested bf16 precision, but the current CUDA device does not support bfloat16.")
 
     # ---------------- time_shift & latent size ----------------
-    shift_dim = (args.image_size // 16) * (args.image_size // 16) * 1280
+    # Determine latent_channels based on encoder_type for time_shift calculation
+    _latent_c = 1280 if args.encoder_type == "dinov3" else 768  # SigLIP2-base hidden size
+    shift_dim = (args.image_size // 16) * (args.image_size // 16) * _latent_c
     shift_base = 4096
     time_shift = math.sqrt(shift_dim / shift_base)
 
@@ -458,8 +465,53 @@ def main(args):
         logger = create_logger(None)
         writer = None
 
-    # ---------------- load DINO VAE ----------------
-    dinov3_vae = load_dinov3_vae(args.vae_ckpt, device, decoder_type=args.decoder_type)
+    # ---------------- load VAE (DINOv3 or SigLIP2) ----------------
+    # Determine latent_channels based on encoder_type
+    if args.encoder_type == "dinov3":
+        latent_channels = 1280
+        default_dec_block_out_channels = (1280, 1024, 512, 256, 128)
+    elif args.encoder_type == "siglip2":
+        latent_channels = 768  # SigLIP2-base hidden size
+        default_dec_block_out_channels = (768, 512, 256, 128, 64)
+    else:
+        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
+    
+    # Build model params for VAE
+    vae_model_params = {
+        "encoder_type": args.encoder_type,
+        "image_size": args.image_size,
+        "patch_size": 16,
+        "out_channels": 3,
+        "latent_channels": latent_channels,
+        "target_latent_channels": None,
+        "spatial_downsample_factor": 16,
+        "lora_rank": 256,
+        "lora_alpha": 256,
+        "dec_block_out_channels": default_dec_block_out_channels,
+        "dec_layers_per_block": 3,
+        "decoder_dropout": 0.0,
+        "gradient_checkpointing": False,
+        "denormalize_decoder_output": False,
+    }
+    
+    # Add encoder-specific params
+    if args.encoder_type == "dinov3":
+        vae_model_params["dinov3_model_dir"] = args.dinov3_dir
+    elif args.encoder_type == "siglip2":
+        vae_model_params["siglip2_model_name"] = args.siglip2_model_name
+    
+    dinov3_vae = load_vae(
+        args.vae_ckpt, 
+        device, 
+        encoder_type=args.encoder_type,
+        decoder_type=args.decoder_type,
+        model_params=vae_model_params,
+    )
+    
+    # Get normalization function based on encoder_type
+    normalize_fn = get_normalize_fn(args.encoder_type)
+    
+    logger.info(f"Encoder type: {args.encoder_type}, Latent channels: {latent_channels}")
 
     # ---------------- Stage2 model ----------------
     model: Stage2ModelProtocol = instantiate_from_config(model_config).to(device)
@@ -602,7 +654,7 @@ def main(args):
             # print("step",train_steps)
             with torch.no_grad():
                 x_latent, _p = dinov3_vae.encode(x_img)
-                x_latent = normalize_sae(x_latent)
+                x_latent = normalize_fn(x_latent)
             model_kwargs = dict(y=y)
 
             with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
@@ -668,13 +720,14 @@ def main(args):
                         dinov3_vae=dinov3_vae,
                         y=y_sample,
                         image_size=args.image_size,
-                        latent_shape=(1280, args.image_size // 16, args.image_size // 16),
+                        latent_shape=(latent_channels, args.image_size // 16, args.image_size // 16),
                         stage2_steps=args.stage2_steps,
                         vae_diffusion_steps=args.vae_diffusion_steps,
                         time_shift=time_shift,
                         device=device,
                         pred_mode=args.prediction_mode,
                         decoder_type=args.decoder_type,
+                        encoder_type=args.encoder_type,
                     )
 
                     # 只有 rank 0 保存图片
@@ -697,6 +750,7 @@ def main(args):
                             image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
                             diffusion_steps=args.vae_diffusion_steps,
                             decoder_type=args.decoder_type,
+                            encoder_type=args.encoder_type,
                         )
 
                         # Original noisy latent reconstruction monitor
@@ -710,6 +764,7 @@ def main(args):
                             image_shape=torch.Size([1, 3, args.image_size, args.image_size]),
                             diffusion_steps=args.vae_diffusion_steps,
                             decoder_type=args.decoder_type,
+                            encoder_type=args.encoder_type,
                         )
 
                         recon_img = (recon + 1.0) / 2.0
@@ -809,7 +864,28 @@ if __name__ == "__main__":
     )
     parser.add_argument("--vae-diffusion-steps", type=int, default=25, help="Sampling steps for VAE diffusion decoder.")
 
-    # === NEW: decoder type ===
+    # === Encoder type ===
+    parser.add_argument(
+        "--encoder-type",
+        type=str,
+        default="dinov3",
+        choices=["dinov3", "siglip2"],
+        help="Choose encoder type: 'dinov3' or 'siglip2'.",
+    )
+    parser.add_argument(
+        "--dinov3-dir",
+        type=str,
+        default="/cpfs01/huangxu/models/dinov3",
+        help="Path to DINOv3 model directory.",
+    )
+    parser.add_argument(
+        "--siglip2-model-name",
+        type=str,
+        default="google/siglip2-base-patch16-256",
+        help="SigLIP2 model name from HuggingFace.",
+    )
+
+    # === Decoder type ===
     parser.add_argument(
         "--decoder-type",
         type=str,

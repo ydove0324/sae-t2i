@@ -1,0 +1,103 @@
+# ==================================================
+# VAE Training Config - DINOv3 without GAN
+# 只使用重建损失 + VF Loss，不使用 GAN
+# ==================================================
+
+# =================== 数据配置 ===================
+data:
+  train_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
+  val_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val/"
+  image_size: 256
+  batch_size: 32  # 不用 GAN 可以用更大 batch
+
+# =================== Encoder 配置 ===================
+encoder:
+  type: "dinov3"
+  
+  dinov3:
+    model_dir: "/cpfs01/huangxu/models/dinov3"
+    hidden_size: 1280
+    patch_size: 16
+  
+  siglip2:
+    model_name: "google/siglip2-base-patch16-256"
+    num_tokens: 256
+
+# =================== Decoder 配置 ===================
+decoder:
+  out_channels: 3
+  latent_channels: 1280
+  target_latent_channels: null
+  spatial_downsample_factor: 16
+  block_out_channels: [1280, 1024, 512, 256, 128]
+  layers_per_block: 3
+  dropout: 0.0
+  gradient_checkpointing: false
+  denormalize_output: false
+
+# =================== VAE 配置 ===================
+vae:
+  variational: true
+  noise_tau: 0.0
+  mask_channels: 0.0
+
+# =================== LoRA 配置 ===================
+lora:
+  enabled: true
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+
+# =================== Loss 配置 ===================
+loss:
+  l1_weight: 1.0
+  lpips_weight: 0.5
+  kl_weight: 1.0e-6
+  
+  vf:
+    enabled: true
+    weight: 0.1
+    margin_cos: 0.1
+    margin_dms: 0.1
+    max_tokens: 256
+    adaptive_weight: true
+  
+  # GAN 关闭
+  gan:
+    enabled: false
+    weight: 0.0
+    start_step: 0
+    max_d_weight: 10000.0
+    stage_disc_steps: 0
+
+# =================== 判别器配置 ===================
+discriminator:
+  ndf: 64
+  n_layers: 4
+  norm: "gn"
+  lr: 2.0e-5
+
+# =================== 优化器配置 ===================
+optimizer:
+  lr: 1.0e-4
+  betas: [0.5, 0.9]
+  weight_decay: 0.01
+
+# =================== 训练配置 ===================
+training:
+  max_steps: 100000
+  precision: "bf16"
+  fsdp_size: 1
+
+# =================== 日志和检查点 ===================
+logging:
+  output_dir: "results_vae/dinov3_no_gan"
+  log_every: 10
+  eval_every: 2000
+  save_every: 5000
+  val_max_batches: 2000
+  debug: false
+
+# =================== 可选: 从检查点恢复 ===================
+checkpoint:
+  vae_ckpt: ""

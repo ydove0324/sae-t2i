@@ -1,0 +1,109 @@
+# ==================================================
+# VAE Training Config - DINOv3 Encoder (默认)
+# ==================================================
+
+# =================== 数据配置 ===================
+data:
+  train_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
+  val_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val/"
+  image_size: 256
+  batch_size: 32
+
+# =================== Encoder 配置 ===================
+encoder:
+  type: "dinov3"  # "dinov3" 或 "siglip2"
+  
+  # DINOv3 配置
+  dinov3:
+    model_dir: "/cpfs01/huangxu/models/dinov3-vitl"
+    hidden_size: 1024
+    patch_size: 16
+  
+  # SigLIP2 配置 (encoder.type="siglip2" 时生效)
+  siglip2:
+    model_name: "google/siglip2-base-patch16-256"
+    num_tokens: 256
+
+# =================== Decoder 配置 ===================
+decoder:
+  out_channels: 3
+  latent_channels: 1024
+  target_latent_channels: null  # null 表示和 latent_channels 一样
+  spatial_downsample_factor: 16
+  block_out_channels: [1024, 768, 512, 256, 128]
+  layers_per_block: 3
+  dropout: 0.0
+  gradient_checkpointing: false
+  denormalize_output: false
+
+# =================== VAE 配置 ===================
+vae:
+  variational: true
+  noise_tau: 0.0  # 训练时的噪声 tau (推理时应设为 0)
+  mask_channels: 0.0  # 随机 mask channel 的比例
+
+# =================== LoRA 配置 ===================
+lora:
+  enabled: true
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+
+# =================== Loss 配置 ===================
+loss:
+  # 重建损失
+  l1_weight: 1.0
+  lpips_weight: 0.5
+  
+  # KL 散度损失
+  kl_weight: 1.0e-6
+  
+  # VF (Visual Feature) 损失 - 特征对齐
+  vf:
+    enabled: true
+    weight: 0.01
+    margin_cos: 0.3   # cosine margin loss 的 margin
+    margin_dms: 0.1   # distance matrix similarity 的 margin
+    max_tokens: 32   # 计算 dms loss 时采样的 token 数
+    adaptive_weight: true  # 是否使用自适应权重
+  
+  # GAN 损失
+  gan:
+    enabled: true
+    weight: 0.01
+    start_step: 0     # 从第几步开始 GAN 训练
+    max_d_weight: 10000.0  # 最大自适应权重
+    stage_disc_steps: 0    # 纯训练判别器的步数 (0=从一开始联合训练)
+
+# =================== 判别器配置 ===================
+discriminator:
+  ndf: 64           # 基础通道数
+  n_layers: 4       # 层数
+  norm: "gn"        # 归一化类型: "in", "bn", "gn"
+  lr: 2.0e-5        # 判别器学习率
+
+# =================== 优化器配置 ===================
+optimizer:
+  lr: 1.0e-4
+  betas: [0.5, 0.9]
+  weight_decay: 0.01
+
+# =================== 训练配置 ===================
+training:
+  max_steps: 100000
+  precision: "bf16"  # "fp32" 或 "bf16"
+  fsdp_size: 1       # 1=使用 DDP, >1=使用 FSDP
+  stage1_steps: 20000
+
+# =================== 日志和检查点 ===================
+logging:
+  output_dir: "results_vae/dinov3_vitl_two_stage"
+  log_every: 10
+  eval_every: 2000
+  save_every: 5000
+  val_max_batches: 2000
+  debug: true
+
+# =================== 可选: 从检查点恢复 ===================
+checkpoint:
+  vae_ckpt: "results_vae/dinov3_vitl_v3/step_5000.pth"  # 可选的 VAE 初始化权重路径

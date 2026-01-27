@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -261,17 +261,39 @@ def run_validation(model, val_loader, device, step, args, logger, use_fsdp=False
 # Main
 # ==========================
 
+def load_config_file(config_path: str) -> dict:
+    """加载 YAML 配置文件"""
+    import yaml
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--train-path", type=str, required=True)
+    # 配置文件支持
+    parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
+
+    parser.add_argument("--train-path", type=str, default=None)
     parser.add_argument("--val-path", type=str, default="/share/project/datasets/ImageNet/val")
     parser.add_argument("--output-dir", type=str, default="results/dinov3_vae_lora_vf")
     parser.add_argument("--vae-ckpt", type=str, default="", help="optional init checkpoint")
-    parser.add_argument("--dinov3-dir", type=str, default="/share/project/huangxu/models/dinov3")
+    
+    # Encoder 配置
+    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "siglip2"],
+                        help="Encoder type: 'dinov3' or 'siglip2'")
+    parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3")
+    parser.add_argument("--siglip2-model-name", type=str, default="google/siglip2-base-patch16-256",
+                        help="SigLIP2 model name from HuggingFace")
+    
+    # Decoder 配置
+    parser.add_argument("--latent-channels", type=int, default=None, 
+                        help="Latent channels (auto-detected from encoder if not set)")
+    parser.add_argument("--dec-block-out-channels", type=str, default="1280,1024,512,256,128",
+                        help="Decoder block output channels, comma-separated")
 
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max-steps", type=int, default=100000)
 
@@ -283,13 +305,15 @@ def main():
     # VF loss
     parser.add_argument("--vf-weight", type=float, default=0.1)
     parser.add_argument("--vf-m1", type=float, default=0.1)
-    parser.add_argument("--vf-m2", type=float, default=0.3)
+    parser.add_argument("--vf-m2", type=float, default=0.1)
     parser.add_argument("--vf-max-tokens", type=int, default=32)
+    parser.add_argument("--no-vf", action="store_true", help="Disable VF loss")
 
     # LoRA
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument("--no-lora", action="store_true", help="Disable LoRA")
 
     # model regularization
     parser.add_argument("--noise-tau", type=float, default=0.0)
@@ -304,11 +328,19 @@ def main():
     parser.add_argument("--disc-ndf", type=int, default=64, help="PatchGAN base channels")
     parser.add_argument("--disc-n-layers", type=int, default=4, help="PatchGAN number of layers")
     parser.add_argument("--disc-norm", type=str, default="gn", choices=["in", "bn", "gn"], help="PatchGAN normalization")
+    parser.add_argument("--no-gan", action="store_true", help="Disable GAN loss")
 
-    # Stage training mode
+    # Stage training mode for GAN
     parser.add_argument("--stage-disc-steps", type=int, default=0,
                         help="Number of steps to train discriminator only (stage_disc mode). "
                              "If 0, train jointly from the start (stage_joint mode).")
+
+    # Stage 1 training: train to_moments + decoder only (no LoRA, no VF loss)
+    # This is a separate training stage concept, not related to GAN
+    parser.add_argument("--stage1-steps", type=int, default=0,
+                        help="Stage 1 steps: train to_moments + decoder only (freeze encoder/LoRA, no VF loss). "
+                             "After stage1_steps, transition to Stage 2: enable LoRA + VF loss. "
+                             "If 0, skip Stage 1 and train everything from start.")
 
     # FSDP
     parser.add_argument("--fsdp-size", type=int, default=1,
@@ -326,6 +358,152 @@ def main():
     parser.add_argument("--debug", action="store_true")
 
     args = parser.parse_args()
+    
+    # 如果指定了配置文件，加载并覆盖默认值
+    if args.config:
+        config = load_config_file(args.config)
+        # 从配置文件更新 args
+        if 'data' in config:
+            if args.train_path is None and 'train_path' in config['data']:
+                args.train_path = config['data']['train_path']
+            if 'val_path' in config['data']:
+                args.val_path = config['data']['val_path']
+            if 'image_size' in config['data']:
+                args.image_size = config['data']['image_size']
+            if 'batch_size' in config['data']:
+                args.batch_size = config['data']['batch_size']
+        
+        if 'encoder' in config:
+            enc_cfg = config['encoder']
+            if 'type' in enc_cfg:
+                args.encoder_type = enc_cfg['type']
+            if 'dinov3' in enc_cfg and 'model_dir' in enc_cfg['dinov3']:
+                args.dinov3_dir = enc_cfg['dinov3']['model_dir']
+            if 'siglip2' in enc_cfg and 'model_name' in enc_cfg['siglip2']:
+                args.siglip2_model_name = enc_cfg['siglip2']['model_name']
+        
+        if 'decoder' in config:
+            dec_cfg = config['decoder']
+            if 'latent_channels' in dec_cfg:
+                args.latent_channels = dec_cfg['latent_channels']
+            if 'block_out_channels' in dec_cfg:
+                args.dec_block_out_channels = ','.join(map(str, dec_cfg['block_out_channels']))
+        
+        if 'lora' in config:
+            lora_cfg = config['lora']
+            if 'rank' in lora_cfg:
+                args.lora_rank = lora_cfg['rank']
+            if 'alpha' in lora_cfg:
+                args.lora_alpha = lora_cfg['alpha']
+            if 'dropout' in lora_cfg:
+                args.lora_dropout = lora_cfg['dropout']
+            if 'enabled' in lora_cfg and not lora_cfg['enabled']:
+                args.no_lora = True
+        
+        if 'loss' in config:
+            loss_cfg = config['loss']
+            if 'l1_weight' in loss_cfg:
+                args.l1_weight = loss_cfg['l1_weight']
+            if 'lpips_weight' in loss_cfg:
+                args.lpips_weight = loss_cfg['lpips_weight']
+            if 'kl_weight' in loss_cfg:
+                args.kl_weight = loss_cfg['kl_weight']
+            
+            if 'vf' in loss_cfg:
+                vf_cfg = loss_cfg['vf']
+                if 'weight' in vf_cfg:
+                    args.vf_weight = vf_cfg['weight']
+                if 'margin_cos' in vf_cfg:
+                    args.vf_m1 = vf_cfg['margin_cos']
+                if 'margin_dms' in vf_cfg:
+                    args.vf_m2 = vf_cfg['margin_dms']
+                if 'max_tokens' in vf_cfg:
+                    args.vf_max_tokens = vf_cfg['max_tokens']
+                if 'enabled' in vf_cfg and not vf_cfg['enabled']:
+                    args.no_vf = True
+            
+            if 'gan' in loss_cfg:
+                gan_cfg = loss_cfg['gan']
+                if 'weight' in gan_cfg:
+                    args.gan_weight = gan_cfg['weight']
+                if 'start_step' in gan_cfg:
+                    args.gan_start_step = gan_cfg['start_step']
+                if 'max_d_weight' in gan_cfg:
+                    args.max_d_weight = gan_cfg['max_d_weight']
+                if 'stage_disc_steps' in gan_cfg:
+                    args.stage_disc_steps = gan_cfg['stage_disc_steps']
+                if 'enabled' in gan_cfg and not gan_cfg['enabled']:
+                    args.no_gan = True
+        
+        if 'discriminator' in config:
+            disc_cfg = config['discriminator']
+            if 'ndf' in disc_cfg:
+                args.disc_ndf = disc_cfg['ndf']
+            if 'n_layers' in disc_cfg:
+                args.disc_n_layers = disc_cfg['n_layers']
+            if 'norm' in disc_cfg:
+                args.disc_norm = disc_cfg['norm']
+            if 'lr' in disc_cfg:
+                args.disc_lr = disc_cfg['lr']
+        
+        if 'optimizer' in config:
+            opt_cfg = config['optimizer']
+            if 'lr' in opt_cfg:
+                args.lr = opt_cfg['lr']
+        
+        if 'training' in config:
+            train_cfg = config['training']
+            if 'max_steps' in train_cfg:
+                args.max_steps = train_cfg['max_steps']
+            if 'precision' in train_cfg:
+                args.precision = train_cfg['precision']
+            if 'fsdp_size' in train_cfg:
+                args.fsdp_size = train_cfg['fsdp_size']
+            # Stage 1: train to_moments + decoder only (no LoRA, no VF loss)
+            if 'stage1_steps' in train_cfg:
+                args.stage1_steps = train_cfg['stage1_steps']
+        
+        if 'logging' in config:
+            log_cfg = config['logging']
+            if 'output_dir' in log_cfg:
+                args.output_dir = log_cfg['output_dir']
+            if 'log_every' in log_cfg:
+                args.log_every = log_cfg['log_every']
+            if 'eval_every' in log_cfg:
+                args.eval_every = log_cfg['eval_every']
+            if 'save_every' in log_cfg:
+                args.save_every = log_cfg['save_every']
+            if 'val_max_batches' in log_cfg:
+                args.val_max_batches = log_cfg['val_max_batches']
+            if 'debug' in log_cfg:
+                args.debug = log_cfg['debug']
+        
+        if 'checkpoint' in config:
+            ckpt_cfg = config['checkpoint']
+            if 'vae_ckpt' in ckpt_cfg and ckpt_cfg['vae_ckpt']:
+                args.vae_ckpt = ckpt_cfg['vae_ckpt']
+        
+        if 'vae' in config:
+            vae_cfg = config['vae']
+            if 'noise_tau' in vae_cfg:
+                args.noise_tau = vae_cfg['noise_tau']
+            if 'mask_channels' in vae_cfg:
+                args.mask_channels = vae_cfg['mask_channels']
+    
+    # 处理 --no-xxx 参数
+    if args.no_lora:
+        args.lora_rank = 0
+    if args.no_vf:
+        args.vf_weight = 0.0
+    if args.no_gan:
+        args.gan_weight = 0.0
+    
+    # 检查必需参数
+    if args.train_path is None:
+        raise ValueError("--train-path is required (or set via config file)")
+    
+    # 解析 decoder block out channels
+    args.dec_block_out_channels = tuple(int(x) for x in args.dec_block_out_channels.split(','))
 
     rank, local_rank, world_size = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
@@ -366,7 +544,26 @@ def main():
     ])
 
     train_dataset = ImageFolder(args.train_path, transform=train_transform)
-    val_dataset = ImageFolder(args.val_path, transform=val_transform)
+    
+    # 验证集支持两种格式：ImageFolder（有子文件夹分类结构）或纯图片文件夹
+    try:
+        val_dataset = ImageFolder(args.val_path, transform=val_transform)
+    except:
+        # root 下面直接是图片，没有子文件夹
+        class ImageDataset(Dataset):
+            EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff', '.tif'}
+            def __init__(self, root, transform=None):
+                self.transform = transform
+                self.paths = sorted([os.path.join(root, f) for f in os.listdir(root) 
+                                     if os.path.splitext(f)[1].lower() in self.EXTS])
+            def __len__(self):
+                return len(self.paths)
+            def __getitem__(self, idx):
+                img = Image.open(self.paths[idx]).convert('RGB')
+                if self.transform:
+                    img = self.transform(img)
+                return img, 0
+        val_dataset = ImageDataset(args.val_path, transform=val_transform)
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, shuffle=False)
@@ -376,18 +573,36 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,
                             num_workers=4, pin_memory=True, drop_last=False)
 
+    # 根据 encoder_type 设置默认 latent_channels
+    if args.latent_channels is None:
+        if args.encoder_type == "dinov3":
+            args.latent_channels = 1280
+        elif args.encoder_type == "siglip2":
+            args.latent_channels = 768  # SigLIP2-base hidden size
+    
+    if rank == 0:
+        logger.info(f"Encoder type: {args.encoder_type}")
+        logger.info(f"Latent channels: {args.latent_channels}")
+        logger.info(f"Decoder block out channels: {args.dec_block_out_channels}")
+        logger.info(f"LoRA rank: {args.lora_rank}, alpha: {args.lora_alpha}")
+        logger.info(f"VF weight: {args.vf_weight}, GAN weight: {args.gan_weight}")
+
     # Model
     model = AutoencoderKL(
+        # Encoder 配置
+        encoder_type=args.encoder_type,
         dinov3_model_dir=args.dinov3_dir,
+        siglip2_model_name=args.siglip2_model_name,
+        
         image_size=args.image_size,
         patch_size=16,
         out_channels=3,
 
-        latent_channels=1280,
+        latent_channels=args.latent_channels,
         target_latent_channels=None,
         spatial_downsample_factor=16,
 
-        dec_block_out_channels=(1280, 1024, 512, 256, 128),
+        dec_block_out_channels=args.dec_block_out_channels,
         dec_layers_per_block=3,
         decoder_dropout=0.0,
         gradient_checkpointing=False,
@@ -401,7 +616,7 @@ def main():
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        enable_lora=True,
+        enable_lora=(args.lora_rank > 0),
         vf_margin_cos=args.vf_m1,
         vf_margin_dms=args.vf_m2,
         vf_max_tokens=args.vf_max_tokens,
@@ -412,21 +627,23 @@ def main():
     ).to(device)
 
     # Load optional ckpt
+    resume_ckpt = None  # 用于后续恢复 optimizer/discriminator/step
     if args.vae_ckpt and os.path.isfile(args.vae_ckpt):
         if rank == 0:
             logger.info(f"Loading weights from {args.vae_ckpt}")
-        ckpt = torch.load(args.vae_ckpt, map_location="cpu")
-        if "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        elif "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-        elif "model" in ckpt:
-            state_dict = ckpt["model"]
+        resume_ckpt = torch.load(args.vae_ckpt, map_location="cpu")
+        if "state_dict" in resume_ckpt:
+            state_dict = resume_ckpt["state_dict"]
+        elif "model_state_dict" in resume_ckpt:
+            state_dict = resume_ckpt["model_state_dict"]
+        elif "model" in resume_ckpt:
+            state_dict = resume_ckpt["model"]
         else:
-            state_dict = ckpt
+            state_dict = resume_ckpt
+            resume_ckpt = None  # 如果 ckpt 就是 state_dict，则不尝试恢复其他状态
         model.load_state_dict(state_dict, strict=False)
 
-    # Freeze base DINO weights; train LoRA + decoder + moments head (+ optional downsample convs)
+    # Freeze base encoder weights; train LoRA + decoder + moments head (+ optional downsample convs)
     requires_grad(model, False)
 
     # decoder train
@@ -442,20 +659,43 @@ def main():
         requires_grad(model.channel_downsample_conv, True)
 
     # LoRA params train (match by module types, not names)
-    for m in model.encoder.dino_v3.modules():
+    # 获取 encoder backbone (支持多种 encoder 类型)
+    encoder_backbone = model.encoder.get_backbone()
+    
+    step = 0
+    epoch = 0
+    if resume_ckpt is not None:
+        # 恢复 step
+        if "step" in resume_ckpt:
+            step = resume_ckpt["step"]
+            if rank == 0:
+                logger.info(f"Resuming from step {step}")
+    # Stage 1 时冻结 LoRA，只训练 to_moments + decoder
+    # Stage 2 时解冻 LoRA，一起训练
+    in_stage1 = args.stage1_steps > 0 and step < args.stage1_steps
+    enable_lora_training = not in_stage1 and args.lora_rank > 0
+    
+    for m in encoder_backbone.modules():
         # LoRALinear/LoRAConv2d contains lora_down/lora_up
         if hasattr(m, "lora_down") and hasattr(m, "lora_up"):
             for p in m.lora_down.parameters():
-                p.requires_grad = True
+                p.requires_grad = enable_lora_training
             for p in m.lora_up.parameters():
-                p.requires_grad = True
+                p.requires_grad = enable_lora_training
         # keep base frozen
         if hasattr(m, "base") and isinstance(getattr(m, "base"), (nn.Linear, nn.Conv2d)):
             for p in m.base.parameters():
                 p.requires_grad = False
 
-    lora_params = [p for n, p in model.encoder.dino_v3.named_parameters()
+    lora_params = [p for n, p in encoder_backbone.named_parameters()
                    if p.requires_grad and (("lora_up" in n) or ("lora_down" in n))]
+    
+    if rank == 0:
+        num_lora_params = sum(p.numel() for p in lora_params)
+        logger.info(f"LoRA trainable parameters: {num_lora_params / 1e6:.2f}M")
+        if args.stage1_steps > 0:
+            logger.info(f"Stage 1 mode: training to_moments + decoder only (no LoRA, no VF loss) for {args.stage1_steps} steps")
+    
     model.train()
 
     # Wrap model with DDP or FSDP
@@ -539,16 +779,86 @@ def main():
             logger.info(f"GAN weight: {args.gan_weight}, start step: {args.gan_start_step}")
             logger.info(f"Stage disc steps: {args.stage_disc_steps} (0 = joint training from start)")
 
+    # ========== 从 checkpoint 恢复 optimizer/discriminator/step ==========
+    if resume_ckpt is not None:
+        # 恢复 VAE optimizer
+        if "opt" in resume_ckpt:
+            try:
+                opt.load_state_dict(resume_ckpt["opt"])
+                if rank == 0:
+                    logger.info("Loaded VAE optimizer state from checkpoint")
+            except Exception as e:
+                if rank == 0:
+                    logger.warning(f"Failed to load VAE optimizer state: {e}")
+        
+        # 恢复 discriminator 和其 optimizer
+        if use_gan and discriminator is not None:
+            if "discriminator" in resume_ckpt:
+                try:
+                    disc_state = resume_ckpt["discriminator"]
+                    unwrap_model(discriminator).load_state_dict(disc_state)
+                    if rank == 0:
+                        logger.info("Loaded discriminator state from checkpoint")
+                except Exception as e:
+                    if rank == 0:
+                        logger.warning(f"Failed to load discriminator state: {e}")
+            
+            if "opt_disc" in resume_ckpt and opt_disc is not None:
+                try:
+                    opt_disc.load_state_dict(resume_ckpt["opt_disc"])
+                    if rank == 0:
+                        logger.info("Loaded discriminator optimizer state from checkpoint")
+                except Exception as e:
+                    if rank == 0:
+                        logger.warning(f"Failed to load discriminator optimizer state: {e}")
+
     # Loop
-    step = 0
-    epoch = 0
     if rank == 0:
         logger.info("Start Training Loop...")
+    
+    # Track stage transition
+    lora_enabled_in_training = not (args.stage1_steps > 0 and step < args.stage1_steps)
+    stage1_just_ended = False
+    
+    # Keep track of current lora_params for VF loss (updated during stage transition)
+    current_lora_params = lora_params if lora_enabled_in_training else []
 
     while step < args.max_steps:
         train_sampler.set_epoch(epoch)
         for x, _ in train_loader:
             x = x.to(device, non_blocking=True)  # [-1,1]
+
+            # Check if we need to transition from Stage 1 to Stage 2
+            # Stage 1: train to_moments + decoder only (no LoRA, no VF loss)
+            # Stage 2: train LoRA + to_moments + decoder (with VF loss)
+            in_stage1 = args.stage1_steps > 0 and step < args.stage1_steps
+            
+            # Transition from Stage 1 to Stage 2: enable LoRA training
+            if not in_stage1 and not lora_enabled_in_training and args.lora_rank > 0:
+                lora_enabled_in_training = True
+                stage1_just_ended = True
+                # Get the unwrapped encoder backbone (after DDP/FSDP wrapping)
+                model_inner_for_lora = unwrap_model(model)
+                encoder_backbone_inner = model_inner_for_lora.encoder.get_backbone()
+                # Unfreeze LoRA parameters
+                for m in encoder_backbone_inner.modules():
+                    if hasattr(m, "lora_down") and hasattr(m, "lora_up"):
+                        for p in m.lora_down.parameters():
+                            p.requires_grad = True
+                        for p in m.lora_up.parameters():
+                            p.requires_grad = True
+                # Update optimizer to include LoRA params
+                lora_params = [p for n, p in encoder_backbone_inner.named_parameters()
+                               if p.requires_grad and (("lora_up" in n) or ("lora_down" in n))]
+                current_lora_params = lora_params  # Update for VF loss computation
+                opt.add_param_group({'params': lora_params, 'lr': args.lr})
+                
+                if rank == 0:
+                    num_lora_params = sum(p.numel() for p in lora_params)
+                    logger.info(f"=== Stage 1 -> Stage 2 Transition at step {step} ===")
+                    logger.info(f"Enabled LoRA training: {num_lora_params / 1e6:.2f}M params added")
+                    logger.info(f"VF loss now active (weight={args.vf_weight})")
+                dist.barrier()
 
             # Determine if GAN is active this step
             gan_active = use_gan and step >= args.gan_start_step
@@ -609,18 +919,29 @@ def main():
                     kl_loss = posterior.kl().mean()
 
                     # VF loss: student (LoRA on) vs ref (LoRA off)
+                    # Stage 1: skip VF loss (only recon + GAN)
+                    # Stage 2: enable VF loss
                     model_inner = unwrap_model(model)
-                    z_feat = model_inner.encode_features(x, use_lora=True)  # [B,C,S,S]
-                    with torch.no_grad():
-                        f_feat = model_inner.encode_features(x, use_lora=False)
-                    vf_raw = model_inner.compute_vf_loss(z_feat, f_feat)
-
-                    if model_inner.vf_use_adaptive_weight:
-                        w_adapt = model_inner.adaptive_weight(loss_rec, vf_raw, lora_params)
+                    
+                    if in_stage1 or args.vf_weight == 0.0:
+                        # Stage 1 or VF disabled: no VF loss
+                        vf_raw = torch.tensor(0.0, device=device)
+                        w_adapt = torch.tensor(0.0, device=device)
+                        loss_vf = torch.tensor(0.0, device=device)
                     else:
-                        w_adapt = torch.tensor(1.0, device=device)
+                        # Stage 2: compute VF loss
+                        z_feat = model_inner.encode_features(x, use_lora=True)  # [B,C,S,S]
+                        with torch.no_grad():
+                            f_feat = model_inner.encode_features(x, use_lora=False)
+                        vf_raw = model_inner.compute_vf_loss(z_feat, f_feat)
 
-                    loss_vf = model_inner.vf_hyper * w_adapt * vf_raw
+                        if model_inner.vf_use_adaptive_weight:
+                            w_adapt = model_inner.adaptive_weight(loss_rec, vf_raw, current_lora_params)
+                        else:
+                            w_adapt = torch.tensor(1.0, device=device)
+                        w_adapt = torch.clamp(w_adapt, max=3.0)
+                        loss_vf = model_inner.vf_hyper * w_adapt * vf_raw
+                    
                     loss = loss_rec + model_inner.kl_weight * kl_loss + loss_vf
 
                     # GAN Generator loss (only in stage_joint)
@@ -670,12 +991,14 @@ def main():
 
             if step % args.log_every == 0 and rank == 0:
                 # Determine stage string
-                if in_stage_disc:
+                if in_stage1:
+                    stage_str = "stage1"
+                elif in_stage_disc:
                     stage_str = "stage_disc"
                 elif in_stage_joint:
                     stage_str = "stage_joint"
                 else:
-                    stage_str = "no_gan"
+                    stage_str = "stage2" if args.stage1_steps > 0 else "no_gan"
 
                 log_msg = (
                     f"Step {step} [{stage_str}]: total={loss.item():.4f} | rec={loss_rec.item():.4f} "
@@ -708,6 +1031,10 @@ def main():
                     tb_writer.add_scalar("Loss/VF_term", loss_vf.item(), step)
                     tb_writer.add_scalar("Weight/VF_adaptive", w_adapt.item(), step)
                     
+                    # Stage indicator (0=stage1, 1=stage2)
+                    tb_writer.add_scalar("Training/stage", 0 if in_stage1 else 1, step)
+                    tb_writer.add_scalar("Training/lora_enabled", 0 if in_stage1 else 1, step)
+                    
                     # GAN losses (when active)
                     if gan_active:
                         tb_writer.add_scalar("Loss/GAN_gen", gan_loss.item(), step)
@@ -722,7 +1049,11 @@ def main():
             if step % args.save_every == 0 and rank == 0:
                 save_path = os.path.join(args.output_dir, f"step_{step}.pth")
                 model_state = get_model_state_dict(model)
-                ckpt_state = {"model": model_state, "step": step}
+                ckpt_state = {
+                    "model": model_state, 
+                    "step": step,
+                    "opt": opt.state_dict(),  # 保存 VAE optimizer
+                }
                 if use_gan and discriminator is not None:
                     disc_state = get_model_state_dict(discriminator)
                     ckpt_state["discriminator"] = disc_state

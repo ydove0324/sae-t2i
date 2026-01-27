@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 分布式训练节点配置
-# nohup bash train_vae/train_vae.sh > log/lora_rank256_vfloss_0p01_frozen_dinov3.log 2>&1 < /dev/null &
+# nohup bash train_vae/train_vae.sh > log/lora_rank256_vfloss_0p1_frozen_dinov3_gramloss.log 2>&1 < /dev/null &
 WORKER_NODES=(
 job-18f25148-acb0-43d7-8564-98fe2e809e60-worker-0
 job-18f25148-acb0-43d7-8564-98fe2e809e60-worker-1

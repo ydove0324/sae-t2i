@@ -6,3 +6,4 @@ result*
 *.png
 *.tar
 logs/
+*.pth

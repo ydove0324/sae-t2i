@@ -1,0 +1,104 @@
+# ==================================================
+# VAE Training Config - SigLIP2 Encoder
+# ==================================================
+
+# =================== 数据配置 ===================
+data:
+  train_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
+  val_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val/"
+  image_size: 256
+  batch_size: 32
+
+# =================== Encoder 配置 ===================
+encoder:
+  type: "siglip2"  # 使用 SigLIP2 encoder
+  
+  # DINOv3 配置 (encoder.type="dinov3" 时生效)
+  dinov3:
+    model_dir: "/cpfs01/huangxu/models/dinov3"
+    hidden_size: 1280
+    patch_size: 16
+  
+  # SigLIP2 配置
+  siglip2:
+    model_name: "/cpfs01/huangxu/models/siglip2"
+    num_tokens: 256
+    hidden_size: 768  # SigLIP2-base 的 hidden size
+
+# =================== Decoder 配置 ===================
+decoder:
+  out_channels: 3
+  latent_channels: 768   # 匹配 SigLIP2 的 hidden size
+  target_latent_channels: null
+  spatial_downsample_factor: 16
+  block_out_channels: [768, 512, 256, 128, 64]  # 适配较小的 latent channels
+  layers_per_block: 3
+  dropout: 0.0
+  gradient_checkpointing: false
+  denormalize_output: false
+
+# =================== VAE 配置 ===================
+vae:
+  variational: true
+  noise_tau: 0.0
+  mask_channels: 0.0
+
+# =================== LoRA 配置 ===================
+lora:
+  enabled: true
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+
+# =================== Loss 配置 ===================
+loss:
+  l1_weight: 1.0
+  lpips_weight: 0.5
+  kl_weight: 1.0e-6
+  
+  vf:
+    enabled: true
+    weight: 0.1
+    margin_cos: 0.1
+    margin_dms: 0.1
+    max_tokens: 256
+    adaptive_weight: true
+  
+  gan:
+    enabled: true
+    weight: 0.01
+    start_step: 0
+    max_d_weight: 10000.0
+    stage_disc_steps: 0
+
+# =================== 判别器配置 ===================
+discriminator:
+  ndf: 64
+  n_layers: 4
+  norm: "gn"
+  lr: 2.0e-5
+
+# =================== 优化器配置 ===================
+optimizer:
+  lr: 1.0e-4
+  betas: [0.5, 0.9]
+  weight_decay: 0.01
+
+# =================== 训练配置 ===================
+training:
+  max_steps: 100000
+  precision: "bf16"
+  fsdp_size: 1
+
+# =================== 日志和检查点 ===================
+logging:
+  output_dir: "results_vae/siglip2_default"
+  log_every: 10
+  eval_every: 2000
+  save_every: 5000
+  val_max_batches: 2000
+  debug: true
+
+# =================== 可选: 从检查点恢复 ===================
+checkpoint:
+  vae_ckpt: ""
