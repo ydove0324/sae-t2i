@@ -29,7 +29,7 @@ def denormalize_sae(tensor: torch.Tensor) -> torch.Tensor:
 # ==========================================
 
 SIGLIP2_SHIFT_FACTOR = 0.0
-SIGLIP2_SCALE_FACTOR = 1.0
+SIGLIP2_SCALE_FACTOR = 0.6689115762710571
 
 
 def normalize_siglip2(tensor: torch.Tensor) -> torch.Tensor:
