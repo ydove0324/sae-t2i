@@ -15,11 +15,11 @@ IMAGE_SIZE=256
 NUM_IMAGES=10                                          # Number of images to visualize
 
 # VAE checkpoint
-VAE_CKPT="results_vae/siglip2_default/step_10000.pth"
+VAE_CKPT="results_vae/dinov3_vitl_two_stage/step_52000.pth"
 # VAE_CKPT="results_vae/cnn_decoder_finetune_vf_loss0p1_lora_rank256_ganloss0p01_frozen_dinov3_gramloss/step_40000.pth"
 
 # Encoder type: "dinov3" or "siglip2"
-ENCODER_TYPE="siglip2"
+ENCODER_TYPE="dinov3"
 
 # LoRA parameters
 LORA_RANK=256
@@ -30,7 +30,7 @@ DINOV3_DIR="/cpfs01/huangxu/models/dinov3"
 SIGLIP2_MODEL="/cpfs01/huangxu/models/siglip2"
 
 # Output directory
-OUTPUT_DIR="results/latent_feature_vis_siglip2"
+OUTPUT_DIR="results/latent_feature_vis_dinov3_vitl"
 
 # Visualization options
 USE_LORA="--use-lora"                                  # Use "--no-lora" to disable
