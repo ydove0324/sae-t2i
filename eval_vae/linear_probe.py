@@ -274,7 +274,7 @@ def main():
     
     # VAE
     parser.add_argument("--vae-ckpt", type=str, required=True, help="Path to VAE checkpoint.")
-    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "siglip2"])
+    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "dinov3_vitl", "siglip2"])
     parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3")
     parser.add_argument("--siglip2-model-name", type=str, default="google/siglip2-base-patch16-256")
     parser.add_argument("--lora-rank", type=int, default=256)
@@ -337,6 +337,9 @@ def main():
     if args.encoder_type == "dinov3":
         latent_channels = 1280
         dec_block_out_channels = (1280, 1024, 512, 256, 128)
+    elif args.encoder_type == "dinov3_vitl":
+        latent_channels = 1024
+        dec_block_out_channels = (1024, 768, 512, 256, 128)
     else:  # siglip2
         latent_channels = 768
         dec_block_out_channels = (768, 512, 256, 128, 64)
@@ -358,7 +361,7 @@ def main():
         "denormalize_decoder_output": False,
     }
     
-    if args.encoder_type == "dinov3":
+    if args.encoder_type == "dinov3" or args.encoder_type == "dinov3_vitl":
         vae_model_params["dinov3_model_dir"] = args.dinov3_dir
     elif args.encoder_type == "siglip2":
         vae_model_params["siglip2_model_name"] = args.siglip2_model_name
