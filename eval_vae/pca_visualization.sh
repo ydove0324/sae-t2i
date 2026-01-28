@@ -42,6 +42,6 @@ python eval_vae/pca_visualization.py \
     --lora-rank ${LORA_RANK} \
     --lora-alpha ${LORA_ALPHA} \
     --output-dir ${OUTPUT_DIR} \
-    --n-components 3
+    --n-components 10
 
 echo "Done! Results saved to ${OUTPUT_DIR}"
