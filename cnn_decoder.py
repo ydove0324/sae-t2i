@@ -608,7 +608,7 @@ class AutoencoderKL(nn.Module):
     def __init__(
         self,
         # Encoder 配置 - 支持多种 encoder
-        encoder_type: str = "dinov3",  # "dinov3" 或 "siglip2"
+        encoder_type: str = "dinov3",  # "dinov3", "dinov3_vitl" 或 "siglip2"
         dinov3_model_dir: str = "",
         siglip2_model_name: str = "google/siglip2-base-patch16-256",
         
@@ -675,7 +675,7 @@ class AutoencoderKL(nn.Module):
         self.denormalize_decoder_output = denormalize_decoder_output
 
         # 根据 encoder_type 创建不同的 encoder
-        if encoder_type == "dinov3":
+        if encoder_type == "dinov3" or encoder_type == "dinov3_vitl":
             self.encoder = Encoder2D(
                 dinov3_model_dir=dinov3_model_dir,
                 lora_rank=lora_rank,
@@ -696,7 +696,7 @@ class AutoencoderKL(nn.Module):
             # 使用 encoder 的实际 hidden_size
             latent_channels = self.encoder.hidden_size
         else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type}. Supported: 'dinov3', 'siglip2'")
+            raise ValueError(f"Unknown encoder_type: {encoder_type}. Supported: 'dinov3', 'dinov3_vitl', 'siglip2'")
         
         # 更新 latent_channels (可能被 encoder 覆盖)
         self.original_latent_channels = latent_channels
@@ -748,7 +748,7 @@ class AutoencoderKL(nn.Module):
         pred.last_hidden_state: [B, 1 + R + N, C] (DINOv3) 或 [B, N, C] (SigLIP2)
         return patch map: [B, C, S, S]
         """
-        if self.encoder_type == "dinov3":
+        if self.encoder_type == "dinov3" or self.encoder_type == "dinov3_vitl":
             # DINOv3: 有 CLS token 和 register tokens
             cls_len = 1
             reg_len = self.encoder.num_register_tokens
@@ -773,7 +773,7 @@ class AutoencoderKL(nn.Module):
                 if p.requires_grad:
                     return p
         # fallback: patch embedding weight
-        if self.encoder_type == "dinov3":
+        if self.encoder_type == "dinov3" or self.encoder_type == "dinov3_vitl":
             return backbone.embeddings.patch_embeddings.weight
         elif self.encoder_type == "siglip2":
             return backbone.embeddings.patch_embedding.weight
