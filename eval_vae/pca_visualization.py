@@ -269,6 +269,7 @@ def main():
     print("\nPerforming dimensionality reduction...")
     
     results = {}
+    cumulative_variance = {}  # Store cumulative variance for config
     
     if args.method in ["pca", "both"]:
         print("  Running PCA...")
@@ -290,6 +291,7 @@ def main():
         checkpoints = [5, 10, 32, 64, 100]
         for k in checkpoints:
             if k <= max_components:
+                cumulative_variance[k] = cumsum[k-1]
                 print(f"    Top {k:3d} components: {cumsum[k-1]:.4f} ({cumsum[k-1]*100:.2f}%)")
             else:
                 print(f"    Top {k:3d} components: N/A (only {max_components} available)")
@@ -436,6 +438,9 @@ def main():
         f.write(f"Feature Dimension: {features_np.shape[1]}\n")
         if "pca" in results:
             f.write(f"PCA Explained Variance: {pca.explained_variance_ratio_}\n")
+            f.write(f"\nCumulative Explained Variance:\n")
+            for k, v in cumulative_variance.items():
+                f.write(f"  Top {k:3d} components: {v:.4f} ({v*100:.2f}%)\n")
     
     print("\n" + "=" * 50)
     print(" Done!")

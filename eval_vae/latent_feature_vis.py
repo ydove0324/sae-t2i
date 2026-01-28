@@ -182,6 +182,8 @@ def main():
         "gradient_checkpointing": False,
         "denormalize_decoder_output": True,
         "skip_to_moments": True,
+        "denormalize_decoder_output": True,
+        "skip_to_moments": True,
     }
     
     if args.encoder_type == "dinov3":
@@ -196,6 +198,7 @@ def main():
         decoder_type="cnn_decoder",
         model_params=vae_model_params,
         verbose=True,
+        skip_to_moments=True
         skip_to_moments=False
     )
     vae.eval()

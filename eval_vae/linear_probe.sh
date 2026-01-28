@@ -6,7 +6,8 @@
 # ===== Configuration =====
 TRAIN_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train"
 VAL_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val"
-VAE_CKPT="results_vae/cnn_decoder_finetune_vf_loss0p1_lora_rank256_ganloss0p01_frozen_dinov3_gramloss/step_40000.pth"  # Change to your VAE checkpoint
+# VAE_CKPT="results_vae/cnn_decoder_finetune_vf_loss0p1_lora_rank256_ganloss0p01_frozen_dinov3_gramloss/step_40000.pth"  # Change to your VAE checkpoint
+VAE_CKPT="/cpfs01/huangxu/models/SAE/models/ema_vae.pth"  # Change to your VAE checkpoint
 
 ENCODER_TYPE="dinov3"  # dinov3 or siglip2
 DINOV3_DIR="/cpfs01/huangxu/models/dinov3"
@@ -19,8 +20,8 @@ LR=0.1
 POOLING="avg"  # avg, max, avg_max, flatten
 
 # LoRA config (should match VAE training)
-LORA_RANK=256
-LORA_ALPHA=256
+LORA_RANK=0
+LORA_ALPHA=0
 
 # Number of GPUs
 NUM_GPUS=8

@@ -105,6 +105,7 @@ def load_vae(
     decoder_type: str = "cnn_decoder",
     model_params: dict = None,
     verbose: bool = True,
+    skip_to_moments: bool = False,
 ):
     """
     Build and load VAE with different encoder types (DINOv3 or SigLIP2).
@@ -116,6 +117,7 @@ def load_vae(
         decoder_type: "diffusion_decoder" or "cnn_decoder".
         model_params: Optional custom model parameters. If None, uses default based on encoder_type.
         verbose: Whether to print loading information.
+        skip_to_moments: If True, ignore missing 'to_moments' keys (for old checkpoints without this layer).
 
     Returns:
         Loaded VAE model in eval mode with frozen parameters.
@@ -183,6 +185,12 @@ def load_vae(
         if "encoder_type" not in model_params:
             model_params["encoder_type"] = encoder_type
 
+    # Ensure skip_to_moments is set in model_params (parameter takes precedence)
+    if skip_to_moments:
+        model_params["skip_to_moments"] = True
+    elif "skip_to_moments" not in model_params:
+        model_params["skip_to_moments"] = False
+
     vae = AutoencoderKL(**model_params).to(device)
 
     if verbose:
@@ -201,7 +209,10 @@ def load_vae(
         state_dict = checkpoint
 
     missing, unexpected = vae.load_state_dict(state_dict, strict=False)
+    
     if verbose:
+        if skip_to_moments:
+            print("[load_vae] skip_to_moments=True: to_moments layer not created, using raw encoder features.")
         if missing:
             print(f"[load_vae] Missing keys: {missing}")
         if unexpected:

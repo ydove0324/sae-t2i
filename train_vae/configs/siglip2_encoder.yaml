@@ -58,7 +58,7 @@ loss:
   
   vf:
     enabled: true
-    weight: 0.1
+    weight: 0.5
     margin_cos: 0.1
     margin_dms: 0.1
     max_tokens: 256
@@ -101,4 +101,4 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: ""
+  vae_ckpt: "results_vae/siglip2_default/step_65000.pth"

@@ -4,14 +4,15 @@
 # Usage: bash pca_visualization.sh
 
 # ===== Configuration =====
-DATA_PATH="/share/project/datasets/ImageNet/train"
-VAE_CKPT="results_vae/dinov3_vitl_two_stage/step_50000.pth"
+DATA_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train"
+VAE_CKPT="results_vae/siglip2_default/step_70000.pth"
+# VAE_CKPT="/cpfs01/huangxu/models/SAE/vfloss_vae.pth"
+# VAE_CKPT="/cpfs01/huangxu/models/SAE/models/ema_vae.pth"
+ENCODER_TYPE="siglip2"  # dinov3 or siglip2
+SIGLIP2_MODEL_NAME="/cpfs01/huangxu/models/siglip2"
+DINOV3_DIR="/cpfs01/huangxu/models/dinov3"
 
-ENCODER_TYPE="dinov3_vitl"  # dinov3 or siglip2
-SIGLIP2_MODEL_NAME="/share/project/huangxu/models/siglip2"
-DINOV3_DIR="/share/project/huangxu/models/dinov3-vitl"
-
-OUTPUT_DIR="results/pca_visualization_dinov3_vitl"
+OUTPUT_DIR="results/pca_visualization_siglip2_70000"
 IMAGE_SIZE=256
 NUM_CLASSES=10         # 选择多少个类别
 SAMPLES_PER_CLASS=200  # 每个类别采样多少

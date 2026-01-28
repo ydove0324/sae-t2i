@@ -15,25 +15,27 @@ IMAGE_SIZE=256
 NUM_IMAGES=10                                          # Number of images to visualize
 
 # VAE checkpoint
-VAE_CKPT="results_vae/dinov3_vitl_two_stage/step_52000.pth"
+# VAE_CKPT="results_vae/siglip2_default/step_60000.pth"
 # VAE_CKPT="results_vae/cnn_decoder_finetune_vf_loss0p1_lora_rank256_ganloss0p01_frozen_dinov3_gramloss/step_40000.pth"
+VAE_CKPT="/cpfs01/huangxu/models/SAE/models/ema_vae.pth"
 
 # Encoder type: "dinov3" or "siglip2"
 ENCODER_TYPE="dinov3"
 
 # LoRA parameters
-LORA_RANK=256
-LORA_ALPHA=256
+LORA_RANK=0
+LORA_ALPHA=0
 
 # Model paths (adjust based on encoder type)
 DINOV3_DIR="/cpfs01/huangxu/models/dinov3"
 SIGLIP2_MODEL="/cpfs01/huangxu/models/siglip2"
 
 # Output directory
-OUTPUT_DIR="results/latent_feature_vis_dinov3_vitl"
+OUTPUT_DIR="results/latent_feature_vis_kl500_dinov3"
 
 # Visualization options
-USE_LORA="--use-lora"                                  # Use "--no-lora" to disable
+# USE_LORA="--use-lora"                                  # Use "--no-lora" to disable
+USE_LORA="--no-lora"
 GLOBAL_NORM=""                                         # Use "--global-norm" for consistent colors
 UPSCALE=16
 
@@ -64,6 +66,8 @@ python eval_vae/latent_feature_vis.py \
     --output-dir "$OUTPUT_DIR" \
     --upscale $UPSCALE \
     --seed $SEED \
+    --lora-rank $LORA_RANK \
+    --lora-alpha $LORA_ALPHA \
     $USE_LORA $GLOBAL_NORM
 
 echo "========================================"

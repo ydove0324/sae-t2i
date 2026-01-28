@@ -145,7 +145,13 @@ def add_lora_to_dinov3(dino_model: nn.Module, r: int = 32, alpha: int = 32, drop
     Targets:
       - dino_model.embeddings.patch_embeddings (Conv2d)
       - each block.attention.{q_proj,k_proj,v_proj} (Linear)
+    
+    If r <= 0, do NOT add any LoRA layers (return original model unchanged).
     """
+    if r <= 0:
+        # No LoRA: return original model unchanged
+        return dino_model
+    
     # patch embed
     pe = dino_model.embeddings.patch_embeddings
     dino_model.embeddings.patch_embeddings = LoRAConv2d(pe, r=r, alpha=alpha, dropout=dropout, enabled=True)
@@ -166,7 +172,13 @@ def add_lora_to_siglip2(siglip_vision_model: nn.Module, r: int = 32, alpha: int 
     Targets:
       - vision_model.embeddings.patch_embedding (Conv2d)
       - each encoder.layers[i].self_attn.{q_proj,k_proj,v_proj} (Linear)
+    
+    If r <= 0, do NOT add any LoRA layers (return original model unchanged).
     """
+    if r <= 0:
+        # No LoRA: return original model unchanged
+        return siglip_vision_model
+    
     # patch embed - SigLIP2 使用 patch_embedding
     if hasattr(siglip_vision_model.embeddings, 'patch_embedding'):
         pe = siglip_vision_model.embeddings.patch_embedding
@@ -651,6 +663,9 @@ class AutoencoderKL(nn.Module):
         vf_weight_clamp: float = 1e4,
         training_mode: str = "enc_dec",
         denormalize_decoder_output: bool = True,
+        
+        # Skip to_moments layer (for old checkpoints without VAE reparameterization)
+        skip_to_moments: bool = False,
     ):
         super().__init__()
 
@@ -723,7 +738,12 @@ class AutoencoderKL(nn.Module):
             effective_c = self.target_latent_channels
 
         # VAE moments head: feature -> (mu, logvar)
-        self.to_moments = nn.Conv2d(effective_c, 2 * effective_c, kernel_size=1, stride=1, padding=0)
+        # If skip_to_moments=True, don't create this layer (for old checkpoints)
+        self.skip_to_moments = skip_to_moments
+        if skip_to_moments:
+            self.to_moments = None
+        else:
+            self.to_moments = nn.Conv2d(effective_c, 2 * effective_c, kernel_size=1, stride=1, padding=0)
 
         # Decoder
         self.decoder = Decoder2D(
@@ -802,7 +822,7 @@ class AutoencoderKL(nn.Module):
         w = (n_rec / (n_vf + eps)).clamp(0.0, self.vf_weight_clamp).detach()
         return w
 
-    def encode(self, x: torch.Tensor,sample_posterior: bool | None = None) -> CausalEncoderOutput:
+    def encode(self, x: torch.Tensor, sample_posterior: bool | None = None) -> CausalEncoderOutput:
         feat = self.encode_features(x, use_lora=True)  # [B,1280,S,S]
 
         # extra downsample
@@ -812,6 +832,15 @@ class AutoencoderKL(nn.Module):
         # channel downsample
         if self.channel_downsample_conv is not None:
             feat = self.channel_downsample_conv(feat)
+
+        # Skip to_moments: directly return feature without VAE reparameterization
+        if self.to_moments is None:
+            # No VAE reparameterization, just return the feature as latent
+            if self.random_masking_channel_ratio > 0.0:
+                feat, _ = mask_channels(feat, mask_ratio=self.random_masking_channel_ratio, channel_dim=1)
+            if self.training and self.noise_tau > 0:
+                feat = self._noising(feat)
+            return CausalEncoderOutput(latent=feat, posterior=None)
 
         moments = self.to_moments(feat)  # [B,2C,H,W]
 
