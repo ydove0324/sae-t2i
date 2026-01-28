@@ -4,18 +4,18 @@
 
 # =================== 数据配置 ===================
 data:
-  train_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
-  val_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val/"
+  train_path: "/share/project/datasets/ImageNet/train"
+  val_path: "/share/project/datasets/ImageNet/val"
   image_size: 256
-  batch_size: 32
+  batch_size: 16
 
 # =================== Encoder 配置 ===================
 encoder:
-  type: "dinov3"  # "dinov3" 或 "siglip2"
+  type: "dinov3_vitl"  # "dinov3", "dinov3_vitl" 或 "siglip2"
   
   # DINOv3 配置
   dinov3:
-    model_dir: "/cpfs01/huangxu/models/dinov3-vitl"
+    model_dir: "/share/project/huangxu/models/dinov3-vitl"
     hidden_size: 1024
     patch_size: 16
   
@@ -61,7 +61,7 @@ loss:
   # VF (Visual Feature) 损失 - 特征对齐
   vf:
     enabled: true
-    weight: 0.01
+    weight: 0.1
     margin_cos: 0.3   # cosine margin loss 的 margin
     margin_dms: 0.1   # distance matrix similarity 的 margin
     max_tokens: 32   # 计算 dms loss 时采样的 token 数
@@ -71,7 +71,7 @@ loss:
   gan:
     enabled: true
     weight: 0.01
-    start_step: 0     # 从第几步开始 GAN 训练
+    start_step: 25000     # 从第几步开始 GAN 训练
     max_d_weight: 10000.0  # 最大自适应权重
     stage_disc_steps: 0    # 纯训练判别器的步数 (0=从一开始联合训练)
 
@@ -106,4 +106,4 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: "results_vae/dinov3_vitl_v3/step_5000.pth"  # 可选的 VAE 初始化权重路径
+  vae_ckpt: ""  # 可选的 VAE 初始化权重路径
