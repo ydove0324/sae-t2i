@@ -192,6 +192,7 @@ def main():
         decoder_type="cnn_decoder",
         model_params=vae_model_params,
         verbose=True,
+        skip_to_moments=False,
     )
     vae.eval()
     
@@ -274,6 +275,20 @@ def main():
         # Print explained variance
         print(f"  PCA explained variance ratio: {pca.explained_variance_ratio_}")
         print(f"  Total explained variance: {sum(pca.explained_variance_ratio_):.4f}")
+        
+        # Calculate cumulative explained variance for different numbers of components
+        print("\n  Cumulative explained variance analysis:")
+        max_components = min(100, features_np.shape[1], features_np.shape[0])
+        pca_full = PCA(n_components=max_components)
+        pca_full.fit(features_np)
+        
+        cumsum = np.cumsum(pca_full.explained_variance_ratio_)
+        checkpoints = [5, 10, 32, 64, 100]
+        for k in checkpoints:
+            if k <= max_components:
+                print(f"    Top {k:3d} components: {cumsum[k-1]:.4f} ({cumsum[k-1]*100:.2f}%)")
+            else:
+                print(f"    Top {k:3d} components: N/A (only {max_components} available)")
     
     if args.method in ["tsne", "both"]:
         print("  Running t-SNE...")
