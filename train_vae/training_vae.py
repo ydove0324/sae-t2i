@@ -25,8 +25,8 @@ from torchvision.utils import save_image
 # local import
 from cnn_decoder import AutoencoderKL
 
-# PatchGAN from local gan_model.py
-from gan_model import NLayerDiscriminator, d_hinge_loss, g_hinge_loss
+# DinoDisc from local dinodisc.py
+from dinodisc import DinoDisc, DiffAug, hinge_d_loss, vanilla_g_loss
 
 # === deps ===
 try:
@@ -48,6 +48,40 @@ try:
 except ImportError:
     HAS_FID = False
     print("Warning: pytorch-fid not found. rFID calculation will be skipped.")
+
+
+# ==========================
+# Learning Rate Scheduler
+# ==========================
+
+import math
+
+def get_cosine_schedule_with_warmup(
+    optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr_ratio: float = 0.1,  # min_lr / max_lr
+):
+    """
+    Create a cosine annealing scheduler with linear warmup.
+    
+    Args:
+        optimizer: The optimizer
+        warmup_steps: Number of warmup steps
+        total_steps: Total training steps
+        min_lr_ratio: Ratio of min_lr to max_lr (default 0.1 means min_lr = 0.1 * max_lr)
+    """
+    def lr_lambda(current_step: int):
+        # Warmup phase
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        # Cosine decay phase
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Scale from [0, 1] to [min_lr_ratio, 1]
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+    
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ==========================
@@ -124,13 +158,46 @@ def get_model_state_dict(model):
 def calculate_adaptive_weight(
     recon_loss: torch.Tensor,
     gan_loss: torch.Tensor,
-    layer: torch.nn.Parameter,
+    params,  # Can be a single Parameter or an iterable of Parameters (e.g., decoder.parameters())
     max_d_weight: float = 1e4,
 ) -> torch.Tensor:
-    """Calculate adaptive weight for GAN loss based on gradient magnitudes."""
-    recon_grads = torch.autograd.grad(recon_loss, layer, retain_graph=True)[0]
-    gan_grads = torch.autograd.grad(gan_loss, layer, retain_graph=True)[0]
-    d_weight = torch.norm(recon_grads) / (torch.norm(gan_grads) + 1e-6)
+    """Calculate adaptive weight for GAN loss based on gradient magnitudes.
+    
+    Args:
+        recon_loss: Reconstruction loss tensor
+        gan_loss: GAN generator loss tensor
+        params: Single parameter or iterable of parameters (e.g., model.decoder.parameters())
+        max_d_weight: Maximum value for the adaptive weight
+    """
+    # Convert to list if it's an iterator/generator
+    if hasattr(params, 'parameters'):
+        # It's a module, get its parameters
+        param_list = list(params.parameters())
+    elif isinstance(params, torch.nn.Parameter):
+        # Single parameter
+        param_list = [params]
+    else:
+        # Assume it's already an iterable
+        param_list = list(params)
+    
+    # Filter out parameters that don't require grad
+    param_list = [p for p in param_list if p.requires_grad]
+    
+    if len(param_list) == 0:
+        return torch.tensor(1.0, device=recon_loss.device)
+    
+    # Compute gradients for all parameters
+    recon_grads = torch.autograd.grad(recon_loss, param_list, retain_graph=True, allow_unused=True)
+    gan_grads = torch.autograd.grad(gan_loss, param_list, retain_graph=True, allow_unused=True)
+    
+    # Compute total gradient norms
+    recon_norm_sq = sum(g.pow(2).sum() for g in recon_grads if g is not None)
+    gan_norm_sq = sum(g.pow(2).sum() for g in gan_grads if g is not None)
+    
+    recon_norm = torch.sqrt(recon_norm_sq)
+    gan_norm = torch.sqrt(gan_norm_sq)
+    
+    d_weight = recon_norm / (gan_norm + 1e-6)
     d_weight = torch.clamp(d_weight, 0.0, max_d_weight)
     return d_weight.detach()
 
@@ -287,14 +354,27 @@ def main():
                         help="SigLIP2 model name from HuggingFace")
     
     # Decoder 配置
+    parser.add_argument("--decoder-type", type=str, default="cnn_decoder", 
+                        choices=["cnn_decoder", "vit_decoder"],
+                        help="Decoder type: 'cnn_decoder' or 'vit_decoder'")
     parser.add_argument("--latent-channels", type=int, default=None, 
                         help="Latent channels (auto-detected from encoder if not set)")
     parser.add_argument("--dec-block-out-channels", type=str, default="1280,1024,512,256,128",
                         help="Decoder block output channels, comma-separated")
+    # ViT decoder 配置
+    parser.add_argument("--vit-hidden-size", type=int, default=1024, help="ViT decoder hidden size")
+    parser.add_argument("--vit-num-layers", type=int, default=24, help="ViT decoder number of layers")
+    parser.add_argument("--vit-num-heads", type=int, default=16, help="ViT decoder number of heads")
+    parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size")
 
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-4, help="Max learning rate")
+    parser.add_argument("--min-lr", type=float, default=2e-5, help="Min learning rate for cosine decay")
+    parser.add_argument("--warmup-steps", type=int, default=0, help="Warmup steps (0 to disable)")
+    parser.add_argument("--scheduler", type=str, default="constant", choices=["constant", "cosine"],
+                        help="Learning rate scheduler: 'constant' or 'cosine'")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for optimizer")
     parser.add_argument("--max-steps", type=int, default=100000)
 
     parser.add_argument("--l1-weight", type=float, default=1.0)
@@ -318,16 +398,29 @@ def main():
     # model regularization
     parser.add_argument("--noise-tau", type=float, default=0.0)
     parser.add_argument("--mask-channels", type=float, default=0.0)
+    
+    # VAE output options
+    parser.add_argument("--denormalize-decoder-output", action="store_true",
+                        help="Denormalize decoder output in VAE.")
+    parser.add_argument("--skip-to-moments", action="store_true",
+                        help="Skip loading to_moments layer (for old checkpoints without it).")
 
-    # GAN - PatchGAN
+    # GAN - DinoDisc
     parser.add_argument("--gan-weight", type=float, default=0.0, help="GAN loss weight (0 to disable)")
     parser.add_argument("--gan-start-step", type=int, default=0, help="Step to start GAN training")
     parser.add_argument("--disc-lr", type=float, default=1e-4, help="Discriminator learning rate")
     parser.add_argument("--max-d-weight", type=float, default=1e4, help="Max adaptive weight for GAN loss")
-    # PatchGAN discriminator config
-    parser.add_argument("--disc-ndf", type=int, default=64, help="PatchGAN base channels")
-    parser.add_argument("--disc-n-layers", type=int, default=4, help="PatchGAN number of layers")
-    parser.add_argument("--disc-norm", type=str, default="gn", choices=["in", "bn", "gn"], help="PatchGAN normalization")
+    # DinoDisc discriminator config
+    parser.add_argument("--dino-ckpt-path", type=str, default="./dino_vit_small_patch8_224.pth",
+                        help="Path to DINO checkpoint for DinoDisc")
+    parser.add_argument("--disc-recipe", type=str, default="S_8", choices=["S_8", "S_16", "B_16"],
+                        help="DinoDisc recipe (S_8, S_16, or B_16)")
+    parser.add_argument("--disc-ks", type=int, default=3, help="DinoDisc head kernel size")
+    parser.add_argument("--disc-norm", type=str, default="bn", choices=["bn", "gn"], help="DinoDisc normalization")
+    parser.add_argument("--disc-key-depths", type=str, default="2,5,8,11",
+                        help="DinoDisc key depths for feature extraction, comma-separated")
+    parser.add_argument("--diffaug-prob", type=float, default=1.0, help="DiffAug probability")
+    parser.add_argument("--diffaug-cutout", type=float, default=0.2, help="DiffAug cutout ratio")
     parser.add_argument("--no-gan", action="store_true", help="Disable GAN loss")
 
     # Stage training mode for GAN
@@ -384,10 +477,26 @@ def main():
         
         if 'decoder' in config:
             dec_cfg = config['decoder']
+            if 'type' in dec_cfg:
+                args.decoder_type = dec_cfg['type']
             if 'latent_channels' in dec_cfg:
                 args.latent_channels = dec_cfg['latent_channels']
-            if 'block_out_channels' in dec_cfg:
+            # CNN decoder 配置
+            if 'cnn' in dec_cfg and 'block_out_channels' in dec_cfg['cnn']:
+                args.dec_block_out_channels = ','.join(map(str, dec_cfg['cnn']['block_out_channels']))
+            elif 'block_out_channels' in dec_cfg:
                 args.dec_block_out_channels = ','.join(map(str, dec_cfg['block_out_channels']))
+            # ViT decoder 配置
+            if 'vit' in dec_cfg:
+                vit_cfg = dec_cfg['vit']
+                if 'hidden_size' in vit_cfg:
+                    args.vit_hidden_size = vit_cfg['hidden_size']
+                if 'num_layers' in vit_cfg:
+                    args.vit_num_layers = vit_cfg['num_layers']
+                if 'num_heads' in vit_cfg:
+                    args.vit_num_heads = vit_cfg['num_heads']
+                if 'intermediate_size' in vit_cfg:
+                    args.vit_intermediate_size = vit_cfg['intermediate_size']
         
         if 'lora' in config:
             lora_cfg = config['lora']
@@ -437,19 +546,35 @@ def main():
         
         if 'discriminator' in config:
             disc_cfg = config['discriminator']
-            if 'ndf' in disc_cfg:
-                args.disc_ndf = disc_cfg['ndf']
-            if 'n_layers' in disc_cfg:
-                args.disc_n_layers = disc_cfg['n_layers']
+            if 'dino_ckpt_path' in disc_cfg:
+                args.dino_ckpt_path = disc_cfg['dino_ckpt_path']
+            if 'recipe' in disc_cfg:
+                args.disc_recipe = disc_cfg['recipe']
+            if 'ks' in disc_cfg:
+                args.disc_ks = disc_cfg['ks']
             if 'norm' in disc_cfg:
                 args.disc_norm = disc_cfg['norm']
+            if 'key_depths' in disc_cfg:
+                args.disc_key_depths = ','.join(map(str, disc_cfg['key_depths']))
             if 'lr' in disc_cfg:
                 args.disc_lr = disc_cfg['lr']
+            if 'diffaug_prob' in disc_cfg:
+                args.diffaug_prob = disc_cfg['diffaug_prob']
+            if 'diffaug_cutout' in disc_cfg:
+                args.diffaug_cutout = disc_cfg['diffaug_cutout']
         
         if 'optimizer' in config:
             opt_cfg = config['optimizer']
             if 'lr' in opt_cfg:
                 args.lr = opt_cfg['lr']
+            if 'min_lr' in opt_cfg:
+                args.min_lr = opt_cfg['min_lr']
+            if 'warmup_steps' in opt_cfg:
+                args.warmup_steps = opt_cfg['warmup_steps']
+            if 'scheduler' in opt_cfg:
+                args.scheduler = opt_cfg['scheduler']
+            if 'weight_decay' in opt_cfg:
+                args.weight_decay = opt_cfg['weight_decay']
         
         if 'training' in config:
             train_cfg = config['training']
@@ -489,6 +614,10 @@ def main():
                 args.noise_tau = vae_cfg['noise_tau']
             if 'mask_channels' in vae_cfg:
                 args.mask_channels = vae_cfg['mask_channels']
+            if 'denormalize_decoder_output' in vae_cfg:
+                args.denormalize_decoder_output = vae_cfg['denormalize_decoder_output']
+            if 'skip_to_moments' in vae_cfg:
+                args.skip_to_moments = vae_cfg['skip_to_moments']
     
     # 处理 --no-xxx 参数
     if args.no_lora:
@@ -582,8 +711,12 @@ def main():
     
     if rank == 0:
         logger.info(f"Encoder type: {args.encoder_type}")
+        logger.info(f"Decoder type: {args.decoder_type}")
         logger.info(f"Latent channels: {args.latent_channels}")
-        logger.info(f"Decoder block out channels: {args.dec_block_out_channels}")
+        if args.decoder_type == "cnn_decoder":
+            logger.info(f"Decoder block out channels: {args.dec_block_out_channels}")
+        else:
+            logger.info(f"ViT decoder: hidden={args.vit_hidden_size}, layers={args.vit_num_layers}, heads={args.vit_num_heads}")
         logger.info(f"LoRA rank: {args.lora_rank}, alpha: {args.lora_alpha}")
         logger.info(f"VF weight: {args.vf_weight}, GAN weight: {args.gan_weight}")
 
@@ -602,10 +735,20 @@ def main():
         target_latent_channels=None,
         spatial_downsample_factor=16,
 
+        # Decoder 配置
+        decoder_type=args.decoder_type,
+        
+        # CNN decoder 参数
         dec_block_out_channels=args.dec_block_out_channels,
         dec_layers_per_block=3,
         decoder_dropout=0.0,
         gradient_checkpointing=False,
+        
+        # ViT decoder 参数
+        vit_decoder_hidden_size=args.vit_hidden_size,
+        vit_decoder_num_layers=args.vit_num_layers,
+        vit_decoder_num_heads=args.vit_num_heads,
+        vit_decoder_intermediate_size=args.vit_intermediate_size,
 
         variational=True,
         kl_weight=args.kl_weight,
@@ -623,7 +766,8 @@ def main():
         vf_hyper=args.vf_weight,
         vf_use_adaptive_weight=True,
         training_mode="enc_dec",
-        denormalize_decoder_output=False,
+        denormalize_decoder_output=args.denormalize_decoder_output,
+        skip_to_moments=args.skip_to_moments,
     ).to(device)
 
     # Load optional ckpt
@@ -641,6 +785,13 @@ def main():
         else:
             state_dict = resume_ckpt
             resume_ckpt = None  # 如果 ckpt 就是 state_dict，则不尝试恢复其他状态
+        
+        # Skip to_moments layer if requested (for old checkpoints without it)
+        if args.skip_to_moments:
+            state_dict = {k: v for k, v in state_dict.items() if "to_moments" not in k}
+            if rank == 0:
+                logger.info("Skipping to_moments layer loading (--skip-to-moments)")
+        
         model.load_state_dict(state_dict, strict=False)
 
     # Freeze base encoder weights; train LoRA + decoder + moments head (+ optional downsample convs)
@@ -650,7 +801,11 @@ def main():
     requires_grad(model.decoder, True)
 
     # moments head train
-    requires_grad(model.to_moments, True)
+    if model.to_moments is not None:
+        requires_grad(model.to_moments, True)
+    else:
+        if rank == 0:
+            logger.info("to_moments is None")
 
     # extra convs
     for conv in model.latent_downsample_layers:
@@ -727,26 +882,54 @@ def main():
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
         betas=(0.5, 0.9),
-        weight_decay=1e-2,
+        weight_decay=args.weight_decay,
     )
+    
+    # Learning rate scheduler for VAE
+    scheduler = None
+    if args.scheduler == "cosine":
+        min_lr_ratio = args.min_lr / args.lr if args.lr > 0 else 0.1
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer=opt,
+            warmup_steps=args.warmup_steps,
+            total_steps=args.max_steps,
+            min_lr_ratio=min_lr_ratio,
+        )
+        if rank == 0:
+            logger.info(f"Using cosine scheduler: warmup={args.warmup_steps}, max_lr={args.lr}, min_lr={args.min_lr}")
+    else:
+        if rank == 0:
+            logger.info(f"Using constant learning rate: {args.lr}")
 
     loss_lpips = LPIPSLoss(device)
 
-    # ========== GAN Setup - PatchGAN ==========
+    # ========== GAN Setup - DinoDisc ==========
     use_gan = args.gan_weight > 0.0
     discriminator = None
     opt_disc = None
+    scheduler_disc = None
+    diffaug = None
 
     if use_gan:
-        # Build PatchGAN discriminator
-        discriminator = NLayerDiscriminator(
-            in_channels=3,
-            ndf=args.disc_ndf,
-            n_layers=args.disc_n_layers,
-            norm=args.disc_norm,
+        # Parse key_depths
+        disc_key_depths = tuple(int(x) for x in args.disc_key_depths.split(','))
+        
+        # Build DinoDisc discriminator
+        discriminator = DinoDisc(
+            device=device,
+            dino_ckpt_path=args.dino_ckpt_path,
+            ks=args.disc_ks,
+            key_depths=disc_key_depths,
+            norm_type=args.disc_norm,
+            using_spec_norm=True,
+            norm_eps=1e-6,
+            recipe=args.disc_recipe,
         ).to(device)
+        
+        # DiffAug for discriminator
+        diffaug = DiffAug(prob=args.diffaug_prob, cutout=args.diffaug_cutout)
 
-        # Wrap discriminator with DDP or FSDP
+        # Wrap discriminator with DDP or FSDP (only wrap trainable heads)
         if use_fsdp:
             fsdp_mixed_precision_disc = None
             if use_bf16:
@@ -767,19 +950,35 @@ def main():
         discriminator.train()
 
         opt_disc = torch.optim.AdamW(
-            discriminator.parameters(),
+            filter(lambda p: p.requires_grad, discriminator.parameters()),
             lr=args.disc_lr,
             betas=(0.5, 0.9),
-            weight_decay=1e-2,
+            weight_decay=args.weight_decay,
         )
+        
+        # Learning rate scheduler for discriminator (same schedule as VAE)
+        scheduler_disc = None
+        if args.scheduler == "cosine":
+            # Discriminator training starts at gan_start_step
+            # Total steps for discriminator = max_steps - gan_start_step
+            disc_total_steps = args.max_steps - args.gan_start_step
+            disc_min_lr_ratio = args.min_lr / args.disc_lr if args.disc_lr > 0 else 0.1
+            scheduler_disc = get_cosine_schedule_with_warmup(
+                optimizer=opt_disc,
+                warmup_steps=0,  # No warmup for discriminator (starts later)
+                total_steps=disc_total_steps,
+                min_lr_ratio=disc_min_lr_ratio,
+            )
 
         if rank == 0:
-            num_disc_params = sum(p.numel() for p in discriminator.parameters())
-            logger.info(f"PatchGAN Discriminator parameters: {num_disc_params / 1e6:.2f}M")
+            num_disc_params = sum(p.numel() for p in discriminator.parameters() if p.requires_grad)
+            logger.info(f"DinoDisc Discriminator trainable parameters: {num_disc_params / 1e6:.2f}M")
+            logger.info(f"DinoDisc recipe: {args.disc_recipe}, key_depths: {disc_key_depths}")
+            logger.info(f"DiffAug: {diffaug}")
             logger.info(f"GAN weight: {args.gan_weight}, start step: {args.gan_start_step}")
             logger.info(f"Stage disc steps: {args.stage_disc_steps} (0 = joint training from start)")
 
-    # ========== 从 checkpoint 恢复 optimizer/discriminator/step ==========
+    # ========== 从 checkpoint 恢复 optimizer/discriminator/scheduler/step ==========
     if resume_ckpt is not None:
         # 恢复 VAE optimizer
         if "opt" in resume_ckpt:
@@ -791,7 +990,17 @@ def main():
                 if rank == 0:
                     logger.warning(f"Failed to load VAE optimizer state: {e}")
         
-        # 恢复 discriminator 和其 optimizer
+        # 恢复 VAE scheduler
+        if "scheduler" in resume_ckpt and scheduler is not None:
+            try:
+                scheduler.load_state_dict(resume_ckpt["scheduler"])
+                if rank == 0:
+                    logger.info("Loaded VAE scheduler state from checkpoint")
+            except Exception as e:
+                if rank == 0:
+                    logger.warning(f"Failed to load VAE scheduler state: {e}")
+        
+        # 恢复 discriminator 和其 optimizer/scheduler
         if use_gan and discriminator is not None:
             if "discriminator" in resume_ckpt:
                 try:
@@ -811,6 +1020,15 @@ def main():
                 except Exception as e:
                     if rank == 0:
                         logger.warning(f"Failed to load discriminator optimizer state: {e}")
+            
+            if "scheduler_disc" in resume_ckpt and scheduler_disc is not None:
+                try:
+                    scheduler_disc.load_state_dict(resume_ckpt["scheduler_disc"])
+                    if rank == 0:
+                        logger.info("Loaded discriminator scheduler state from checkpoint")
+                except Exception as e:
+                    if rank == 0:
+                        logger.warning(f"Failed to load discriminator scheduler state: {e}")
 
     # Loop
     if rank == 0:
@@ -870,11 +1088,9 @@ def main():
             in_stage_joint = gan_active and not in_stage_disc
 
             # ========== Generator (VAE) Forward & Update ==========
-            # Determine if we need to update generator
-            # - Before GAN starts (not gan_active): train VAE normally
-            # - stage_disc: freeze VAE, only train discriminator (no_grad to save memory)
-            # - stage_joint: train both VAE and discriminator
-            update_generator = (not gan_active) or in_stage_joint
+            # VAE is always trained with recon/KL/VF loss
+            # - stage_disc: train VAE (recon + KL + VF), train discriminator, but NO GAN loss for VAE
+            # - stage_joint: train both VAE and discriminator, VAE includes GAN loss
 
             # Initialize loss values for logging
             loss = torch.tensor(0.0, device=device)
@@ -888,78 +1104,75 @@ def main():
             gan_loss = torch.tensor(0.0, device=device)
             d_weight = torch.tensor(0.0, device=device)
 
-            if in_stage_disc:
-                # stage_disc: only forward VAE to get recon, no grad to save memory
-                if discriminator is not None:
-                    discriminator.eval()
-                    requires_grad(discriminator, False)
+            # Freeze discriminator during VAE update (to avoid computing unnecessary gradients)
+            if gan_active and discriminator is not None:
+                discriminator.eval()
+                requires_grad(discriminator, False)
 
-                with torch.no_grad():
-                    with torch.autocast("cuda", dtype=amp_dtype, enabled=use_bf16):
-                        out = model(x)
-                        recon = out.sample  # [-1,1]
-            else:
-                # Normal training or stage_joint: compute full loss with gradients
-                if gan_active and discriminator is not None:
-                    discriminator.eval()
-                    requires_grad(discriminator, False)
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=use_bf16):
+                out = model(x)
+                recon = out.sample  # [-1,1]
+                posterior = out.posterior
 
-                opt.zero_grad(set_to_none=True)
-                with torch.autocast("cuda", dtype=amp_dtype, enabled=use_bf16):
-                    out = model(x)
-                    recon = out.sample  # [-1,1]
-                    posterior = out.posterior
+                # Recon loss (keep in [-1,1] for LPIPS)
+                l1_loss = F.l1_loss(recon, x)
+                lpips_loss = loss_lpips(x, recon)
+                loss_rec = args.l1_weight * l1_loss + args.lpips_weight * lpips_loss
 
-                    # Recon loss (keep in [-1,1] for LPIPS)
-                    l1_loss = F.l1_loss(recon, x)
-                    lpips_loss = loss_lpips(x, recon)
-                    loss_rec = args.l1_weight * l1_loss + args.lpips_weight * lpips_loss
-
-                    # KL
+                # KL
+                if posterior is not None:
                     kl_loss = posterior.kl().mean()
+                else:
+                    kl_loss = torch.tensor(0.0, device=device)
 
-                    # VF loss: student (LoRA on) vs ref (LoRA off)
-                    # Stage 1: skip VF loss (only recon + GAN)
-                    # Stage 2: enable VF loss
-                    model_inner = unwrap_model(model)
-                    
-                    if in_stage1 or args.vf_weight == 0.0:
-                        # Stage 1 or VF disabled: no VF loss
-                        vf_raw = torch.tensor(0.0, device=device)
-                        w_adapt = torch.tensor(0.0, device=device)
-                        loss_vf = torch.tensor(0.0, device=device)
+                # VF loss: student (LoRA on) vs ref (LoRA off)
+                # Stage 1: skip VF loss (only recon + GAN)
+                # Stage 2: enable VF loss
+                model_inner = unwrap_model(model)
+                
+                if in_stage1 or args.vf_weight == 0.0:
+                    # Stage 1 or VF disabled: no VF loss
+                    vf_raw = torch.tensor(0.0, device=device)
+                    w_adapt = torch.tensor(0.0, device=device)
+                    loss_vf = torch.tensor(0.0, device=device)
+                else:
+                    # Stage 2: compute VF loss
+                    z_feat = model_inner.encode_features(x, use_lora=True)  # [B,C,S,S]
+                    with torch.no_grad():
+                        f_feat = model_inner.encode_features(x, use_lora=False)
+                    vf_raw = model_inner.compute_vf_loss(z_feat, f_feat)
+
+                    if model_inner.vf_use_adaptive_weight:
+                        w_adapt = model_inner.adaptive_weight(loss_rec, vf_raw, current_lora_params)
                     else:
-                        # Stage 2: compute VF loss
-                        z_feat = model_inner.encode_features(x, use_lora=True)  # [B,C,S,S]
-                        with torch.no_grad():
-                            f_feat = model_inner.encode_features(x, use_lora=False)
-                        vf_raw = model_inner.compute_vf_loss(z_feat, f_feat)
+                        w_adapt = torch.tensor(1.0, device=device)
+                    w_adapt = torch.clamp(w_adapt, max=3.0)
+                    loss_vf = model_inner.vf_hyper * w_adapt * vf_raw
+                
+                loss = loss_rec + model_inner.kl_weight * kl_loss + loss_vf
 
-                        if model_inner.vf_use_adaptive_weight:
-                            w_adapt = model_inner.adaptive_weight(loss_rec, vf_raw, current_lora_params)
-                        else:
-                            w_adapt = torch.tensor(1.0, device=device)
-                        w_adapt = torch.clamp(w_adapt, max=3.0)
-                        loss_vf = model_inner.vf_hyper * w_adapt * vf_raw
-                    
-                    loss = loss_rec + model_inner.kl_weight * kl_loss + loss_vf
+                # GAN Generator loss (only in stage_joint, NOT in stage_disc)
+                if in_stage_joint:
+                    # Apply DiffAug to reconstruction for generator training
+                    recon_aug = diffaug.aug(recon) if diffaug is not None else recon
+                    logits_fake = discriminator(recon_aug)
+                    gan_loss = vanilla_g_loss(logits_fake)
+                    # Compute adaptive weight using entire decoder parameters
+                    d_weight = calculate_adaptive_weight(
+                        loss_rec + model_inner.kl_weight * kl_loss + loss_vf,
+                        gan_loss,
+                        model_inner.decoder,  # Pass entire decoder module
+                        args.max_d_weight,
+                    )
+                    loss = loss + args.gan_weight * d_weight * gan_loss
 
-                    # GAN Generator loss (only in stage_joint)
-                    if in_stage_joint:
-                        logits_fake = discriminator(recon)
-                        gan_loss = g_hinge_loss(logits_fake)
-                        # Compute adaptive weight using decoder's last layer
-                        last_layer = model_inner.decoder.conv_out.weight
-                        d_weight = calculate_adaptive_weight(
-                            loss_rec + model_inner.kl_weight * kl_loss + loss_vf,
-                            gan_loss,
-                            last_layer,
-                            args.max_d_weight,
-                        )
-                        loss = loss + args.gan_weight * d_weight * gan_loss
-
-                loss.backward()
-                opt.step()
+            loss.backward()
+            opt.step()
+            
+            # Update VAE learning rate scheduler
+            if scheduler is not None:
+                scheduler.step()
 
             # ========== Discriminator Update ==========
             disc_loss = torch.tensor(0.0, device=device)
@@ -977,15 +1190,22 @@ def main():
                         # Discretize for discriminator input
                         recon_detach = recon_detach.clamp(-1.0, 1.0)
                         recon_detach = torch.round((recon_detach + 1.0) * 127.5) / 127.5 - 1.0
+                        # Apply DiffAug to both real and fake images
+                        x_aug = diffaug.aug(x) if diffaug is not None else x
+                        recon_aug = diffaug.aug(recon_detach) if diffaug is not None else recon_detach
 
-                    logits_fake_d = discriminator(recon_detach)
-                    logits_real_d = discriminator(x)
-                    disc_loss = d_hinge_loss(logits_real_d, logits_fake_d)
+                    logits_fake_d = discriminator(recon_aug)
+                    logits_real_d = discriminator(x_aug)
+                    disc_loss = hinge_d_loss(logits_real_d, logits_fake_d)
                     logits_real_mean = logits_real_d.detach().mean()
                     logits_fake_mean = logits_fake_d.detach().mean()
 
                 disc_loss.backward()
                 opt_disc.step()
+                
+                # Update discriminator learning rate scheduler
+                if scheduler_disc is not None:
+                    scheduler_disc.step()
             # print(f"disc_loss: {disc_loss.item()}")
             step += 1
 
@@ -1000,8 +1220,12 @@ def main():
                 else:
                     stage_str = "stage2" if args.stage1_steps > 0 else "no_gan"
 
+                # Get current learning rates
+                current_lr = opt.param_groups[0]['lr']
+                current_disc_lr = opt_disc.param_groups[0]['lr'] if opt_disc is not None else 0.0
+
                 log_msg = (
-                    f"Step {step} [{stage_str}]: total={loss.item():.4f} | rec={loss_rec.item():.4f} "
+                    f"Step {step} [{stage_str}] lr={current_lr:.2e}: total={loss.item():.4f} | rec={loss_rec.item():.4f} "
                     f"(L1={l1_loss.item():.4f}, LPIPS={lpips_loss.item():.4f}) "
                     f"| KL={kl_loss.item():.4f} "
                     f"| VF={vf_raw.item():.4f} w={w_adapt.item():.3f} vf_term={loss_vf.item():.4f}"
@@ -1010,6 +1234,7 @@ def main():
                     log_msg += (
                         f" | GAN={gan_loss.item():.4f} d_w={d_weight.item():.3f} "
                         f"D_loss={disc_loss.item():.4f} D_real={logits_real_mean.item():.3f} D_fake={logits_fake_mean.item():.3f}"
+                        f" disc_lr={current_disc_lr:.2e}"
                     )
                 logger.info(log_msg)
 
@@ -1054,10 +1279,15 @@ def main():
                     "step": step,
                     "opt": opt.state_dict(),  # 保存 VAE optimizer
                 }
+                # 保存 VAE scheduler
+                if scheduler is not None:
+                    ckpt_state["scheduler"] = scheduler.state_dict()
                 if use_gan and discriminator is not None:
                     disc_state = get_model_state_dict(discriminator)
                     ckpt_state["discriminator"] = disc_state
                     ckpt_state["opt_disc"] = opt_disc.state_dict()
+                    if scheduler_disc is not None:
+                        ckpt_state["scheduler_disc"] = scheduler_disc.state_dict()
                 torch.save(ckpt_state, save_path)
                 logger.info(f"Saved checkpoint to {save_path}")
 
