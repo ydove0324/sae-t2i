@@ -22,14 +22,102 @@ from PIL import Image
 from copy import deepcopy
 from glob import glob
 from time import time
+from collections import defaultdict
 import argparse
+
+
+#################################################################################
+#                              Timing Profiler                                  #
+#################################################################################
+
+class TrainingProfiler:
+    """
+    训练过程时间分析器，用于追踪各主要操作的耗时。
+    """
+    def __init__(self, enabled=True, sync_cuda=True):
+        self.enabled = enabled
+        self.sync_cuda = sync_cuda  # 是否在计时前同步CUDA
+        self.timers = defaultdict(list)
+        self.current_timers = {}
+        
+    def start(self, name: str):
+        """开始计时某个操作"""
+        if not self.enabled:
+            return
+        if self.sync_cuda:
+            torch.cuda.synchronize()
+        self.current_timers[name] = time()
+    
+    def stop(self, name: str):
+        """停止计时某个操作"""
+        if not self.enabled:
+            return
+        if name not in self.current_timers:
+            return
+        if self.sync_cuda:
+            torch.cuda.synchronize()
+        elapsed = time() - self.current_timers[name]
+        self.timers[name].append(elapsed)
+        del self.current_timers[name]
+        return elapsed
+    
+    def reset(self):
+        """重置所有计时器"""
+        self.timers.clear()
+        self.current_timers.clear()
+    
+    def get_stats(self, last_n: int = None) -> dict:
+        """获取统计信息"""
+        stats = {}
+        for name, times in self.timers.items():
+            if last_n is not None:
+                times = times[-last_n:]
+            if len(times) > 0:
+                stats[name] = {
+                    "count": len(times),
+                    "total": sum(times),
+                    "mean": sum(times) / len(times),
+                    "min": min(times),
+                    "max": max(times),
+                }
+        return stats
+    
+    def print_summary(self, last_n: int = None, logger=None):
+        """打印时间分析摘要"""
+        stats = self.get_stats(last_n)
+        if not stats:
+            return
+        
+        # 按总时间排序
+        sorted_stats = sorted(stats.items(), key=lambda x: x[1]["total"], reverse=True)
+        total_time = sum(s["total"] for _, s in sorted_stats)
+        
+        lines = [
+            "\n" + "=" * 70,
+            f"{'操作名称':<30} {'次数':>8} {'总时间(s)':>12} {'平均(ms)':>12} {'占比':>8}",
+            "-" * 70,
+        ]
+        for name, s in sorted_stats:
+            pct = (s["total"] / total_time * 100) if total_time > 0 else 0
+            lines.append(
+                f"{name:<30} {s['count']:>8} {s['total']:>12.3f} "
+                f"{s['mean']*1000:>12.2f} {pct:>7.1f}%"
+            )
+        lines.append("=" * 70)
+        
+        msg = "\n".join(lines)
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
 import logging
 import shutil  # Added for file operations
 
 import sys
 sys.path.append(".")
 import math
-from torch.cuda.amp import autocast
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from omegaconf import OmegaConf
 # from models.rae.stage1 import RAE
 from models.rae.stage2.models import Stage2ModelProtocol
@@ -235,31 +323,33 @@ def run_fid_evaluation(
             
             y = torch.full((curr_batch,), cls_id, device=device, dtype=torch.long)
             
-            # 1. Sample Latent
-            z0_hat = sample_latent_linear_50_steps(
-                model=model,
-                batch_size=curr_batch,
-                latent_shape=latent_shape,
-                device=device,
-                y=y,
-                time_shift=time_shift,
-                steps=50,  # Using 50 steps as standard
-                use_cfg=use_cfg,
-                cfg_scale=cfg_scale,
-                cfg_interval_low=cfg_interval_low,
-                cfg_interval_high=cfg_interval_high,
-                null_class=null_class,
-            )
-            
-            # 2. Decode using Diffusion Decoder (Default)
-            imgs = reconstruct_from_latent_with_diffusion(
-                vae=vae,
-                latent_z=z0_hat,
-                image_shape=torch.Size([curr_batch, 3, args.image_size, args.image_size]),
-                diffusion_steps=args.vae_diffusion_steps,
-                decoder_type=decoder_type,
-                encoder_type=encoder_type,
-            )
+            # FID evaluation always uses FP32 for precision
+            with torch.autocast(device_type='cuda', enabled=False):
+                # 1. Sample Latent
+                z0_hat = sample_latent_linear_50_steps(
+                    model=model,
+                    batch_size=curr_batch,
+                    latent_shape=latent_shape,
+                    device=device,
+                    y=y,
+                    time_shift=time_shift,
+                    steps=50,  # Using 50 steps as standard
+                    use_cfg=use_cfg,
+                    cfg_scale=cfg_scale,
+                    cfg_interval_low=cfg_interval_low,
+                    cfg_interval_high=cfg_interval_high,
+                    null_class=null_class,
+                )
+                
+                # 2. Decode using Diffusion Decoder (Default)
+                imgs = reconstruct_from_latent_with_diffusion(
+                    vae=vae,
+                    latent_z=z0_hat.float(),  # Ensure FP32
+                    image_shape=torch.Size([curr_batch, 3, args.image_size, args.image_size]),
+                    diffusion_steps=args.vae_diffusion_steps,
+                    decoder_type=decoder_type,
+                    encoder_type=encoder_type,
+                )
             
             # 3. Save
             imgs = (imgs + 1.0) / 2.0
@@ -302,10 +392,10 @@ def run_fid_evaluation(
             logger.error(f"FID Calculation failed: {e}")
         finally:
             # Clean up to save space
-            if os.path.exists(flat_dir):
-                shutil.rmtree(flat_dir)
+                if os.path.exists(flat_dir):
+                    shutil.rmtree(flat_dir)
             # Optional: Clean up the structured eval_dir too if you don't want to keep images
-            # shutil.rmtree(eval_dir) 
+            # shutil.rmtree(eval_dir)
 
     dist.barrier()
     logger.info(f"========== End FID Evaluation (Step {step}) ==========")
@@ -627,7 +717,7 @@ def main(args):
         print(f"Using latent_size from config: {latent_size}")
     
     # ---------------- time_shift ----------------
-    shift_dim = misc.get("time_dist_shift_dim", latent_size[0] * latent_size[1] * latent_size[2])
+    shift_dim = latent_size[0] * latent_size[1] * latent_size[2]
     shift_base = misc.get("time_dist_shift_base", 4096)
     time_shift = math.sqrt(shift_dim / shift_base)
     
@@ -749,6 +839,14 @@ def main(args):
     model_param_count = sum(p.numel() for p in model.parameters())
     logger.info(f"Model Parameters: {model_param_count/1e6:.2f}M")
 
+    # torch.compile acceleration (before DDP wrapping)
+    if args.compile:
+        if rank == 0:
+            logger.info(f"Compiling model with torch.compile (mode={args.compile_mode})...")
+        model = torch.compile(model, mode=args.compile_mode)
+        if rank == 0:
+            logger.info("Model compiled successfully.")
+
     model = DDP(model, device_ids=[device_idx], gradient_as_bucket_view=False)
 
     opt, opt_msg = build_optimizer(model.parameters(), training_cfg)
@@ -806,6 +904,17 @@ def main(args):
     log_steps = 0
     running_loss = 0.0
     start_time = time()
+    
+    # 初始化 AMP (混合精度训练)
+    use_amp = (args.precision == "bf16")
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    scaler = GradScaler(enabled=(use_amp and amp_dtype == torch.float16))  # bf16不需要scaler
+    if rank == 0:
+        logger.info(f"AMP enabled: {use_amp}, dtype: {amp_dtype}")
+    
+    # 初始化时间分析器
+    profiler = TrainingProfiler(enabled=args.profile, sync_cuda=True)
+    profile_print_every = 100  # 每500步打印一次时间分析
 
     logger.info(f"Training for {epochs} epochs...")
     # 你原来强制 log_every=10，我保留 args/config 的值（如果你想强制就自己改）
@@ -813,6 +922,7 @@ def main(args):
 
     for epoch in range(epochs):
         sampler.set_epoch(epoch)
+        epoch_start_time = time()
         if rank == 0:
             print(f"Beginning epoch {epoch}...")
 
@@ -821,13 +931,17 @@ def main(args):
         step_loss_accum = 0.0
 
         for x_img, y in loader:
-            x_img = x_img.to(device)
-            y = y.to(device)
+            profiler.start("data_to_gpu")
+            x_img = x_img.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            profiler.stop("data_to_gpu")
 
             # 实时编码图片到 latent
-            with torch.no_grad():
+            profiler.start("vae_encode")
+            with torch.no_grad(), autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 x_latent, _p = dinov3_vae.encode(x_img)
                 x_latent = normalize_fn(x_latent)
+            profiler.stop("vae_encode")
 
             # CFG label dropout
             NULL_CLASS = num_classes
@@ -840,15 +954,18 @@ def main(args):
 
             model_kwargs = dict(y=y_train)
 
-            loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
-                model=model,
-                x_latent=x_latent,
-                model_kwargs=model_kwargs,
-                time_shift=time_shift,
-                noise_schedule=noise_schedule,
-                log_norm_mean=log_norm_mean,
-                log_norm_std=log_norm_std,
-            )
+            profiler.start("forward_loss")
+            with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
+                    model=model,
+                    x_latent=x_latent,
+                    model_kwargs=model_kwargs,
+                    time_shift=time_shift,
+                    noise_schedule=noise_schedule,
+                    log_norm_mean=log_norm_mean,
+                    log_norm_std=log_norm_std,
+                )
+            profiler.stop("forward_loss")
 
             # ==========================
             # NaN 检测 + 自动从 latest.pt 恢复（保留你原逻辑）
@@ -882,6 +999,13 @@ def main(args):
                         schedl.load_state_dict(checkpoint["scheduler"])
                     train_steps = int(checkpoint.get("train_steps", 0))
 
+                    # Reset training state after resume
+                    opt.zero_grad(set_to_none=True)
+                    accum_counter = 0
+                    step_loss_accum = 0.0
+                    model.train()
+                    ema.eval()
+
                     torch.cuda.synchronize()
                     gc.collect()
                     torch.cuda.empty_cache()
@@ -901,20 +1025,39 @@ def main(args):
             # backward + accum
             step_loss_accum += loss_tensor.item()
             loss_tensor = loss_tensor / grad_accum_steps
-            loss_tensor.backward()
+            
+            profiler.start("backward")
+            if scaler.is_enabled():
+                scaler.scale(loss_tensor).backward()
+            else:
+                loss_tensor.backward()
+            profiler.stop("backward")
             accum_counter += 1
 
             if accum_counter < grad_accum_steps:
                 continue
 
+            profiler.start("optimizer_step")
+            if scaler.is_enabled():
+                scaler.unscale_(opt)
+            
             if clip_grad > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
             else:
                 grad_norm = torch.tensor(0.0, device=device)
 
-            opt.step()
+            if scaler.is_enabled():
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
             schedl.step()
+            profiler.stop("optimizer_step")
+            
+            profiler.start("ema_update")
             update_ema(ema, model.module, decay=ema_decay)
+            profiler.stop("ema_update")
+            
             opt.zero_grad()
 
             running_loss += step_loss_accum / grad_accum_steps
@@ -931,7 +1074,8 @@ def main(args):
             show_time = 100
             DEBUG = False
             if rank == 0 and ((train_steps % show_time == 0) or DEBUG):
-                with torch.no_grad():
+                # Eval visualization always uses FP32 for precision
+                with torch.no_grad(), torch.autocast(device_type='cuda', enabled=False):
                     # 1) 生成一张（EMA）
                     y_sample = y[:1]
                     img_gen, z_gen = stage2_sample_and_reconstruct(
@@ -953,7 +1097,7 @@ def main(args):
                     save_image(img_gen_01, os.path.join(vis_dir, f"gen_step_{train_steps:07d}.png"))
 
                     # 2) 用当前 step 的 x-pred latent 做重建
-                    latent_sample = pred_latent[0:1]
+                    latent_sample = pred_latent[0:1].float()  # Ensure FP32
                     recon = reconstruct_from_latent_with_diffusion(
                         vae=dinov3_vae,
                         latent_z=latent_sample,
@@ -965,7 +1109,7 @@ def main(args):
 
                     # 3) noisy latent 可视化（按你原代码）
                     # x_latent 是 z0，t_sample/noise 是 compute_train_loss 里生成的
-                    x_latent_sample = x_latent[0:1] * (1 - t_sample[0]) + noise[0:1] * t_sample[0]
+                    x_latent_sample = (x_latent[0:1] * (1 - t_sample[0]) + noise[0:1] * t_sample[0]).float()  # Ensure FP32
                     x_recon = reconstruct_from_latent_with_diffusion(
                         vae=dinov3_vae,
                         latent_z=x_latent_sample,
@@ -1033,6 +1177,8 @@ def main(args):
                 )
 
                 # 2) CFG
+                if train_steps % (args.fid_every * 4) != 0:
+                    continue
                 run_fid_evaluation(
                     model=ema,
                     vae=dinov3_vae,
@@ -1082,6 +1228,13 @@ def main(args):
                 running_loss = 0.0
                 log_steps = 0
                 start_time = time()
+            
+            # ==========================
+            # 周期性打印时间分析
+            # ==========================
+            if args.profile and train_steps % profile_print_every == 0 and train_steps > 0 and rank == 0:
+                profiler.print_summary(last_n=profile_print_every, logger=logger)
+                profiler.reset()
 
             # ==========================
             # checkpoint 保存（保留 + 修正你原来重复块问题：这里只留一次）
@@ -1141,6 +1294,11 @@ def main(args):
                     logger.info(f"Updated quick resume checkpoint: {latest_path}")
                 dist.barrier()
 
+        # Epoch结束，打印epoch时间
+        if rank == 0:
+            epoch_time = time() - epoch_start_time
+            logger.info(f"Epoch {epoch} completed in {epoch_time:.2f}s ({epoch_time/60:.2f}min)")
+
     model.eval()
     logger.info("Done!")
     cleanup()
@@ -1158,6 +1316,9 @@ if __name__ == "__main__":
     parser.add_argument("--global-batch-size", type=int, default=None)
     parser.add_argument("--precision", type=str, choices=["bf16", "fp32"], default="fp32")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--profile", action="store_true", help="Enable training profiler to analyze time spent in each operation.")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile for model acceleration.")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"], help="torch.compile mode.")
 
     # VAE
     parser.add_argument("--vae-ckpt", type=str, required=True)
