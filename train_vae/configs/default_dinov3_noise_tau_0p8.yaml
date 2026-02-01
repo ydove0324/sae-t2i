@@ -130,7 +130,7 @@ training:
 
 # =================== 日志和检查点 ===================
 logging:
-  output_dir: "results_vae/dinov3_vit_decoder_xl"
+  output_dir: "results_vae/dinov3_vit_decoder_xl_noise_tau_0p8"
   log_every: 10
   eval_every: 2000
   save_every: 5000
@@ -139,4 +139,4 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: "results_vae/dinov3_vit_decoder_xl/step_65000.pth"
+  vae_ckpt: "results_vae/dinov3_vit_decoder_xl_noise_tau_0p8/step_65000.pth"

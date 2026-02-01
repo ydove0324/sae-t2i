@@ -266,14 +266,29 @@ def run_validation(model, val_loader, device, step, args, logger, use_fsdp=False
     total_psnr = 0.0
     count = 0
     max_batches = args.val_max_batches
+    
+    # 计算所有 rank 应该迭代的最小 batch 数，确保同步
+    # 获取当前 rank 的 val_loader 实际 batch 数
+    local_num_batches = len(val_loader)
+    local_num_batches_tensor = torch.tensor(local_num_batches, device=device, dtype=torch.long)
+    dist.all_reduce(local_num_batches_tensor, op=dist.ReduceOp.MIN)
+    min_batches_across_ranks = local_num_batches_tensor.item()
+    
+    # 实际使用的 batch 数 = min(max_batches, 所有 rank 中最小的 batch 数)
+    actual_max_batches = min(max_batches, min_batches_across_ranks)
+    
+    if rank == 0:
+        logger.info(f"Validation: using {actual_max_batches} batches (max_batches={max_batches}, min_across_ranks={min_batches_across_ranks})")
 
     for i, (x, _) in enumerate(val_loader):
-        if i >= max_batches:
+        if i >= actual_max_batches:
             break
         x = x.to(device)
 
-        out = model(x)
-        recon = out.sample  # [-1,1]
+        # Force fp32 precision for validation
+        with torch.autocast("cuda", dtype=torch.float32, enabled=False):
+            out = model(x)
+            recon = out.sample  # [-1,1]
         batch_psnr = calculate_psnr(x, recon)
         total_psnr += batch_psnr.item()
         count += 1
@@ -316,9 +331,32 @@ def run_validation(model, val_loader, device, step, args, logger, use_fsdp=False
             if rfid >= 0:  # Only log if FID was successfully calculated
                 tb_writer.add_scalar("Validation/rFID", rfid, step)
 
-        if not args.debug:
-            shutil.rmtree(gt_dir, ignore_errors=True)
-            shutil.rmtree(recon_dir, ignore_errors=True)
+    # 先同步，确保所有 rank 都完成了 FID 相关操作
+    dist.barrier()
+    
+    # 所有 rank 都尝试删除自己的文件（而不是只让 rank 0 删除整个目录）
+    # 这样可以分散 I/O 负载，避免单个 rank 卡住
+    if not args.debug:
+        import glob
+        # 删除当前 rank 保存的文件
+        for pattern in [f"r{rank}_b*_*.png"]:
+            for f in glob.glob(os.path.join(gt_dir, pattern)):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+            for f in glob.glob(os.path.join(recon_dir, pattern)):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+    
+    dist.barrier()
+    
+    # rank 0 最后清理空目录
+    if rank == 0 and not args.debug:
+        shutil.rmtree(gt_dir, ignore_errors=True)
+        shutil.rmtree(recon_dir, ignore_errors=True)
 
     dist.barrier()
     model.train()
@@ -347,11 +385,13 @@ def main():
     parser.add_argument("--vae-ckpt", type=str, default="", help="optional init checkpoint")
     
     # Encoder 配置
-    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "siglip2"],
-                        help="Encoder type: 'dinov3' or 'siglip2'")
+    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "siglip2", "dinov2"],
+                        help="Encoder type: 'dinov3', 'siglip2', or 'dinov2'")
     parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3")
     parser.add_argument("--siglip2-model-name", type=str, default="google/siglip2-base-patch16-256",
                         help="SigLIP2 model name from HuggingFace")
+    parser.add_argument("--dinov2-model-name", type=str, default="facebook/dinov2-with-registers-base",
+                        help="DINOv2 model name from HuggingFace (e.g., 'facebook/dinov2-with-registers-base')")
     
     # Decoder 配置
     parser.add_argument("--decoder-type", type=str, default="cnn_decoder", 
@@ -368,6 +408,10 @@ def main():
     parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size")
 
     parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--patch-size", type=int, default=None, 
+                        help="Patch size (auto-detected from encoder if not set)")
+    parser.add_argument("--spatial-downsample-factor", type=int, default=None,
+                        help="Spatial downsample factor (auto-detected from patch_size if not set)")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=2e-4, help="Max learning rate")
     parser.add_argument("--min-lr", type=float, default=2e-5, help="Min learning rate for cosine decay")
@@ -472,8 +516,16 @@ def main():
                 args.encoder_type = enc_cfg['type']
             if 'dinov3' in enc_cfg and 'model_dir' in enc_cfg['dinov3']:
                 args.dinov3_dir = enc_cfg['dinov3']['model_dir']
+            if 'dinov3' in enc_cfg and 'patch_size' in enc_cfg['dinov3']:
+                if args.patch_size is None:
+                    args.patch_size = enc_cfg['dinov3']['patch_size']
             if 'siglip2' in enc_cfg and 'model_name' in enc_cfg['siglip2']:
                 args.siglip2_model_name = enc_cfg['siglip2']['model_name']
+            if 'dinov2' in enc_cfg and 'model_name' in enc_cfg['dinov2']:
+                args.dinov2_model_name = enc_cfg['dinov2']['model_name']
+            if 'dinov2' in enc_cfg and 'patch_size' in enc_cfg['dinov2']:
+                if args.patch_size is None:
+                    args.patch_size = enc_cfg['dinov2']['patch_size']
         
         if 'decoder' in config:
             dec_cfg = config['decoder']
@@ -497,6 +549,10 @@ def main():
                     args.vit_num_heads = vit_cfg['num_heads']
                 if 'intermediate_size' in vit_cfg:
                     args.vit_intermediate_size = vit_cfg['intermediate_size']
+            # spatial_downsample_factor
+            if 'spatial_downsample_factor' in dec_cfg:
+                if args.spatial_downsample_factor is None:
+                    args.spatial_downsample_factor = dec_cfg['spatial_downsample_factor']
         
         if 'lora' in config:
             lora_cfg = config['lora']
@@ -708,10 +764,27 @@ def main():
             args.latent_channels = 1280
         elif args.encoder_type == "siglip2":
             args.latent_channels = 768  # SigLIP2-base hidden size
+        elif args.encoder_type == "dinov2":
+            args.latent_channels = 768  # DINOv2-base hidden size
+    
+    # 根据 encoder_type 设置默认 patch_size 和 spatial_downsample_factor
+    if args.patch_size is None:
+        if args.encoder_type == "dinov3":
+            args.patch_size = 16
+        elif args.encoder_type == "siglip2":
+            args.patch_size = 16
+        elif args.encoder_type == "dinov2":
+            args.patch_size = 14  # DINOv2 uses patch_size=14
+        else:
+            args.patch_size = 16  # default
+    
+    if args.spatial_downsample_factor is None:
+        args.spatial_downsample_factor = args.patch_size
     
     if rank == 0:
         logger.info(f"Encoder type: {args.encoder_type}")
         logger.info(f"Decoder type: {args.decoder_type}")
+        logger.info(f"Image size: {args.image_size}, Patch size: {args.patch_size}, Spatial downsample: {args.spatial_downsample_factor}")
         logger.info(f"Latent channels: {args.latent_channels}")
         if args.decoder_type == "cnn_decoder":
             logger.info(f"Decoder block out channels: {args.dec_block_out_channels}")
@@ -726,14 +799,15 @@ def main():
         encoder_type=args.encoder_type,
         dinov3_model_dir=args.dinov3_dir,
         siglip2_model_name=args.siglip2_model_name,
+        dinov2_model_name=args.dinov2_model_name,
         
         image_size=args.image_size,
-        patch_size=16,
+        patch_size=args.patch_size,
         out_channels=3,
 
         latent_channels=args.latent_channels,
         target_latent_channels=None,
-        spatial_downsample_factor=16,
+        spatial_downsample_factor=args.spatial_downsample_factor,
 
         # Decoder 配置
         decoder_type=args.decoder_type,
@@ -1070,6 +1144,27 @@ def main():
                                if p.requires_grad and (("lora_up" in n) or ("lora_down" in n))]
                 current_lora_params = lora_params  # Update for VF loss computation
                 opt.add_param_group({'params': lora_params, 'lr': args.lr})
+                
+                # Recreate scheduler to match new number of param groups
+                # LambdaLR needs to be recreated when param_groups change
+                if scheduler is not None:
+                    # Save current scheduler step before recreating
+                    current_scheduler_step = scheduler.last_epoch + 1 if hasattr(scheduler, 'last_epoch') else step
+                    # Recreate scheduler with updated optimizer (now has 2 param groups)
+                    min_lr_ratio = args.min_lr / args.lr if args.lr > 0 else 0.1
+                    scheduler = get_cosine_schedule_with_warmup(
+                        optimizer=opt,
+                        warmup_steps=args.warmup_steps,
+                        total_steps=args.max_steps,
+                        min_lr_ratio=min_lr_ratio,
+                    )
+                    # Restore scheduler to correct step by setting last_epoch
+                    # LambdaLR's last_epoch is -1 initially, so we set it to current_step - 1
+                    scheduler.last_epoch = current_scheduler_step - 1
+                    # Manually update learning rates to match the step
+                    scheduler.step()
+                    if rank == 0:
+                        logger.info(f"Recreated scheduler at step {current_scheduler_step} to match {len(opt.param_groups)} param groups")
                 
                 if rank == 0:
                     num_lora_params = sum(p.numel() for p in lora_params)

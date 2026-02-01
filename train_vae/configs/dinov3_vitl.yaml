@@ -4,10 +4,12 @@
 
 # =================== 数据配置 ===================
 data:
-  train_path: "/share/project/datasets/ImageNet/train"
-  val_path: "/share/project/datasets/ImageNet/val"
+  # train_path: "/share/project/datasets/ImageNet/train"
+  # val_path: "/share/project/datasets/ImageNet/val"
+  train_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
+  val_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val/"
   image_size: 256
-  batch_size: 16
+  batch_size: 32
 
 # =================== Encoder 配置 ===================
 encoder:
@@ -15,7 +17,7 @@ encoder:
   
   # DINOv3 配置
   dinov3:
-    model_dir: "/share/project/huangxu/models/dinov3-vitl"
+    model_dir: "/cpfs01/huangxu/models/dinov3-vitl"
     hidden_size: 1024
     patch_size: 16
   
@@ -53,23 +55,23 @@ lora:
 loss:
   # 重建损失
   l1_weight: 1.0
-  lpips_weight: 0.5
+  lpips_weight: 1
   
   # KL 散度损失
-  kl_weight: 1.0e-6
+  kl_weight: 1.0e-8
   
   # VF (Visual Feature) 损失 - 特征对齐
   vf:
     enabled: true
     weight: 0.1
-    margin_cos: 0.3   # cosine margin loss 的 margin
-    margin_dms: 0.1   # distance matrix similarity 的 margin
+    margin_cos: 0.1   # cosine margin loss 的 margin
+    margin_dms: 0.5   # distance matrix similarity 的 margin
     max_tokens: 32   # 计算 dms loss 时采样的 token 数
     adaptive_weight: true  # 是否使用自适应权重
   
   # GAN 损失
   gan:
-    enabled: true
+    enabled: false
     weight: 0.01
     start_step: 25000     # 从第几步开始 GAN 训练
     max_d_weight: 10000.0  # 最大自适应权重
@@ -106,4 +108,4 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: ""  # 可选的 VAE 初始化权重路径
+  vae_ckpt: "results_vae/dinov3_vitl_two_stage/step_30000.pth"  # 可选的 VAE 初始化权重路径

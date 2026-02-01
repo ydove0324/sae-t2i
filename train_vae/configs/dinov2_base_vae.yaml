@@ -1,49 +1,49 @@
 # ==================================================
-# VAE Training Config - DINOv3 Encoder + ViT-XL Decoder (Only Decoder Training)
+# VAE Training Config - DINOv2-B Encoder + ViT-L Decoder + DinoDisc
 # ==================================================
-# 参考配置: batch_size=512, 1 epoch = 2500 steps
-# 训练阶段:
-#   - epoch 0-5  (step 0-14999):     只训练 VAE (L1 + LPIPS)
-#   - epoch 6-7  (step 15000-19999): 开始训练判别器 D (stage_disc)
-#   - epoch 8-15 (step 20000-39999): VAE + D 联合训练 (stage_joint)
+# 参考配置: batch_size=512, 1 epoch ≈ 2500 steps
+# 训练阶段 (两阶段训练):
+#   Stage 1 - epoch 0-7  (step 0-19999):     只训练 Decoder (L1 + LPIPS + KL)，无 LoRA，无 VF loss
+#   Stage 2 - epoch 8+   (step 20000+):      启用 LoRA + VF loss
+# GAN 训练阶段:
+#   - epoch 0-9  (step 0-24999):     只训练 VAE
+#   - epoch 10-11 (step 25000-29999): 开始训练判别器 D (stage_disc)
+#   - epoch 12+  (step 30000+):       VAE + D 联合训练 (stage_joint)
 
 # =================== 数据配置 ===================
 data:
   train_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
   val_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val/"
-  image_size: 256
+  image_size: 224
   batch_size: 64  # 单卡 batch_size，8 卡 = 512 global batch
 
 # =================== Encoder 配置 ===================
 encoder:
-  type: "dinov3"  # "dinov3" 或 "siglip2"
+  type: "dinov2"
   
-  # DINOv3 配置
-  dinov3:
-    model_dir: "/cpfs01/huangxu/models/dinov3"
-    hidden_size: 1280
-    patch_size: 16
-  
-  # SigLIP2 配置 (encoder.type="siglip2" 时生效)
-  siglip2:
-    model_name: "google/siglip2-base-patch16-256"
-    num_tokens: 256
+  # DINOv2 with registers 配置
+  # Options: facebook/dinov2-with-registers-base (768), 
+  #          facebook/dinov2-with-registers-large (1024),
+  #          facebook/dinov2-with-registers-giant (1536)
+  dinov2:
+    model_name: "/cpfs01/huangxu/models/dinov2-register-base"
     hidden_size: 768
+    patch_size: 14  # DINOv2 默认 patch_size=14
 
 # =================== Decoder 配置 ===================
 decoder:
   type: "vit_decoder"  # 使用 ViT decoder (可选: "cnn_decoder", "vit_decoder")
   out_channels: 3
-  latent_channels: 1280   # 匹配 DINOv3 的 hidden size
+  latent_channels: 768   # 匹配 DINOv2-base 的 hidden size
   target_latent_channels: null
-  spatial_downsample_factor: 16
+  spatial_downsample_factor: 14  # 匹配 DINOv2 的 patch_size
   dropout: 0.0
   gradient_checkpointing: false
   denormalize_output: false
   
   # CNN decoder 配置 (decoder.type="cnn_decoder" 时生效)
   cnn:
-    block_out_channels: [1280, 1024, 512, 256, 128]
+    block_out_channels: [768, 512, 256, 128, 64]
     layers_per_block: 3
   
   # ViT decoder 配置 (decoder.type="vit_decoder" 时生效)
@@ -60,13 +60,13 @@ vae:
   noise_tau: 0.0
   mask_channels: 0.0
   denormalize_decoder_output: true
-  skip_to_moments: true
+  skip_to_moments: false
 
 # =================== LoRA 配置 ===================
 lora:
-  enabled: false  # 禁用 LoRA，只训练 decoder
-  rank: 0
-  alpha: 0
+  enabled: true   # 启用 LoRA (Stage 2 生效)
+  rank: 256
+  alpha: 256
   dropout: 0.0
 
 # =================== Loss 配置 ===================
@@ -76,27 +76,27 @@ loss:
   lpips_weight: 1.0
   
   # KL 散度损失
-  kl_weight: 1.0e-6
+  kl_weight: 1.0e-8
   
-  # VF (Visual Feature) 损失 - 禁用（因为没有 LoRA）
+  # VF (Visual Feature) 损失 - 特征对齐 (Stage 2 启用)
   vf:
-    enabled: false
-    weight: 0.0
+    enabled: true
+    weight: 0.5
     margin_cos: 0.1
-    margin_dms: 0.5
+    margin_dms: 0.1
     max_tokens: 256
     adaptive_weight: true
   
   # GAN 损失 (DinoDisc)
-  # 训练阶段说明 (1 epoch = 2500 steps @ bs=512):
-  #   - [0, start_step): 只训练 VAE，不使用 GAN (epoch 0-5)
-  #   - [start_step, start_step + stage_disc_steps): 只训练判别器 D (epoch 6-7, stage_disc)
-  #   - [start_step + stage_disc_steps, max_steps]: VAE 和 D 联合训练 (epoch 8+, stage_joint)
+  # 训练阶段说明 (1 epoch ≈ 2500 steps @ bs=512):
+  #   - [0, start_step): 只训练 VAE，不使用 GAN
+  #   - [start_step, start_step + stage_disc_steps): 只训练判别器 D (stage_disc)
+  #   - [start_step + stage_disc_steps, max_steps]: VAE 和 D 联合训练 (stage_joint)
   gan:
     enabled: true
     weight: 0.75              # GAN loss 权重
-    start_step: 15000         # epoch 6 开始启用 GAN (disc. start epoch = 6)
-    stage_disc_steps: 5000    # epoch 6-7 单独训练判别器 (2 epochs)，从 epoch 8 开始联合训练
+    start_step: 25000         # epoch 10 开始启用 GAN
+    stage_disc_steps: 5000    # epoch 10-11 单独训练判别器 (2 epochs)
     max_d_weight: 10000.0     # 自适应权重的最大值
 
 # =================== 判别器配置 (DinoDisc) ===================
@@ -107,14 +107,14 @@ discriminator:
   ks: 3                   # head 卷积核大小
   norm: "bn"              # 可选: bn, gn
   key_depths: [2, 5, 8, 11]  # 特征提取层深度
-  lr: 2.0e-4              # 判别器 max lr (和 decoder 一样)
+  lr: 2.0e-4              # 判别器 max lr
   # DiffAug 配置
   diffaug_prob: 1.0       # DiffAug 概率
   diffaug_cutout: 0.2     # DiffAug cutout 比例
 
 # =================== 优化器配置 ===================
 optimizer:
-  # Decoder optimizer (Adam)
+  # Decoder + LoRA optimizer (Adam)
   lr: 2.0e-4              # max learning rate
   min_lr: 2.0e-5          # min learning rate (for cosine decay)
   betas: [0.5, 0.9]
@@ -124,13 +124,17 @@ optimizer:
 
 # =================== 训练配置 ===================
 training:
-  max_steps: 100000        # 16 epochs (@ bs=512, 2500 steps/epoch)
+  max_steps: 100000       # ~40 epochs (@ bs=512, 2500 steps/epoch)
   precision: "bf16"
   fsdp_size: 1
+  # 两阶段训练:
+  #   Stage 1 [0, stage1_steps): 只训练 decoder (无 LoRA, 无 VF loss)
+  #   Stage 2 [stage1_steps, max_steps]: 启用 LoRA + VF loss
+  stage1_steps: 20000     # epoch 0-7 为 Stage 1
 
 # =================== 日志和检查点 ===================
 logging:
-  output_dir: "results_vae/dinov3_vit_decoder_xl"
+  output_dir: "results_vae/dinov2_base_vit_decoder_GAN0p75_v2"
   log_every: 10
   eval_every: 2000
   save_every: 5000
@@ -139,4 +143,5 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: "results_vae/dinov3_vit_decoder_xl/step_65000.pth"
+  vae_ckpt: ""  # 可选的 VAE 初始化权重路径
+  # vae_ckpt: "results_vae/dinov2_base_vit_decoder_GAN0p75/step_60000.pth"

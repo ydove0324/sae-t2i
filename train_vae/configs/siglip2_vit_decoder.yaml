@@ -1,5 +1,5 @@
 # ==================================================
-# VAE Training Config - SigLIP2 Encoder
+# VAE Training Config - SigLIP2 Encoder + ViT-XL Decoder
 # ==================================================
 
 # =================== 数据配置 ===================
@@ -7,7 +7,7 @@ data:
   train_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
   val_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val/"
   image_size: 256
-  batch_size: 32
+  batch_size: 64
 
 # =================== Encoder 配置 ===================
 encoder:
@@ -27,21 +27,35 @@ encoder:
 
 # =================== Decoder 配置 ===================
 decoder:
+  type: "vit_decoder"  # 使用 ViT decoder (可选: "cnn_decoder", "vit_decoder")
   out_channels: 3
   latent_channels: 768   # 匹配 SigLIP2 的 hidden size
   target_latent_channels: null
   spatial_downsample_factor: 16
-  block_out_channels: [768, 512, 256, 128, 64]  # 适配较小的 latent channels
-  layers_per_block: 3
   dropout: 0.0
   gradient_checkpointing: false
   denormalize_output: false
+  
+  # CNN decoder 配置 (decoder.type="cnn_decoder" 时生效)
+  cnn:
+    block_out_channels: [768, 512, 256, 128, 64]
+    layers_per_block: 3
+  
+  # ViT decoder 配置 (decoder.type="vit_decoder" 时生效)
+  vit:
+    # ViT-XL 配置 (默认)
+    hidden_size: 1024       # XL: 1024, L: 768, B: 512
+    num_layers: 24          # XL: 24, L: 16, B: 8
+    num_heads: 16           # XL: 16, L: 12, B: 8
+    intermediate_size: 4096 # XL: 4096, L: 3072, B: 2048
 
 # =================== VAE 配置 ===================
 vae:
   variational: true
   noise_tau: 0.0
   mask_channels: 0.0
+  denormalize_decoder_output: false  # 是否对 decoder 输出进行反归一化
+  skip_to_moments: false             # 是否跳过加载 to_moments 层（用于旧 checkpoint）
 
 # =================== LoRA 配置 ===================
 lora:
@@ -71,12 +85,18 @@ loss:
     max_d_weight: 10000.0
     stage_disc_steps: 0
 
-# =================== 判别器配置 ===================
+# =================== 判别器配置 (DinoDisc) ===================
 discriminator:
-  ndf: 64
-  n_layers: 4
-  norm: "gn"
+  # DinoDisc 配置
+  dino_ckpt_path: "./dino_vit_small_patch8_224.pth"
+  recipe: "S_8"           # 可选: S_8, S_16, B_16
+  ks: 3                   # head 卷积核大小
+  norm: "bn"              # 可选: bn, gn
+  key_depths: [2, 5, 8, 11]  # 特征提取层深度
   lr: 2.0e-5
+  # DiffAug 配置
+  diffaug_prob: 1.0       # DiffAug 概率
+  diffaug_cutout: 0.2     # DiffAug cutout 比例
 
 # =================== 优化器配置 ===================
 optimizer:
@@ -92,7 +112,7 @@ training:
 
 # =================== 日志和检查点 ===================
 logging:
-  output_dir: "results_vae/siglip2_default_v3"
+  output_dir: "results_vae/siglip2_vit_decoder_xl"
   log_every: 10
   eval_every: 2000
   save_every: 5000
@@ -101,4 +121,4 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: "results_vae/siglip2_default_v3/step_55000.pth"
+  vae_ckpt: null
