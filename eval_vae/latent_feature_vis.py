@@ -199,7 +199,6 @@ def main():
         model_params=vae_model_params,
         verbose=True,
         skip_to_moments=True
-        skip_to_moments=False
     )
     vae.eval()
     

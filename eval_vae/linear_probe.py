@@ -317,9 +317,11 @@ def main():
     
     # VAE (needed for extraction)
     parser.add_argument("--vae-ckpt", type=str, default=None, help="Path to VAE checkpoint.")
-    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "dinov3_vitl", "siglip2"])
+    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "dinov3_vitl", "siglip2", "dinov2"])
     parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3")
     parser.add_argument("--siglip2-model-name", type=str, default="google/siglip2-base-patch16-256")
+    parser.add_argument("--dinov2-model-name", type=str, default="facebook/dinov2-with-registers-base",
+                        help="DINOv2 model name from HuggingFace (e.g., 'facebook/dinov2-with-registers-base')")
     parser.add_argument("--lora-rank", type=int, default=256)
     parser.add_argument("--lora-alpha", type=int, default=256)
     
@@ -412,24 +414,34 @@ def main():
             if rank == 0:
                 print("Loading VAE...")
             
+            # 根据 encoder_type 设置 latent_channels, dec_block_out_channels, patch_size
             if args.encoder_type == "dinov3":
                 latent_channels = 1280
                 dec_block_out_channels = (1280, 1024, 512, 256, 128)
+                patch_size = 16
             elif args.encoder_type == "dinov3_vitl":
                 latent_channels = 1024
                 dec_block_out_channels = (1024, 768, 512, 256, 128)
-            else:  # siglip2
+                patch_size = 16
+            elif args.encoder_type == "siglip2":
                 latent_channels = 768
                 dec_block_out_channels = (768, 512, 256, 128, 64)
+                patch_size = 16
+            elif args.encoder_type == "dinov2":
+                latent_channels = 768  # DINOv2-base hidden size
+                dec_block_out_channels = (768, 512, 256, 128, 64)
+                patch_size = 14  # DINOv2 uses patch_size=14
+            else:
+                raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
             
             vae_model_params = {
                 "encoder_type": args.encoder_type,
                 "image_size": args.image_size,
-                "patch_size": 16,
+                "patch_size": patch_size,
                 "out_channels": 3,
                 "latent_channels": latent_channels,
                 "target_latent_channels": None,
-                "spatial_downsample_factor": 16,
+                "spatial_downsample_factor": patch_size,  # 匹配 patch_size
                 "lora_rank": args.lora_rank,
                 "lora_alpha": args.lora_alpha,
                 "dec_block_out_channels": dec_block_out_channels,
@@ -439,10 +451,13 @@ def main():
                 "denormalize_decoder_output": False,
             }
             
-            if args.encoder_type == "dinov3" or args.encoder_type == "dinov3_vitl":
+            # 根据 encoder_type 添加模型路径参数
+            if args.encoder_type in ["dinov3", "dinov3_vitl"]:
                 vae_model_params["dinov3_model_dir"] = args.dinov3_dir
             elif args.encoder_type == "siglip2":
                 vae_model_params["siglip2_model_name"] = args.siglip2_model_name
+            elif args.encoder_type == "dinov2":
+                vae_model_params["dinov2_model_name"] = args.dinov2_model_name
             
             vae = load_vae(
                 args.vae_ckpt,
@@ -451,6 +466,7 @@ def main():
                 decoder_type="cnn_decoder",
                 model_params=vae_model_params,
                 verbose=(rank == 0),
+                skip_to_moments=True,
             )
             
             for p in vae.parameters():

@@ -14,16 +14,16 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torchvision.utils import save_image
+from torch.utils.data import Dataset
 
 # 设置 torch 缓存路径 (可选)
-os.environ["TORCH_HOME"] = "/share/project/huangxu/.cache/torch"
 
 # 添加当前目录以导入项目模块
 sys.path.append(".")
 
 # 导入 VAE 工具函数
 from models.rae.utils.vae_utils import (
-    load_dinov3_vae,
+    load_vae,
     normalize_sae,
     denormalize_sae,
     reconstruct_from_latent_with_diffusion,
@@ -92,13 +92,41 @@ def calculate_batch_psnr(img1, img2):
 
 def main():
     parser = argparse.ArgumentParser()
+    # Data
     parser.add_argument("--data-path", type=str, required=True, help="Path to ImageNet validation set.")
-    parser.add_argument("--vae-ckpt", type=str, required=True, help="Path to VAE checkpoint.")
-    parser.add_argument("--type", type=str, default="CNN", choices=["CNN", "DIFFUSION"], help="Reconstruction type.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU.")
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--diffusion-steps", type=int, default=8, help="Steps for diffusion decoder (only used if type=DIFFUSION).")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU.")
     parser.add_argument("--max-images", type=int, default=None, help="Limit total images (across all GPUs).")
+    
+    # VAE model
+    parser.add_argument("--vae-ckpt", type=str, required=True, help="Path to VAE checkpoint.")
+    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "dinov3_vitl", "siglip2", "dinov2"], help="Encoder type.")
+    parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3", help="Path to DINOv3 model directory.")
+    parser.add_argument("--siglip2-model-name", type=str, default="google/siglip2-base-patch16-256", help="SigLIP2 model name.")
+    parser.add_argument("--dinov2-model-name", type=str, default="facebook/dinov2-with-registers-base", help="DINOv2 model name.")
+    parser.add_argument("--lora-rank", type=int, default=256, help="LoRA rank.")
+    parser.add_argument("--lora-alpha", type=int, default=256, help="LoRA alpha.")
+    parser.add_argument("--no-lora", action="store_true", help="Disable LoRA (set lora_rank=0).")
+    parser.add_argument("--skip-to-moments", action="store_true", help="Skip to_moments layer (for old checkpoints).")
+    parser.add_argument("--denormalize-output", action="store_true", help="Denormalize decoder output.")
+    parser.add_argument("--patch-size", type=int, default=None, 
+                        help="Patch size (auto-detected from encoder if not set). "
+                             "For old checkpoints trained with hardcoded patch_size=16, use --patch-size 16")
+    
+    # Decoder type
+    parser.add_argument("--decoder-type", type=str, default="cnn_decoder", choices=["cnn_decoder", "vit_decoder"], help="Decoder architecture type.")
+    
+    # ViT decoder params (only used if --decoder-type=vit_decoder)
+    parser.add_argument("--vit-hidden-size", type=int, default=1024, help="ViT decoder hidden size (XL: 1024, L: 768, B: 512).")
+    parser.add_argument("--vit-num-layers", type=int, default=24, help="ViT decoder num layers (XL: 24, L: 16, B: 8).")
+    parser.add_argument("--vit-num-heads", type=int, default=16, help="ViT decoder num heads (XL: 16, L: 12, B: 8).")
+    parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size (XL: 4096, L: 3072, B: 2048).")
+    
+    # Reconstruction
+    parser.add_argument("--type", type=str, default="CNN", choices=["CNN", "DIFFUSION"], help="Reconstruction type (for diffusion decoder).")
+    parser.add_argument("--diffusion-steps", type=int, default=8, help="Steps for diffusion decoder (only used if type=DIFFUSION).")
+    
+    # Output
     parser.add_argument("--output-dir", type=str, default="results/test_eval")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-images", action="store_true", help="Always keep images.")
@@ -123,14 +151,100 @@ def main():
         os.makedirs(recon_dir, exist_ok=True)
         print(f"==========================================")
         print(f" Mode: {args.type}")
+        print(f" Encoder: {args.encoder_type}")
+        print(f" Decoder: {args.decoder_type}")
+        if args.decoder_type == "vit_decoder":
+            print(f"   ViT hidden_size: {args.vit_hidden_size}")
+            print(f"   ViT num_layers: {args.vit_num_layers}")
+            print(f"   ViT num_heads: {args.vit_num_heads}")
         print(f" GPUs: {world_size}")
         print(f" Ckpt: {args.vae_ckpt}")
+        print(f" LoRA: {'Disabled' if args.no_lora else f'rank={args.lora_rank}, alpha={args.lora_alpha}'}")
+        print(f" Skip to_moments: {args.skip_to_moments}")
+        print(f" Denormalize output: {args.denormalize_output}")
         print(f"==========================================")
     dist.barrier()
 
     # 3. 加载模型
-    decoder_type = "cnn_decoder" if args.type == "CNN" else "diffusion_decoder"
-    vae = load_dinov3_vae(args.vae_ckpt, device, decoder_type=decoder_type, verbose=(rank == 0))
+    # 确定 decoder_type：优先使用 --decoder-type，但如果是 DIFFUSION 模式则用 diffusion_decoder
+    if args.type == "DIFFUSION":
+        decoder_type = "diffusion_decoder"
+    else:
+        decoder_type = args.decoder_type  # "cnn_decoder" or "vit_decoder"
+    
+    # 根据 encoder_type 设置 latent_channels, dec_block_out_channels, patch_size
+    if args.encoder_type == "dinov3":
+        latent_channels = 1280
+        dec_block_out_channels = (1280, 1024, 512, 256, 128)
+        default_patch_size = 16
+    elif args.encoder_type == "dinov3_vitl":
+        latent_channels = 1024
+        dec_block_out_channels = (1024, 768, 512, 256, 128)
+        default_patch_size = 16
+    elif args.encoder_type == "siglip2":
+        latent_channels = 768
+        dec_block_out_channels = (768, 512, 256, 128, 64)
+        default_patch_size = 16
+    elif args.encoder_type == "dinov2":
+        latent_channels = 768
+        dec_block_out_channels = (768, 512, 256, 128, 64)
+        # Note: DINOv2 encoder uses patch_size=14, but old training code used patch_size=16 for decoder
+        # If loading old checkpoint trained with hardcoded patch_size=16, use --patch-size 16
+        default_patch_size = 14  # Default for new training, but old checkpoints may need 16
+    else:
+        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
+    
+    # Use user-specified patch_size if provided, otherwise use default
+    patch_size = args.patch_size if args.patch_size is not None else default_patch_size
+    
+    # 如果 --no-lora，则设置 lora_rank=0
+    lora_rank = 0 if args.no_lora else args.lora_rank
+    lora_alpha = 0 if args.no_lora else args.lora_alpha
+    
+    # 构建 model_params (基础参数)
+    vae_model_params = {
+        "encoder_type": args.encoder_type,
+        "image_size": args.image_size,
+        "patch_size": patch_size,
+        "out_channels": 3,
+        "latent_channels": latent_channels,
+        "target_latent_channels": None,
+        "spatial_downsample_factor": patch_size,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "decoder_dropout": 0.0,
+        "gradient_checkpointing": False,
+        "denormalize_decoder_output": args.denormalize_output,
+    }
+    
+    # 根据 decoder_type 添加特定参数
+    if decoder_type == "cnn_decoder":
+        vae_model_params["dec_block_out_channels"] = dec_block_out_channels
+        vae_model_params["dec_layers_per_block"] = 3
+    elif decoder_type == "vit_decoder":
+        # ViT decoder 参数 (参数名需要匹配 cnn_decoder.AutoencoderKL)
+        vae_model_params["vit_decoder_hidden_size"] = args.vit_hidden_size
+        vae_model_params["vit_decoder_num_layers"] = args.vit_num_layers
+        vae_model_params["vit_decoder_num_heads"] = args.vit_num_heads
+        vae_model_params["vit_decoder_intermediate_size"] = args.vit_intermediate_size
+    
+    # 根据 encoder_type 添加模型路径参数
+    if args.encoder_type in ["dinov3", "dinov3_vitl"]:
+        vae_model_params["dinov3_model_dir"] = args.dinov3_dir
+    elif args.encoder_type == "siglip2":
+        vae_model_params["siglip2_model_name"] = args.siglip2_model_name
+    elif args.encoder_type == "dinov2":
+        vae_model_params["dinov2_model_name"] = args.dinov2_model_name
+    
+    vae = load_vae(
+        args.vae_ckpt,
+        device,
+        encoder_type=args.encoder_type,
+        decoder_type=decoder_type,
+        model_params=vae_model_params,
+        verbose=(rank == 0),
+        skip_to_moments=args.skip_to_moments,
+    )
 
     # 4. 数据集与 Sampler
     transform = transforms.Compose([
@@ -143,8 +257,35 @@ def main():
     if not os.path.exists(args.data_path):
         if rank == 0: print(f"Error: Data path {args.data_path} not found.")
         sys.exit(1)
+    class ImageDataset(Dataset):
+        EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff', '.tif'}
+        def __init__(self, root, transform=None):
+            self.transform = transform
+            self.paths = sorted([
+                os.path.join(root, f)
+                for f in os.listdir(root)
+                if os.path.splitext(f)[1].lower() in self.EXTS
+            ])
+        def __len__(self):
+            return len(self.paths)
+        def __getitem__(self, idx):
+            try:
+                img = Image.open(self.paths[idx]).convert('RGB')
+                if self.transform:
+                    img = self.transform(img)
+                return img, 0
+            except Exception as e:
+                print(f"Failed to load image {self.paths[idx]}: {e}")
+                # 返回一个全零图像，保证训练不崩
+                dummy_img = torch.zeros(3, *([self.transform.transforms[0].function.keywords['image_size']]*2))
+                return dummy_img, 0
 
-    dataset = ImageFolder(root=args.data_path, transform=transform)
+    try:
+        dataset = ImageDataset(root=args.data_path, transform=transform)
+    except Exception as e:
+        if rank == 0:
+            print(f"Error: Failed to create dataset from {args.data_path}: {e}")
+        sys.exit(1)
 
     if args.max_images is not None:
         if rank == 0: print(f"Limiting dataset to {args.max_images} images.")
@@ -187,6 +328,7 @@ def main():
                 image_shape=x_img.shape,
                 diffusion_steps=args.diffusion_steps,
                 decoder_type=decoder_type,
+                encoder_type=args.encoder_type,
             )
 
         # 统计 PSNR
@@ -238,9 +380,14 @@ def main():
         
         print("\n" + "#"*40)
         print(f" FINAL RESULTS ({args.type})")
+        print(f" Encoder Type     : {args.encoder_type}")
+        print(f" Decoder Type     : {decoder_type}")
         print(f" Total Images     : {int(global_count)}")
         if args.type == "DIFFUSION":
             print(f" Diffusion Steps  : {args.diffusion_steps}")
+        if decoder_type == "vit_decoder":
+            print(f" ViT Config       : hidden={args.vit_hidden_size}, layers={args.vit_num_layers}")
+        print(f" LoRA             : {'Disabled' if args.no_lora else f'rank={args.lora_rank}'}")
         print(f" PSNR             : {global_avg_psnr:.4f} dB")
         if HAS_FID:
             print(f" rFID             : {rfid_value:.4f}")
@@ -251,6 +398,13 @@ def main():
         # Save Text
         with open(os.path.join(args.output_dir, "results.txt"), "w") as f:
             f.write(f"Type: {args.type}\n")
+            f.write(f"Encoder: {args.encoder_type}\n")
+            f.write(f"Decoder: {decoder_type}\n")
+            if decoder_type == "vit_decoder":
+                f.write(f"ViT Config: hidden={args.vit_hidden_size}, layers={args.vit_num_layers}, heads={args.vit_num_heads}\n")
+            f.write(f"LoRA: {'Disabled' if args.no_lora else f'rank={args.lora_rank}, alpha={args.lora_alpha}'}\n")
+            f.write(f"Skip to_moments: {args.skip_to_moments}\n")
+            f.write(f"Denormalize output: {args.denormalize_output}\n")
             f.write(f"PSNR: {global_avg_psnr:.4f}\n")
             f.write(f"rFID: {rfid_value}\n")
             f.write(f"Count: {global_count}\n")
