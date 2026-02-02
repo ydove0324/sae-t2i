@@ -709,6 +709,8 @@ def main(args):
             latent_channels = 1280
         elif args.encoder_type == "siglip2":
             latent_channels = 768  # SigLIP2-base hidden size
+        elif args.encoder_type == "dinov2":
+            latent_channels = 768  # DINOv2-base hidden size
         else:
             raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
         latent_size = (latent_channels, 16, 16)
@@ -764,11 +766,15 @@ def main(args):
         logger = create_logger(None)
         writer = None
 
-    # ---------------- load VAE (DINOv3 or SigLIP2) ----------------
+    # ---------------- load VAE (DINOv3, SigLIP2, or DINOv2) ----------------
     # Build model params for VAE
     if args.encoder_type == "dinov3":
         default_dec_block_out_channels = (1280, 1024, 512, 256, 128)
-    else:  # siglip2
+    elif args.encoder_type == "siglip2":
+        default_dec_block_out_channels = (768, 512, 256, 128, 64)
+    elif args.encoder_type == "dinov2":
+        default_dec_block_out_channels = (768, 512, 256, 128, 64)  # DINOv2-base: 768 hidden size
+    else:
         default_dec_block_out_channels = (768, 512, 256, 128, 64)
     
     # LoRA rank: 0 means no LoRA layers at all
@@ -798,6 +804,8 @@ def main(args):
         vae_model_params["dinov3_model_dir"] = args.dinov3_dir
     elif args.encoder_type == "siglip2":
         vae_model_params["siglip2_model_name"] = args.siglip2_model_name
+    elif args.encoder_type == "dinov2":
+        vae_model_params["dinov2_model_name"] = args.dinov2_model_name
     
     dinov3_vae = load_vae(
         args.vae_ckpt, 
@@ -968,7 +976,7 @@ def main(args):
             profiler.stop("forward_loss")
 
             # ==========================
-            # NaN 检测 + 自动从 latest.pt 恢复（保留你原逻辑）
+            # NaN 检测：跳过该轮，清空优化器状态
             # ==========================
             is_nan_local = 0 if torch.isfinite(loss_tensor) else 1
             is_nan = torch.tensor(is_nan_local, device=device)
@@ -976,51 +984,14 @@ def main(args):
 
             if is_nan.item() > 0:
                 if rank == 0:
-                    logger.warning(f"[step {train_steps}] NaN detected across ranks! Auto-resuming from latest.pt ...")
+                    logger.warning(f"[step {train_steps}] NaN detected! Skipping this iteration...")
+                # 只清空梯度，保留优化器状态
+                opt.zero_grad(set_to_none=True)
+                # 重置累积计数器
+                accum_counter = 0
+                step_loss_accum = 0.0
                 dist.barrier()
-
-                try:
-                    torch.cuda.synchronize()
-                    del loss_tensor
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    dist.barrier()
-
-                    latest_path = f"{checkpoint_dir}/latest.pt"
-                    checkpoint = torch.load(latest_path, map_location="cpu")
-
-                    if "ema" in checkpoint:
-                        ema.load_state_dict(checkpoint["ema"])
-                    if "model" in checkpoint:
-                        model.module.load_state_dict(checkpoint["model"])
-                    if "opt" in checkpoint and checkpoint["opt"] is not None:
-                        opt.load_state_dict(checkpoint["opt"])
-                    if "scheduler" in checkpoint and checkpoint["scheduler"] is not None:
-                        schedl.load_state_dict(checkpoint["scheduler"])
-                    train_steps = int(checkpoint.get("train_steps", 0))
-
-                    # Reset training state after resume
-                    opt.zero_grad(set_to_none=True)
-                    accum_counter = 0
-                    step_loss_accum = 0.0
-                    model.train()
-                    ema.eval()
-
-                    torch.cuda.synchronize()
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    dist.barrier()
-                    if rank == 0:
-                        logger.warning(f"All ranks resumed from {latest_path} (train_steps={train_steps})")
-                    dist.barrier()
-                    continue
-
-                except Exception as e:
-                    if rank == 0:
-                        logger.error(f"Failed to resume checkpoint: {e}")
-                    dist.barrier()
-                    cleanup()
-                    exit(1)
+                continue
 
             # backward + accum
             step_loss_accum += loss_tensor.item()
@@ -1328,8 +1299,8 @@ if __name__ == "__main__":
         "--encoder-type",
         type=str,
         default="dinov3",
-        choices=["dinov3", "siglip2"],
-        help="Choose encoder type: 'dinov3' or 'siglip2'.",
+        choices=["dinov3", "siglip2", "dinov2"],
+        help="Choose encoder type: 'dinov3', 'siglip2', or 'dinov2'.",
     )
     parser.add_argument(
         "--dinov3-dir",
@@ -1342,6 +1313,12 @@ if __name__ == "__main__":
         type=str,
         default="google/siglip2-base-patch16-256",
         help="SigLIP2 model name from HuggingFace.",
+    )
+    parser.add_argument(
+        "--dinov2-model-name",
+        type=str,
+        default="facebook/dinov2-with-registers-base",
+        help="DINOv2 model name from HuggingFace (e.g., 'facebook/dinov2-with-registers-base').",
     )
     
     # LoRA

@@ -52,7 +52,7 @@ torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
   --log-norm-mean 0.5 \
   --log-norm-std 1.0  \
   --denormalize-decoder-output \
-  --fid-every 10000 \
+  --fid-every 25000 \
   --fid-ref-path VIRTUAL_imagenet256_labeled.npz \
   --fid-batch-size 64 \
   --no-lora \

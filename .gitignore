@@ -7,3 +7,4 @@ result*
 *.tar
 logs/
 *.pth
+tensorboard_logs/*

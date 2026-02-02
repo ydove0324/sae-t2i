@@ -10,7 +10,7 @@ export NCCL_SOCKET_IFNAME=eth0
 export GLOO_SOCKET_IFNAME=eth0
 export NCCL_IB_HCA=mlx5_100,mlx5_101,mlx5_102,mlx5_103,mlx5_104,mlx5_105,mlx5_106,mlx5_107
 export NCCL_IB_GID_INDEX=7
-export TORCH_HOME="/share/project/huangxu/.cache/torch"
+export TORCH_HOME="/cpfs01/huangxu/.cache/torch"
 # export NCCL_DEBUG=INFO
 # torchrun
 unset PET_NNODES
@@ -31,17 +31,18 @@ export OMP_NUM_THREADS=4
 # echo "  MASTER_ADDR=$MASTER_ADDR"
 # echo "  MASTER_PORT=$MASTER_PORT"
 # VAE_CKPT="/share/project/huangxu/models/SAE/diffusion_decoder/kl100/vae.pth"
-VAE_CKPT="/cpfs01/huangxu/models/SAE/vfloss_vae.pth"
+# VAE_CKPT="/cpfs01/huangxu/models/SAE/ema_vae.pth"
+VAE_CKPT="results_vae/siglip2_default_v3/step_110000.pth"
 
 torchrun --nnodes=1 --node_rank=0 \
   --nproc-per-node=1 \
   --master_addr="localhost" \
   --master_port=19291 \
   projects/rae/train_overfit.py \
-  --config projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml \
+  --config projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_SIGLIP_768.yaml \
   --data-path /cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/ \
   --vae-ckpt $VAE_CKPT \
-  --results-dir ./result_vfloss_vae \
+  --results-dir ./result_dit/overfit_siglip2_v3_110000 \
   --precision bf16 \
   --image-size 256 \
   --global-batch-size 1 \
@@ -49,9 +50,12 @@ torchrun --nnodes=1 --node_rank=0 \
   --dataset-type overfit_single_image \
   --overfit-image-path overfit_image.png \
   --fsdp-size 1 \
-  --encoder-type dinov3 \
-  # --siglip2-model-name /cpfs01/huangxu/models/siglip2 \
+  --encoder-type siglip2 \
+  --dinov3-dir /cpfs01/huangxu/models/dinov3 \
+  --siglip2-model-name /cpfs01/huangxu/models/siglip2 \
+  # --no-lora \
+  # --skip-to-moments \
   # --ema-cpu
   # --ckpt /opt/tiger/vfm/decoder_only/latest.pt
 
-    # --config projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_SIGLIP_768.yaml \
+    \

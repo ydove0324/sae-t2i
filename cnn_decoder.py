@@ -25,6 +25,14 @@ except ImportError:
     HAS_SIGLIP = False
     print("Warning: transformers SiglipModel not found. SigLIP2 encoder will not be available.")
 
+# DINOv2 import
+try:
+    from transformers import Dinov2WithRegistersModel
+    HAS_DINOV2 = True
+except ImportError:
+    HAS_DINOV2 = False
+    print("Warning: transformers Dinov2WithRegistersModel not found. DINOv2 encoder will not be available.")
+
 
 # =========================
 # Outputs
@@ -197,6 +205,34 @@ def add_lora_to_siglip2(siglip_vision_model: nn.Module, r: int = 32, alpha: int 
         attn.v_proj = LoRALinear(attn.v_proj, r=r, alpha=alpha, dropout=dropout, enabled=True)
 
     return siglip_vision_model
+
+
+def add_lora_to_dinov2(dinov2_model: nn.Module, r: int = 32, alpha: int = 32, dropout: float = 0.0):
+    """
+    为 DINOv2 (with registers) model 添加 LoRA
+    Targets:
+      - embeddings.patch_embeddings.projection (Conv2d)
+      - each encoder.layer[i].attention.attention.{query,key,value} (Linear)
+    
+    If r <= 0, do NOT add any LoRA layers (return original model unchanged).
+    """
+    if r <= 0:
+        # No LoRA: return original model unchanged
+        return dinov2_model
+    
+    # patch embed - DINOv2 使用 patch_embeddings.projection
+    if hasattr(dinov2_model.embeddings, 'patch_embeddings'):
+        pe = dinov2_model.embeddings.patch_embeddings.projection
+        dinov2_model.embeddings.patch_embeddings.projection = LoRAConv2d(pe, r=r, alpha=alpha, dropout=dropout, enabled=True)
+
+    # qkv in encoder layers - DINOv2 结构: encoder.layer[i].attention.attention.{query,key,value}
+    for layer in dinov2_model.encoder.layer:
+        attn = layer.attention.attention
+        attn.query = LoRALinear(attn.query, r=r, alpha=alpha, dropout=dropout, enabled=True)
+        attn.key = LoRALinear(attn.key, r=r, alpha=alpha, dropout=dropout, enabled=True)
+        attn.value = LoRALinear(attn.value, r=r, alpha=alpha, dropout=dropout, enabled=True)
+
+    return dinov2_model
 
 
 # =========================
@@ -671,7 +707,8 @@ class ViTXLDecoder(nn.Module):
         
         # Encoder to decoder projection
         self.decoder_embed = nn.Linear(encoder_hidden_size, decoder_hidden_size, bias=True)
-        
+        print("self.num_patches:", self.num_patches)
+        print("self.patch_size:", self.patch_size)
         # Positional embedding (fixed sin-cos)
         self.decoder_pos_embed = nn.Parameter(
             torch.zeros(1, self.num_patches + 1, decoder_hidden_size), requires_grad=False
@@ -870,6 +907,45 @@ class SigLIP2ScalingLayer(nn.Module):
 
 
 # =========================
+# Normalization for DINOv2 input
+# =========================
+
+class DINOv2ScalingLayer(nn.Module):
+    """
+    DINOv2 的输入归一化层
+    input: [-1,1] (after dataset transform t*2-1)
+    output: aligned to ImageNet normalization for DINOv2
+    
+    DINOv2 expects ImageNet normalization:
+      mean = [0.485, 0.456, 0.406]
+      std = [0.229, 0.224, 0.225]
+    
+    Input is in [-1, 1], which corresponds to (pixel/255 - 0.5) / 0.5
+    We need to convert to ImageNet normalized: (pixel/255 - mean) / std
+    """
+    def __init__(self):
+        super().__init__()
+        # Input is in [-1, 1] range (from t * 2 - 1 transform)
+        # First convert to [0, 1]: (x + 1) / 2
+        # Then apply ImageNet normalization: (x - mean) / std
+        # Combined: ((x + 1) / 2 - mean) / std = (x + 1 - 2*mean) / (2*std)
+        
+        imagenet_mean = torch.Tensor([0.485, 0.456, 0.406])
+        imagenet_std = torch.Tensor([0.229, 0.224, 0.225])
+        
+        # shift = (1 - 2*mean), scale = 2*std
+        # output = (x + shift) / scale = (x + 1 - 2*mean) / (2*std)
+        shift = 1 - 2 * imagenet_mean  # [0.03, 0.088, 0.188]
+        scale = 2 * imagenet_std       # [0.458, 0.448, 0.450]
+        
+        self.register_buffer("shift", shift[None, :, None, None])
+        self.register_buffer("scale", scale[None, :, None, None])
+
+    def forward(self, x):
+        return (x + self.shift) / self.scale
+
+
+# =========================
 # Encoder (DINOv3 + LoRA)
 # =========================
 
@@ -963,6 +1039,86 @@ class SigLIP2Encoder2D(nn.Module):
 
 
 # =========================
+# Encoder (DINOv2 + LoRA)
+# =========================
+
+class DINOv2Encoder2D(nn.Module):
+    """
+    DINOv2 (with registers) Encoder with LoRA support.
+    
+    支持 DINOv2-B (base), DINOv2-L (large), DINOv2-G (giant) 等变体。
+    默认使用 facebook/dinov2-with-registers-base。
+    
+    DINOv2-B: hidden_size=768, patch_size=14
+    DINOv2-L: hidden_size=1024, patch_size=14
+    DINOv2-G: hidden_size=1536, patch_size=14
+    """
+    def __init__(
+        self, 
+        model_name: str = "facebook/dinov2-with-registers-base",
+        lora_rank: int = 32, 
+        lora_alpha: int = 32, 
+        lora_dropout: float = 0.0, 
+        enable_lora: bool = True,
+        normalize: bool = True,
+    ):
+        super().__init__()
+        if not HAS_DINOV2:
+            raise ImportError(
+                "DINOv2 requires transformers with Dinov2WithRegistersModel. "
+                "Please install: pip install transformers>=4.36.0"
+            )
+        
+        self.encoder_type = "dinov2"
+        self.model_name = model_name
+        
+        # 加载 DINOv2 模型 (支持本地路径和 HuggingFace model ID)
+        try:
+            self.dinov2 = Dinov2WithRegistersModel.from_pretrained(model_name, local_files_only=True)
+        except (OSError, ValueError, AttributeError):
+            self.dinov2 = Dinov2WithRegistersModel.from_pretrained(model_name, local_files_only=False)
+        
+        # 移除 final layernorm 的 affine (类似 Dinov2withNorm)
+        if normalize:
+            self.dinov2.layernorm.elementwise_affine = False
+            self.dinov2.layernorm.weight = None
+            self.dinov2.layernorm.bias = None
+        
+        # 添加 LoRA
+        add_lora_to_dinov2(self.dinov2, r=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
+        _set_lora_enabled(self.dinov2, enable_lora)
+        
+        self.normalization_layer = DINOv2ScalingLayer()
+        
+        # 保存配置
+        self.hidden_size = self.dinov2.config.hidden_size
+        self.patch_size = self.dinov2.config.patch_size
+        # DINOv2 with registers: 1 CLS + 4 register tokens = 5 unused tokens
+        self.num_register_tokens = getattr(self.dinov2.config, 'num_register_tokens', 4)
+
+    def set_lora_enabled(self, enabled: bool):
+        _set_lora_enabled(self.dinov2, enabled)
+
+    @contextlib.contextmanager
+    def lora_disabled(self):
+        with lora_disabled(self.dinov2):
+            yield
+
+    def forward(self, x: torch.Tensor):
+        # DINOv2 encoder: 先将图片从 256x256 resize 到 224x224
+        # 因为 DINOv2 的 patch_size=14，输入 224x224 会得到 16x16 的 patches
+        if x.shape[-1] == 256 and x.shape[-2] == 256:
+            x = torch.nn.functional.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        x = self.normalization_layer(x)
+        outputs = self.dinov2(x, output_hidden_states=True)
+        return outputs
+    
+    def get_backbone(self):
+        """获取底层 backbone 用于 LoRA 参数访问"""
+        return self.dinov2
+
+
+# =========================
 # AutoencoderKL (DINO encoder + CNN decoder)
 # =========================
 
@@ -980,9 +1136,10 @@ class AutoencoderKL(nn.Module):
     def __init__(
         self,
         # Encoder 配置 - 支持多种 encoder
-        encoder_type: str = "dinov3",  # "dinov3", "dinov3_vitl" 或 "siglip2"
+        encoder_type: str = "dinov3",  # "dinov3", "dinov3_vitl", "siglip2" 或 "dinov2"
         dinov3_model_dir: str = "",
         siglip2_model_name: str = "google/siglip2-base-patch16-256",
+        dinov2_model_name: str = "facebook/dinov2-with-registers-base",
         
         image_size: int = 256,
         patch_size: int = 16,
@@ -1060,6 +1217,10 @@ class AutoencoderKL(nn.Module):
         self.denormalize_decoder_output = denormalize_decoder_output
 
         # 根据 encoder_type 创建不同的 encoder
+        # 初始化 encoder_patch_size 和 decoder_patch_size
+        encoder_patch_size = None
+        decoder_patch_size = patch_size  # 默认使用传入的 patch_size
+        
         if encoder_type == "dinov3" or encoder_type == "dinov3_vitl":
             self.encoder = Encoder2D(
                 dinov3_model_dir=dinov3_model_dir,
@@ -1070,6 +1231,7 @@ class AutoencoderKL(nn.Module):
             )
             # 使用 encoder 的实际 hidden_size
             latent_channels = self.encoder.hidden_size
+            encoder_patch_size = self.encoder.patch_size
         elif encoder_type == "siglip2":
             self.encoder = SigLIP2Encoder2D(
                 model_name=siglip2_model_name,
@@ -1080,8 +1242,23 @@ class AutoencoderKL(nn.Module):
             )
             # 使用 encoder 的实际 hidden_size
             latent_channels = self.encoder.hidden_size
+            encoder_patch_size = self.encoder.patch_size
+        elif encoder_type == "dinov2":
+            self.encoder = DINOv2Encoder2D(
+                model_name=dinov2_model_name,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                enable_lora=enable_lora,
+                normalize=True,
+            )
+            # 使用 encoder 的实际 hidden_size
+            latent_channels = self.encoder.hidden_size
+            # DINOv2 encoder_patch_size=14, decoder_patch_size=16
+            encoder_patch_size = self.encoder.patch_size  # 14
+            decoder_patch_size = patch_size  # 16 (默认)
         else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type}. Supported: 'dinov3', 'dinov3_vitl', 'siglip2'")
+            raise ValueError(f"Unknown encoder_type: {encoder_type}. Supported: 'dinov3', 'dinov3_vitl', 'siglip2', 'dinov2'")
         
         # 更新 latent_channels (可能被 encoder 覆盖)
         self.original_latent_channels = latent_channels
@@ -1089,10 +1266,17 @@ class AutoencoderKL(nn.Module):
             self.target_latent_channels = latent_channels
         self.use_channel_downsample = (self.target_latent_channels != latent_channels)
 
-        # extra spatial downsample after ViT 16x factor
-        assert spatial_downsample_factor % 16 == 0, "spatial_downsample_factor must be 16 * 2^k"
-        extra_factor = spatial_downsample_factor // 16
-        assert extra_factor & (extra_factor - 1) == 0, "only allow 16 * 2^k"
+        # extra spatial downsample after encoder's base downsample factor
+        # DINOv2 uses encoder_patch_size=14, decoder_patch_size=16
+        # 其他 encoder 使用相同的 patch_size
+        if encoder_type == "dinov2":
+            base_downsample_factor = encoder_patch_size  # 14 for DINOv2
+        else:
+            base_downsample_factor = encoder_patch_size if encoder_patch_size is not None else patch_size
+        assert spatial_downsample_factor % base_downsample_factor == 0, \
+            f"spatial_downsample_factor must be {base_downsample_factor} * 2^k for {encoder_type}"
+        extra_factor = spatial_downsample_factor // base_downsample_factor
+        assert extra_factor & (extra_factor - 1) == 0, f"only allow {base_downsample_factor} * 2^k"
         extra_steps = int(math.log2(extra_factor)) if extra_factor > 1 else 0
 
         self.latent_downsample_layers = nn.ModuleList([
@@ -1111,12 +1295,15 @@ class AutoencoderKL(nn.Module):
         # If skip_to_moments=True, don't create this layer (for old checkpoints)
         self.skip_to_moments = skip_to_moments
         if skip_to_moments:
+            print("skip_to_moments is True")
             self.to_moments = None
         else:
+            print("skip_to_moments is False")
             self.to_moments = nn.Conv2d(effective_c, 2 * effective_c, kernel_size=1, stride=1, padding=0)
 
         # Decoder - 支持 CNN 或 ViT
         if decoder_type == "cnn_decoder":
+            print("CNN decoder is used")
             self.decoder = Decoder2D(
                 in_channels=effective_c,
                 out_channels=out_channels,
@@ -1125,6 +1312,9 @@ class AutoencoderKL(nn.Module):
                 gradient_checkpointing=gradient_checkpointing,
             )
         elif decoder_type == "vit_decoder":
+            print("ViT decoder is used")
+            # 对于 DINOv2，decoder 使用 patch_size=16，而不是 encoder 的 patch_size=14
+            # decoder_patch_size 已经在上面根据 encoder_type 设置好了
             self.decoder = ViTXLDecoder(
                 encoder_hidden_size=effective_c,
                 decoder_hidden_size=vit_decoder_hidden_size,
@@ -1132,7 +1322,7 @@ class AutoencoderKL(nn.Module):
                 decoder_num_heads=vit_decoder_num_heads,
                 decoder_intermediate_size=vit_decoder_intermediate_size,
                 image_size=image_size,
-                patch_size=patch_size,
+                patch_size=decoder_patch_size,
                 out_channels=out_channels,
                 dropout=decoder_dropout,
                 gradient_checkpointing=gradient_checkpointing,
@@ -1151,7 +1341,7 @@ class AutoencoderKL(nn.Module):
 
     def _extract_patch_map(self, pred) -> torch.Tensor:
         """
-        pred.last_hidden_state: [B, 1 + R + N, C] (DINOv3) 或 [B, N, C] (SigLIP2)
+        pred.last_hidden_state: [B, 1 + R + N, C] (DINOv3/DINOv2) 或 [B, N, C] (SigLIP2)
         return patch map: [B, C, S, S]
         """
         if self.encoder_type == "dinov3" or self.encoder_type == "dinov3_vitl":
@@ -1162,6 +1352,11 @@ class AutoencoderKL(nn.Module):
         elif self.encoder_type == "siglip2":
             # SigLIP2: 直接是 patch tokens，无 CLS/register
             tokens = pred.last_hidden_state  # [B,N,C]
+        elif self.encoder_type == "dinov2":
+            # DINOv2 with registers: 1 CLS + 4 register tokens = 5 unused tokens
+            cls_len = 1
+            reg_len = self.encoder.num_register_tokens
+            tokens = pred.last_hidden_state[:, cls_len + reg_len:, :]  # [B,N,C]
         else:
             raise ValueError(f"Unknown encoder_type: {self.encoder_type}")
 
@@ -1183,6 +1378,8 @@ class AutoencoderKL(nn.Module):
             return backbone.embeddings.patch_embeddings.weight
         elif self.encoder_type == "siglip2":
             return backbone.embeddings.patch_embedding.weight
+        elif self.encoder_type == "dinov2":
+            return backbone.embeddings.patch_embeddings.projection.weight
         return None
 
     def encode_features(self, x: torch.Tensor, use_lora: bool = True) -> torch.Tensor:

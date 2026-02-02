@@ -30,21 +30,21 @@ export OMP_NUM_THREADS=4
 # echo "  NODE_RANK=$NODE_RANK"
 # echo "  MASTER_ADDR=$MASTER_ADDR"
 # echo "  MASTER_PORT=$MASTER_PORT"
-VAE_CKPT="results_vae/siglip2_default_v3/step_145000.pth"
+VAE_CKPT="/cpfs01/huangxu/models/SAE/ema_vae.pth"
 
 torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
   --nproc-per-node=$NUM_GPUS \
   --master_addr=$MASTER_ADDR \
   --master_port=$MASTER_PORT \
   projects/rae/train.py \
-  --config projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_SIGLIP_768.yaml \
+  --config projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml \
   --data-path /cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/ \
-  --results-dir ./result_dit/result_siglip2_B_v3 \
-  --global-batch-size 512 \
+  --results-dir ./result_dit/result_kl100_vae \
+  --global-batch-size 256 \
   --vae-ckpt $VAE_CKPT \
   --decoder-type cnn_decoder \
-  --encoder-type siglip2 \
-  --siglip2-model-name /cpfs01/huangxu/models/siglip2 \
+  --encoder-type dinov3 \
+  --dinov3-dir /cpfs01/huangxu/models/dinov3 \
   --global-seed 1031 \
   --cfg-prob 0.1 \
   --precision bf16 \
@@ -54,6 +54,9 @@ torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
   --fid-every 25000 \
   --fid-ref-path VIRTUAL_imagenet256_labeled.npz \
   --fid-batch-size 64 \
-  --ckpt result_dit/result_siglip2_B_v3/checkpoints/latest.pt
-  # --ckpt result_dit/result_siglip2_B/checkpoints/latest.pt
+  --no-lora \
+  --skip-to-moments \
+  --ckpt "result_dit/result_kl100_vae/checkpoints/latest.pt" \
+  # --ckpt result_dit/result_kl100_vae/checkpoints/latest.pt
+#   --ckpt result_dit/result_vfloss_vae/checkpoints/latest.pt
   # --ckpt ./result_cfg_v8/checkpoints/latest.pt

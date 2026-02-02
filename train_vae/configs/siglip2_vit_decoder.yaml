@@ -110,6 +110,12 @@ training:
   precision: "bf16"
   fsdp_size: 1
 
+# =================== EMA 配置 ===================
+ema:
+  enabled: true           # 启用 EMA (Exponential Moving Average)
+  decay: 0.9999          # EMA 衰减率
+  val_use_ema: true      # 验证时使用 EMA 模型
+
 # =================== 日志和检查点 ===================
 logging:
   output_dir: "results_vae/siglip2_vit_decoder_xl"

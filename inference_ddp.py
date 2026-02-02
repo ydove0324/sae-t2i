@@ -158,53 +158,194 @@ def run_fid_calculation(args, device):
 # ---------------------------
 # Model Loaders
 # ---------------------------
-def load_dinov3_vae(vae_checkpoint_path: str, device: torch.device, decoder_type: str = "cnn_decoder"):
+def load_dinov3_vae(
+    vae_checkpoint_path: str,
+    device: torch.device,
+    encoder_type: str = "dinov3",
+    decoder_type: str = "cnn_decoder",
+    dinov3_dir: str = "/cpfs01/huangxu/models/dinov3",
+    siglip2_model_name: str = "google/siglip2-base-patch16-256",
+    dinov2_model_name: str = "facebook/dinov2-with-registers-base",
+    image_size: int = 256,
+    patch_size: int = None,
+    latent_channels: int = None,
+    spatial_downsample_factor: int = None,
+    dec_block_out_channels: tuple = None,
+    vit_hidden_size: int = 1024,
+    vit_num_layers: int = 24,
+    vit_num_heads: int = 16,
+    vit_intermediate_size: int = 4096,
+    lora_rank: int = 32,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.0,
+    skip_to_moments: bool = False,
+    denormalize_decoder_output: bool = True,
+):
     """
-    根据 decoder_type 动态选择使用 cnn_decoder 还是 sae_model
+    加载 VAE 模型，支持多种 encoder 和 decoder 类型
+    
+    Args:
+        vae_checkpoint_path: VAE checkpoint 路径
+        device: 设备
+        encoder_type: "dinov3", "siglip2", "dinov2"
+        decoder_type: "cnn_decoder", "vit_decoder", "diffusion_decoder"
+        dinov3_dir: DINOv3 模型目录
+        siglip2_model_name: SigLIP2 模型名称
+        dinov2_model_name: DINOv2 模型名称
+        image_size: 图像大小
+        patch_size: Patch 大小（如果为 None，会根据 encoder_type 自动设置）
+        latent_channels: Latent channels（如果为 None，会根据 encoder_type 自动设置）
+        spatial_downsample_factor: 空间下采样因子（如果为 None，会等于 patch_size）
+        dec_block_out_channels: CNN decoder 的 block out channels（tuple）
+        vit_hidden_size: ViT decoder hidden size
+        vit_num_layers: ViT decoder 层数
+        vit_num_heads: ViT decoder 头数
+        vit_intermediate_size: ViT decoder intermediate size
+        lora_rank: LoRA rank
+        lora_alpha: LoRA alpha
+        lora_dropout: LoRA dropout
+        skip_to_moments: 是否跳过加载 to_moments 层
+        denormalize_decoder_output: 是否反归一化 decoder 输出
     """
-    if decoder_type == "cnn_decoder":
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    # 根据 decoder_type 选择模块
+    if decoder_type in ["cnn_decoder", "vit_decoder"]:
         if cnn_decoder is None:
             raise ImportError("cnn_decoder module not found.")
         AutoencoderKL = cnn_decoder.AutoencoderKL
-        print("[Info] Loading VAE with CNN Decoder...")
+        if rank == 0:
+            print(f"[Info] Loading VAE with {decoder_type.upper()}...")
     elif decoder_type == "diffusion_decoder":
         if sae_model is None:
             raise ImportError("sae_model module not found.")
         AutoencoderKL = sae_model.AutoencoderKL
-        print("[Info] Loading VAE with Diffusion Decoder...")
+        if rank == 0:
+            print("[Info] Loading VAE with Diffusion Decoder...")
     else:
-        raise ValueError(f"Unknown decoder_type: {decoder_type}")
+        raise ValueError(f"Unknown decoder_type: {decoder_type}. Supported: 'cnn_decoder', 'vit_decoder', 'diffusion_decoder'")
 
-    model_params = {
-        "in_channels": 3,
-        "out_channels": 3,
-        "enc_block_out_channels": [128, 256, 384, 512, 768],
-        "dec_block_out_channels": [1280, 1024, 512, 256, 128],
-        "enc_layers_per_block": 2,
-        "dec_layers_per_block": 3,
-        "latent_channels": 1280,
-        "use_quant_conv": False,
-        "use_post_quant_conv": False,
-        "spatial_downsample_factor": 16,
-        "variational": False,
-        "noise_tau": 0.0,
-        "denormalize_decoder_output": True,
-        "running_mode": "dec",
-        "random_masking_channel_ratio": 0.0,
-        "target_latent_channels": None,
-        "lpips_weight": 0.1,
-    }
+    # 根据 encoder_type 设置默认值
+    if latent_channels is None:
+        if encoder_type == "dinov3":
+            latent_channels = 1280
+        elif encoder_type == "siglip2":
+            latent_channels = 768
+        elif encoder_type == "dinov2":
+            latent_channels = 768
+        else:
+            latent_channels = 1280
     
-    # 实例化对应的类
+    if patch_size is None:
+        if encoder_type == "dinov2":
+            patch_size = 14
+        else:
+            patch_size = 16
+    
+    if spatial_downsample_factor is None:
+        spatial_downsample_factor = patch_size
+    
+    if dec_block_out_channels is None:
+        if encoder_type == "dinov2":
+            dec_block_out_channels = (768, 512, 256, 128, 64)
+        else:
+            dec_block_out_channels = (1280, 1024, 512, 256, 128)
+    
+    # 构建模型参数
+    if decoder_type in ["cnn_decoder", "vit_decoder"]:
+        # 使用 cnn_decoder.AutoencoderKL
+        model_params = {
+            "encoder_type": encoder_type,
+            "dinov3_model_dir": dinov3_dir,
+            "siglip2_model_name": siglip2_model_name,
+            "dinov2_model_name": dinov2_model_name,
+            "image_size": image_size,
+            "patch_size": patch_size,
+            "out_channels": 3,
+            "latent_channels": latent_channels,
+            "target_latent_channels": None,
+            "spatial_downsample_factor": spatial_downsample_factor,
+            "decoder_type": decoder_type,
+            "dec_block_out_channels": dec_block_out_channels,
+            "dec_layers_per_block": 3,
+            "decoder_dropout": 0.0,
+            "gradient_checkpointing": False,
+            "vit_decoder_hidden_size": vit_hidden_size,
+            "vit_decoder_num_layers": vit_num_layers,
+            "vit_decoder_num_heads": vit_num_heads,
+            "vit_decoder_intermediate_size": vit_intermediate_size,
+            "variational": True,
+            "kl_weight": 1e-6,
+            "noise_tau": 0.0,
+            "random_masking_channel_ratio": 0.0,
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "enable_lora": (lora_rank > 0),
+            "vf_margin_cos": 0.1,
+            "vf_margin_dms": 0.3,
+            "vf_max_tokens": 32,
+            "vf_hyper": 1.0,
+            "vf_use_adaptive_weight": True,
+            "vf_weight_clamp": 1e4,
+            "training_mode": "enc_dec",
+            "denormalize_decoder_output": denormalize_decoder_output,
+            "skip_to_moments": skip_to_moments,
+        }
+    else:
+        # 使用 sae_model.AutoencoderKL (diffusion_decoder)
+        model_params = {
+            "in_channels": 3,
+            "out_channels": 3,
+            "enc_block_out_channels": [128, 256, 384, 512, 768],
+            "dec_block_out_channels": list(dec_block_out_channels),
+            "enc_layers_per_block": 2,
+            "dec_layers_per_block": 3,
+            "latent_channels": latent_channels,
+            "use_quant_conv": False,
+            "use_post_quant_conv": False,
+            "spatial_downsample_factor": spatial_downsample_factor,
+            "variational": False,
+            "noise_tau": 0.0,
+            "denormalize_decoder_output": denormalize_decoder_output,
+            "running_mode": "dec",
+            "random_masking_channel_ratio": 0.0,
+            "target_latent_channels": None,
+            "lpips_weight": 0.1,
+        }
+    
+    # 实例化模型
     vae = AutoencoderKL(**model_params).to(device)
     
+    # 加载 checkpoint
     ckpt = torch.load(vae_checkpoint_path, map_location="cpu")
-    state_dict = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
     
-    # strict=False 允许加载时有一些 key 不匹配（例如 SAE 模型可能会多出 diffusion_decoder 相关的 key）
+    # 处理不同的 checkpoint 格式
+    if "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+    elif "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    elif "model" in ckpt:
+        state_dict = ckpt["model"]
+    else:
+        state_dict = ckpt
+    
+    # 如果 skip_to_moments=True，跳过 to_moments 相关的 key
+    if skip_to_moments:
+        state_dict = {k: v for k, v in state_dict.items() if "to_moments" not in k}
+        if rank == 0:
+            print("[Info] Skipping to_moments layer loading (skip_to_moments=True)")
+    
+    # 加载权重
     vae.load_state_dict(state_dict, strict=False)
     vae.eval()
     requires_grad(vae, False)
+    
+    if rank == 0:
+        print(f"[Info] VAE loaded: encoder={encoder_type}, decoder={decoder_type}, "
+              f"image_size={image_size}, patch_size={patch_size}, "
+              f"latent_channels={latent_channels}, spatial_downsample={spatial_downsample_factor}")
+    
     return vae
 
 def load_stage2_from_config_and_ckpt(config_path: str, ckpt_path: str, device: torch.device, use_ema: bool = True):
@@ -233,6 +374,13 @@ def load_stage2_from_config_and_ckpt(config_path: str, ckpt_path: str, device: t
 def reconstruct_from_latent_with_diffusion(vae, latent_z, image_shape, diffusion_steps=25, decoder_type="cnn_decoder"):
     """
     根据 decoder_type 切换解码逻辑
+    
+    Args:
+        vae: VAE 模型
+        latent_z: Latent 特征
+        image_shape: 输出图像形状
+        diffusion_steps: Diffusion 步数（仅用于 diffusion_decoder）
+        decoder_type: "cnn_decoder", "vit_decoder", 或 "diffusion_decoder"
     """
     device = latent_z.device
     z = denormalize_sae(latent_z).to(device)
@@ -267,16 +415,13 @@ def reconstruct_from_latent_with_diffusion(vae, latent_z, image_shape, diffusion
             eta=0.0
         )
     else:
-        # === 使用 CNN Decoder 的逻辑 (默认) ===
+        # === 使用 CNN Decoder 或 ViT Decoder 的逻辑 ===
+        # cnn_decoder.AutoencoderKL 的 decode 方法会根据 decoder_type 自动选择
+        # CNN 或 ViT decoder，所以这里统一使用 vae.decode(z).sample
         recon = vae.decode(z).sample
 
     return recon
 
-
-from torchdiffeq import odeint
-
-from torchdiffeq import odeint
-import torch
 
 @torch.no_grad()
 def sample_latent_dopri5(
@@ -346,24 +491,47 @@ def sample_latent_dopri5(
 
 @torch.no_grad()
 def sample_latent_linear_steps(model, batch_size, latent_shape, device, y, time_shift, steps=50):
-    model.eval()
+    """
+    Sample latent z0 using the SAME training parameterization.
+    Aligned with sample_latent_linear_50_steps in train.py
+    """
+    # unwrap DDP if needed
+    model_inner = model.module if hasattr(model, "module") else model
+    model_inner.eval()
+    
     C, H, W = latent_shape
     x = torch.randn((batch_size, C, H, W), device=device, dtype=torch.float32)
     shift = float(time_shift)
-    def flow_shift(t_lin):
+    
+    def flow_shift(t_lin: torch.Tensor) -> torch.Tensor:
+        # SD3-style flow shift
         t = (shift * t_lin) / (1.0 + (shift - 1.0) * t_lin)
+        # 和训练里保持一致：避免 t=1 / t=0 的数值问题
         return t.clamp(0.0, 1.0 - 1e-6)
     
+    # 线性 schedule in t_lin：从 1 -> 0
     for i in range(steps, 0, -1):
         t_lin = torch.full((batch_size,), i / steps, device=device, dtype=torch.float32)
         t_next_lin = torch.full((batch_size,), (i - 1) / steps, device=device, dtype=torch.float32)
-        t = flow_shift(t_lin)
-        t_next = flow_shift(t_next_lin)
-        x0_hat = model(x, t, y=y)
-        t4 = t.view(batch_size, 1, 1, 1)
-        eps_hat = (x - (1.0 - t4) * x0_hat) / (t4 + 1e-8)
-        t_next4 = t_next.view(batch_size, 1, 1, 1)
-        x = t_next4 * eps_hat + (1.0 - t_next4) * x0_hat
+        
+        t = flow_shift(t_lin)           # [B]
+        t_next = flow_shift(t_next_lin) # [B]
+        
+        # Stage2 forward 用的是 t:[B]，不是 [B,1]
+        # 保持与原始代码一致的 autocast 使用（即使 enabled=False）
+        with torch.autocast(device_type='cuda', enabled=False, dtype=torch.float32):
+            x0_hat = model_inner(x, t, y=y)  # x-pred: predict x0 in latent space
+        
+        # eps_hat from x_t = t*eps + (1-t)*x0
+        t_scalar = t.view(batch_size, 1, 1, 1)
+        eps_hat = (x - (1.0 - t_scalar) * x0_hat) / (t_scalar + 1e-8)
+        
+        # update to next time
+        t_next_scalar = t_next.view(batch_size, 1, 1, 1)
+        with torch.autocast(device_type='cuda', enabled=False, dtype=torch.float32):
+            x = t_next_scalar * eps_hat + (1.0 - t_next_scalar) * x0_hat
+    
+    # 最后一步 t_next=0，x 就是 z0_hat
     return x
 
 @torch.no_grad()
@@ -441,9 +609,53 @@ def main():
     parser.add_argument("--calc-fid", action="store_true", help="Calculate FID after generation (ignored if --eval-only is set, as it is implied)")
     parser.add_argument("--ref-path", type=str, default=None, help="Path to .npz stats or reference image folder")
     
+    # Encoder 配置
+    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "siglip2", "dinov2"],
+                        help="Encoder type: 'dinov3', 'siglip2', or 'dinov2'")
+    parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3",
+                        help="Path to DINOv3 model directory")
+    parser.add_argument("--siglip2-model-name", type=str, default="google/siglip2-base-patch16-256",
+                        help="SigLIP2 model name from HuggingFace")
+    parser.add_argument("--dinov2-model-name", type=str, default="facebook/dinov2-with-registers-base",
+                        help="DINOv2 model name from HuggingFace")
+    
     # Decoder 类型选择
-    parser.add_argument("--decoder-type", type=str, default="cnn_decoder", choices=["cnn_decoder", "diffusion_decoder"], 
-                        help="Choose VAE decoder type: 'cnn_decoder' (default) or 'diffusion_decoder'")
+    parser.add_argument("--decoder-type", type=str, default="cnn_decoder", 
+                        choices=["cnn_decoder", "vit_decoder", "diffusion_decoder"], 
+                        help="Choose VAE decoder type: 'cnn_decoder', 'vit_decoder', or 'diffusion_decoder'")
+    
+    # VAE 模型配置
+    parser.add_argument("--image-size", type=int, default=256, help="Image size")
+    parser.add_argument("--patch-size", type=int, default=None, 
+                        help="Patch size (auto-detected from encoder if not set)")
+    parser.add_argument("--latent-channels", type=int, default=None,
+                        help="Latent channels (auto-detected from encoder if not set)")
+    parser.add_argument("--spatial-downsample-factor", type=int, default=None,
+                        help="Spatial downsample factor (auto-detected from patch_size if not set)")
+    
+    # CNN Decoder 配置
+    parser.add_argument("--dec-block-out-channels", type=str, default=None,
+                        help="Decoder block output channels, comma-separated (e.g., '1280,1024,512,256,128')")
+    
+    # ViT Decoder 配置
+    parser.add_argument("--vit-hidden-size", type=int, default=1024, help="ViT decoder hidden size")
+    parser.add_argument("--vit-num-layers", type=int, default=24, help="ViT decoder number of layers")
+    parser.add_argument("--vit-num-heads", type=int, default=16, help="ViT decoder number of heads")
+    parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size")
+    
+    # LoRA 配置
+    parser.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
+    parser.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout")
+    parser.add_argument("--no-lora", action="store_true", help="Disable LoRA")
+    
+    # VAE 选项
+    parser.add_argument("--skip-to-moments", action="store_true",
+                        help="Skip loading to_moments layer (for old checkpoints without it)")
+    parser.add_argument("--denormalize-decoder-output", action="store_true", default=True,
+                        help="Denormalize decoder output in VAE (default: True)")
+    parser.add_argument("--no-denormalize-decoder-output", dest="denormalize_decoder_output", action="store_false",
+                        help="Disable denormalize decoder output")
 
     # 生成参数
     parser.add_argument("--samples-per-class", type=int, default=50)
@@ -454,6 +666,16 @@ def main():
     parser.add_argument("--use-ema", action="store_true")
     
     args = parser.parse_args()
+    
+    # 处理 --no-lora
+    if args.no_lora:
+        args.lora_rank = 0
+    
+    # 解析 dec_block_out_channels
+    if args.dec_block_out_channels is not None:
+        args.dec_block_out_channels = tuple(int(x) for x in args.dec_block_out_channels.split(','))
+    else:
+        args.dec_block_out_channels = None
 
     # 1. Initialize Distributed
     dist.init_process_group(backend="nccl")
@@ -491,6 +713,7 @@ def main():
         print(f"==================================================")
         print(f" Start Distributed Inference: World Size = {world_size}")
         print(f" Target: 1000 classes x {args.samples_per_class} samples")
+        print(f" Encoder Type: {args.encoder_type}")
         print(f" Decoder Type: {args.decoder_type}")
         print(f" Output Dir: {args.out}")
         print(f"==================================================")
@@ -503,8 +726,30 @@ def main():
         dist.destroy_process_group()
         return
 
-    # 传递 decoder_type 给 VAE 加载器
-    vae = load_dinov3_vae(args.vae_ckpt, device, decoder_type=args.decoder_type)
+    # 传递所有参数给 VAE 加载器
+    vae = load_dinov3_vae(
+        vae_checkpoint_path=args.vae_ckpt,
+        device=device,
+        encoder_type=args.encoder_type,
+        decoder_type=args.decoder_type,
+        dinov3_dir=args.dinov3_dir,
+        siglip2_model_name=args.siglip2_model_name,
+        dinov2_model_name=args.dinov2_model_name,
+        image_size=args.image_size,
+        patch_size=args.patch_size,
+        latent_channels=args.latent_channels,
+        spatial_downsample_factor=args.spatial_downsample_factor,
+        dec_block_out_channels=args.dec_block_out_channels,
+        vit_hidden_size=args.vit_hidden_size,
+        vit_num_layers=args.vit_num_layers,
+        vit_num_heads=args.vit_num_heads,
+        vit_intermediate_size=args.vit_intermediate_size,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        skip_to_moments=args.skip_to_moments,
+        denormalize_decoder_output=args.denormalize_decoder_output,
+    )
     stage2 = load_stage2_from_config_and_ckpt(args.config, args.ckpt, device, args.use_ema)
 
     # 2. Task Distribution

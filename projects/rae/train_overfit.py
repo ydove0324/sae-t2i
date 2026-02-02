@@ -476,6 +476,10 @@ def main(args):
     else:
         raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
     
+    # LoRA rank: 0 means no LoRA layers at all
+    effective_lora_rank = 0 if args.no_lora else args.lora_rank
+    effective_lora_alpha = 0 if args.no_lora else args.lora_alpha
+    
     # Build model params for VAE
     vae_model_params = {
         "encoder_type": args.encoder_type,
@@ -485,13 +489,14 @@ def main(args):
         "latent_channels": latent_channels,
         "target_latent_channels": None,
         "spatial_downsample_factor": 16,
-        "lora_rank": 256,
-        "lora_alpha": 256,
+        "lora_rank": effective_lora_rank,
+        "lora_alpha": effective_lora_alpha,
         "dec_block_out_channels": default_dec_block_out_channels,
         "dec_layers_per_block": 3,
         "decoder_dropout": 0.0,
         "gradient_checkpointing": False,
         "denormalize_decoder_output": False,
+        "skip_to_moments": args.skip_to_moments,
     }
     
     # Add encoder-specific params
@@ -506,12 +511,15 @@ def main(args):
         encoder_type=args.encoder_type,
         decoder_type=args.decoder_type,
         model_params=vae_model_params,
+        skip_to_moments=args.skip_to_moments,
     )
     
     # Get normalization function based on encoder_type
     normalize_fn = get_normalize_fn(args.encoder_type)
     
     logger.info(f"Encoder type: {args.encoder_type}, Latent channels: {latent_channels}")
+    logger.info(f"LoRA: rank={effective_lora_rank}, alpha={effective_lora_alpha} (disabled={args.no_lora})")
+    logger.info(f"Skip to_moments: {args.skip_to_moments}")
 
     # ---------------- Stage2 model ----------------
     model: Stage2ModelProtocol = instantiate_from_config(model_config).to(device)
@@ -884,6 +892,12 @@ if __name__ == "__main__":
         default="google/siglip2-base-patch16-256",
         help="SigLIP2 model name from HuggingFace.",
     )
+    
+    # === LoRA ===
+    parser.add_argument("--no-lora", action="store_true", help="Do not use LoRA in VAE encoder (for loading non-LoRA checkpoints).")
+    parser.add_argument("--lora-rank", type=int, default=256, help="LoRA rank (ignored if --no-lora is set).")
+    parser.add_argument("--lora-alpha", type=int, default=256, help="LoRA alpha (ignored if --no-lora is set).")
+    parser.add_argument("--skip-to-moments", action="store_true", help="Skip loading to_moments layer (for old checkpoints without it).")
 
     # === Decoder type ===
     parser.add_argument(

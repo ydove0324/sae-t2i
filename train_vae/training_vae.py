@@ -155,6 +155,38 @@ def get_model_state_dict(model):
     return model.state_dict()
 
 
+@torch.no_grad()
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float, use_fsdp: bool = False):
+    """
+    更新 EMA 模型参数。
+    
+    Args:
+        ema_model: EMA 模型
+        model: 当前训练模型（可能是 DDP/FSDP 包装的）
+        decay: EMA decay rate
+        use_fsdp: 是否使用 FSDP
+    """
+    if use_fsdp:
+        # FSDP 需要使用 summon_full_params 来获取完整参数
+        with FSDP.summon_full_params(model, writeback=False, recurse=True):
+            model_inner = unwrap_model(model)
+            ema_params = dict(ema_model.named_parameters())
+            model_params = dict(model_inner.named_parameters())
+            
+            for name, param in model_params.items():
+                if name in ema_params:
+                    ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+    else:
+        # DDP 或普通模型
+        model_inner = unwrap_model(model)
+        ema_params = dict(ema_model.named_parameters())
+        model_params = dict(model_inner.named_parameters())
+        
+        for name, param in model_params.items():
+            if name in ema_params:
+                ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+
+
 def calculate_adaptive_weight(
     recon_loss: torch.Tensor,
     gan_loss: torch.Tensor,
@@ -248,8 +280,24 @@ def calculate_psnr(img1, img2):
 # ==========================
 
 @torch.no_grad()
-def run_validation(model, val_loader, device, step, args, logger, use_fsdp=False, tb_writer=None):
-    model.eval()
+def run_validation(model, val_loader, device, step, args, logger, use_fsdp=False, tb_writer=None, ema_model=None):
+    """
+    运行验证。
+    
+    Args:
+        model: 当前模型
+        val_loader: 验证数据加载器
+        device: 设备
+        step: 当前步数
+        args: 参数
+        logger: 日志记录器
+        use_fsdp: 是否使用 FSDP
+        tb_writer: TensorBoard writer
+        ema_model: EMA 模型（可选，如果提供则使用 EMA 模型进行验证）
+    """
+    # 如果提供了 EMA 模型，使用 EMA 模型进行验证
+    eval_model = ema_model if ema_model is not None else model
+    eval_model.eval()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
@@ -287,7 +335,7 @@ def run_validation(model, val_loader, device, step, args, logger, use_fsdp=False
 
         # Force fp32 precision for validation
         with torch.autocast("cuda", dtype=torch.float32, enabled=False):
-            out = model(x)
+            out = eval_model(x)
             recon = out.sample  # [-1,1]
         batch_psnr = calculate_psnr(x, recon)
         total_psnr += batch_psnr.item()
@@ -359,7 +407,9 @@ def run_validation(model, val_loader, device, step, args, logger, use_fsdp=False
         shutil.rmtree(recon_dir, ignore_errors=True)
 
     dist.barrier()
-    model.train()
+    eval_model.train()
+    if model is not None:
+        model.train()
 
 
 # ==========================
@@ -493,6 +543,11 @@ def main():
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--val-max-batches", type=int, default=200)
     parser.add_argument("--debug", action="store_true")
+    
+    # EMA 配置
+    parser.add_argument("--ema-decay", type=float, default=0.9999, help="EMA decay rate")
+    parser.add_argument("--use-ema", action="store_true", help="Enable EMA (Exponential Moving Average)")
+    parser.add_argument("--val-use-ema", action="store_true", help="Use EMA model for validation")
 
     args = parser.parse_args()
     
@@ -674,6 +729,15 @@ def main():
                 args.denormalize_decoder_output = vae_cfg['denormalize_decoder_output']
             if 'skip_to_moments' in vae_cfg:
                 args.skip_to_moments = vae_cfg['skip_to_moments']
+        
+        if 'ema' in config:
+            ema_cfg = config['ema']
+            if 'enabled' in ema_cfg:
+                args.use_ema = ema_cfg['enabled']
+            if 'decay' in ema_cfg:
+                args.ema_decay = ema_cfg['decay']
+            if 'val_use_ema' in ema_cfg:
+                args.val_use_ema = ema_cfg['val_use_ema']
     
     # 处理 --no-xxx 参数
     if args.no_lora:
@@ -977,6 +1041,71 @@ def main():
 
     loss_lpips = LPIPSLoss(device)
 
+    # ========== EMA Setup ==========
+    ema_model = None
+    if args.use_ema:
+        # 创建 EMA 模型（复制当前模型结构，但不包装 DDP/FSDP）
+        model_inner = unwrap_model(model)
+        ema_model = AutoencoderKL(
+            # Encoder 配置
+            encoder_type=args.encoder_type,
+            dinov3_model_dir=args.dinov3_dir,
+            siglip2_model_name=args.siglip2_model_name,
+            dinov2_model_name=args.dinov2_model_name,
+            
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            out_channels=3,
+
+            latent_channels=args.latent_channels,
+            target_latent_channels=None,
+            spatial_downsample_factor=args.spatial_downsample_factor,
+
+            # Decoder 配置
+            decoder_type=args.decoder_type,
+            
+            # CNN decoder 参数
+            dec_block_out_channels=args.dec_block_out_channels,
+            dec_layers_per_block=3,
+            decoder_dropout=0.0,
+            gradient_checkpointing=False,
+            
+            # ViT decoder 参数
+            vit_decoder_hidden_size=args.vit_hidden_size,
+            vit_decoder_num_layers=args.vit_num_layers,
+            vit_decoder_num_heads=args.vit_num_heads,
+            vit_decoder_intermediate_size=args.vit_intermediate_size,
+
+            variational=True,
+            kl_weight=args.kl_weight,
+
+            noise_tau=args.noise_tau,
+            random_masking_channel_ratio=args.mask_channels,
+
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            enable_lora=(args.lora_rank > 0),
+            vf_margin_cos=args.vf_m1,
+            vf_margin_dms=args.vf_m2,
+            vf_max_tokens=args.vf_max_tokens,
+            vf_hyper=args.vf_weight,
+            vf_use_adaptive_weight=True,
+            training_mode="enc_dec",
+            denormalize_decoder_output=args.denormalize_decoder_output,
+            skip_to_moments=args.skip_to_moments,
+        ).to(device)
+        
+        # 初始化 EMA 模型为当前模型的状态
+        ema_model.load_state_dict(model_inner.state_dict())
+        ema_model.eval()
+        requires_grad(ema_model, False)
+        
+        if rank == 0:
+            logger.info(f"EMA enabled with decay={args.ema_decay}")
+            if args.val_use_ema:
+                logger.info("Using EMA model for validation")
+
     # ========== GAN Setup - DinoDisc ==========
     use_gan = args.gan_weight > 0.0
     discriminator = None
@@ -1103,6 +1232,16 @@ def main():
                 except Exception as e:
                     if rank == 0:
                         logger.warning(f"Failed to load discriminator scheduler state: {e}")
+        
+        # 恢复 EMA 模型
+        if args.use_ema and ema_model is not None and "ema_model" in resume_ckpt:
+            try:
+                ema_model.load_state_dict(resume_ckpt["ema_model"])
+                if rank == 0:
+                    logger.info("Loaded EMA model state from checkpoint")
+            except Exception as e:
+                if rank == 0:
+                    logger.warning(f"Failed to load EMA model state: {e}")
 
     # Loop
     if rank == 0:
@@ -1165,6 +1304,14 @@ def main():
                     scheduler.step()
                     if rank == 0:
                         logger.info(f"Recreated scheduler at step {current_scheduler_step} to match {len(opt.param_groups)} param groups")
+                
+                # 同步 EMA 模型（如果启用）
+                if args.use_ema and ema_model is not None:
+                    # 在 Stage 转换时，确保 EMA 模型与当前模型同步
+                    model_inner_for_ema = unwrap_model(model)
+                    ema_model.load_state_dict(model_inner_for_ema.state_dict())
+                    if rank == 0:
+                        logger.info("Synchronized EMA model with current model at Stage transition")
                 
                 if rank == 0:
                     num_lora_params = sum(p.numel() for p in lora_params)
@@ -1268,6 +1415,10 @@ def main():
             # Update VAE learning rate scheduler
             if scheduler is not None:
                 scheduler.step()
+            
+            # Update EMA model
+            if args.use_ema and ema_model is not None:
+                update_ema(ema_model, model, decay=args.ema_decay, use_fsdp=use_fsdp)
 
             # ========== Discriminator Update ==========
             disc_loss = torch.tensor(0.0, device=device)
@@ -1364,7 +1515,9 @@ def main():
                         tb_writer.add_scalar("Discriminator/logits_fake", logits_fake_mean.item(), step)
 
             if step % args.eval_every == 0:
-                run_validation(model, val_loader, device, step, args, logger, use_fsdp=use_fsdp, tb_writer=tb_writer)
+                # 如果启用了 EMA 且设置了使用 EMA 进行验证，则使用 EMA 模型
+                val_ema_model = ema_model if (args.use_ema and args.val_use_ema and ema_model is not None) else None
+                run_validation(model, val_loader, device, step, args, logger, use_fsdp=use_fsdp, tb_writer=tb_writer, ema_model=val_ema_model)
 
             if step % args.save_every == 0 and rank == 0:
                 save_path = os.path.join(args.output_dir, f"step_{step}.pth")
@@ -1377,6 +1530,9 @@ def main():
                 # 保存 VAE scheduler
                 if scheduler is not None:
                     ckpt_state["scheduler"] = scheduler.state_dict()
+                # 保存 EMA 模型
+                if args.use_ema and ema_model is not None:
+                    ckpt_state["ema_model"] = ema_model.state_dict()
                 if use_gan and discriminator is not None:
                     disc_state = get_model_state_dict(discriminator)
                     ckpt_state["discriminator"] = disc_state

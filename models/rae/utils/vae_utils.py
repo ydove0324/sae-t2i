@@ -1,5 +1,5 @@
 """
-VAE utility functions for loading and using DINOv3/SigLIP2 VAE models.
+VAE utility functions for loading and using DINOv3/SigLIP2/DINOv2 VAE models.
 Supports both CNN decoder and diffusion decoder.
 """
 
@@ -43,6 +43,27 @@ def denormalize_siglip2(tensor: torch.Tensor) -> torch.Tensor:
 
 
 # ==========================================
+#           DINOv2 Normalization
+# ==========================================
+
+# DINOv2-B (base) normalization statistics
+# These are placeholder values - you may need to compute proper statistics
+# from your training data similar to how DINOv3/SigLIP2 stats were computed.
+DINOV2_SHIFT_FACTOR = 0.0
+DINOV2_SCALE_FACTOR = 0.5  # Placeholder - adjust based on actual feature distribution
+
+
+def normalize_dinov2(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize tensor using DINOv2 statistics."""
+    return (tensor - DINOV2_SHIFT_FACTOR) / DINOV2_SCALE_FACTOR
+
+
+def denormalize_dinov2(tensor: torch.Tensor) -> torch.Tensor:
+    """Denormalize tensor using DINOv2 statistics."""
+    return tensor * DINOV2_SCALE_FACTOR + DINOV2_SHIFT_FACTOR
+
+
+# ==========================================
 #       Generic Normalization Helpers
 # ==========================================
 
@@ -52,8 +73,10 @@ def get_normalize_fn(encoder_type: str = "dinov3"):
         return normalize_sae
     elif encoder_type == "siglip2":
         return normalize_siglip2
+    elif encoder_type == "dinov2":
+        return normalize_dinov2
     else:
-        raise ValueError(f"Unknown encoder_type: {encoder_type}")
+        raise ValueError(f"Unknown encoder_type: {encoder_type}. Supported: 'dinov3', 'siglip2', 'dinov2'")
 
 
 def get_denormalize_fn(encoder_type: str = "dinov3"):
@@ -62,8 +85,10 @@ def get_denormalize_fn(encoder_type: str = "dinov3"):
         return denormalize_sae
     elif encoder_type == "siglip2":
         return denormalize_siglip2
+    elif encoder_type == "dinov2":
+        return denormalize_dinov2
     else:
-        raise ValueError(f"Unknown encoder_type: {encoder_type}")
+        raise ValueError(f"Unknown encoder_type: {encoder_type}. Supported: 'dinov3', 'siglip2', 'dinov2'")
 
 
 # ==========================================
@@ -108,12 +133,12 @@ def load_vae(
     skip_to_moments: bool = False,
 ):
     """
-    Build and load VAE with different encoder types (DINOv3 or SigLIP2).
+    Build and load VAE with different encoder types (DINOv3, SigLIP2, or DINOv2).
 
     Args:
         vae_checkpoint_path: Path to VAE checkpoint file.
         device: Device to load the model on.
-        encoder_type: "dinov3" or "siglip2".
+        encoder_type: "dinov3", "siglip2", or "dinov2".
         decoder_type: "diffusion_decoder" or "cnn_decoder".
         model_params: Optional custom model parameters. If None, uses default based on encoder_type.
         verbose: Whether to print loading information.
@@ -123,13 +148,14 @@ def load_vae(
         Loaded VAE model in eval mode with frozen parameters.
     """
     # Dynamic import based on decoder type
-    if decoder_type == "cnn_decoder":
+    if decoder_type in ["cnn_decoder", "vit_decoder"]:
+        # Both cnn_decoder and vit_decoder are implemented in cnn_decoder.AutoencoderKL
         try:
             from cnn_decoder import AutoencoderKL
         except ImportError:
-            raise ImportError("cnn_decoder module not found, cannot use decoder_type='cnn_decoder'.")
+            raise ImportError("cnn_decoder module not found, cannot use decoder_type='cnn_decoder' or 'vit_decoder'.")
         if verbose:
-            print(f"[load_vae] Using CNN decoder (cnn_decoder.AutoencoderKL) with encoder_type={encoder_type}.")
+            print(f"[load_vae] Using {decoder_type} (cnn_decoder.AutoencoderKL) with encoder_type={encoder_type}.")
     elif decoder_type == "diffusion_decoder":
         try:
             from sae_model import AutoencoderKL
@@ -138,7 +164,7 @@ def load_vae(
         if verbose:
             print(f"[load_vae] Using diffusion decoder (sae_model.AutoencoderKL) with encoder_type={encoder_type}.")
     else:
-        raise ValueError(f"Unknown decoder_type: {decoder_type}")
+        raise ValueError(f"Unknown decoder_type: {decoder_type}. Supported: 'cnn_decoder', 'vit_decoder', 'diffusion_decoder'")
 
     # Default model parameters based on encoder_type
     if model_params is None:
@@ -178,8 +204,26 @@ def load_vae(
                 "gradient_checkpointing": False,
                 "denormalize_decoder_output": False,
             }
+        elif encoder_type == "dinov2":
+            model_params = {
+                "encoder_type": "dinov2",
+                "dinov2_model_name": "facebook/dinov2-with-registers-base",
+                "image_size": 224,  # DINOv2 typically uses 224
+                "patch_size": 14,  # DINOv2 uses patch_size=14
+                "out_channels": 3,
+                "latent_channels": 768,  # DINOv2-base hidden size
+                "target_latent_channels": None,
+                "spatial_downsample_factor": 14,  # Match patch_size
+                "lora_rank": 256,
+                "lora_alpha": 256,
+                "dec_block_out_channels": (768, 512, 256, 128, 64),  # Adjusted for 768 channels
+                "dec_layers_per_block": 3,
+                "decoder_dropout": 0.0,
+                "gradient_checkpointing": False,
+                "denormalize_decoder_output": False,
+            }
         else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type}")
+            raise ValueError(f"Unknown encoder_type: {encoder_type}. Supported: 'dinov3', 'siglip2', 'dinov2'")
     else:
         # Ensure encoder_type is set in model_params
         if "encoder_type" not in model_params:
@@ -190,6 +234,10 @@ def load_vae(
         model_params["skip_to_moments"] = True
     elif "skip_to_moments" not in model_params:
         model_params["skip_to_moments"] = False
+
+    # Set decoder_type in model_params (for cnn_decoder.AutoencoderKL which supports both cnn and vit)
+    if decoder_type in ["cnn_decoder", "vit_decoder"]:
+        model_params["decoder_type"] = decoder_type
 
     vae = AutoencoderKL(**model_params).to(device)
 
@@ -247,7 +295,7 @@ def reconstruct_from_latent_with_diffusion(
         image_shape: Output image shape (B, C, H, W).
         diffusion_steps: Number of diffusion steps (only for diffusion_decoder).
         decoder_type: "diffusion_decoder" or "cnn_decoder".
-        encoder_type: "dinov3" or "siglip2".
+        encoder_type: "dinov3", "siglip2", or "dinov2".
 
     Returns:
         Reconstructed image tensor in [-1, 1] range.
@@ -284,7 +332,7 @@ def reconstruct_from_latent_with_diffusion(
         )
         return recon
 
-    elif decoder_type == "cnn_decoder":
+    elif decoder_type == "cnn_decoder" or decoder_type == "vit_decoder":
         if not hasattr(vae, "decode"):
             raise AttributeError("VAE does not have decode(); cnn_decoder requires vae.decode(z).")
         out = vae.decode(z)
