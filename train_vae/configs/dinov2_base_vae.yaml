@@ -81,7 +81,7 @@ loss:
   # VF (Visual Feature) 损失 - 特征对齐 (Stage 2 启用)
   vf:
     enabled: true
-    weight: 0.5
+    weight: 1
     margin_cos: 0.1
     margin_dms: 0.1
     max_tokens: 256
@@ -132,6 +132,12 @@ training:
   #   Stage 2 [stage1_steps, max_steps]: 启用 LoRA + VF loss
   stage1_steps: 20000     # epoch 0-7 为 Stage 1
 
+# =================== EMA 配置 ===================
+ema:
+  enabled: true           # 启用 EMA (Exponential Moving Average)
+  decay: 0.9999          # EMA 衰减率
+  val_use_ema: true      # 验证时使用 EMA 模型
+
 # =================== 日志和检查点 ===================
 logging:
   output_dir: "results_vae/dinov2_base_vit_decoder_GAN0p75_v2"
@@ -143,5 +149,5 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: ""  # 可选的 VAE 初始化权重路径
+  vae_ckpt: "results_vae/dinov2_base_vit_decoder_GAN0p75_v2/step_20000.pth"  # 可选的 VAE 初始化权重路径
   # vae_ckpt: "results_vae/dinov2_base_vit_decoder_GAN0p75/step_60000.pth"
