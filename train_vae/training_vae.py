@@ -8,6 +8,7 @@ import logging
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import torch.nn as nn
@@ -95,6 +96,7 @@ def setup_ddp():
         local_rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(local_rank)
+        print(f"Rank: {rank}, Local Rank: {local_rank}, World Size: {world_size}")
         return rank, local_rank, world_size
     else:
         os.environ["RANK"] = "0"
@@ -384,20 +386,32 @@ def run_validation(model, val_loader, device, step, args, logger, use_fsdp=False
     
     # 所有 rank 都尝试删除自己的文件（而不是只让 rank 0 删除整个目录）
     # 这样可以分散 I/O 负载，避免单个 rank 卡住
+    # 使用多线程并行删除以加快速度
     if not args.debug:
         import glob
-        # 删除当前 rank 保存的文件
+        
+        def delete_file(file_path):
+            """删除单个文件的辅助函数"""
+            try:
+                os.remove(file_path)
+                return True
+            except:
+                return False
+        
+        # 收集所有需要删除的文件
+        files_to_delete = []
         for pattern in [f"r{rank}_b*_*.png"]:
-            for f in glob.glob(os.path.join(gt_dir, pattern)):
-                try:
-                    os.remove(f)
-                except:
-                    pass
-            for f in glob.glob(os.path.join(recon_dir, pattern)):
-                try:
-                    os.remove(f)
-                except:
-                    pass
+            files_to_delete.extend(glob.glob(os.path.join(gt_dir, pattern)))
+            files_to_delete.extend(glob.glob(os.path.join(recon_dir, pattern)))
+        
+        # 使用多线程并行删除
+        if files_to_delete:
+            num_workers = min(32, len(files_to_delete))  # 最多32个线程
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(delete_file, f) for f in files_to_delete]
+                # 等待所有删除操作完成（可选：检查结果）
+                for future in as_completed(futures):
+                    future.result()  # 获取结果，忽略异常
     
     dist.barrier()
     

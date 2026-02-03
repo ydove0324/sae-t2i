@@ -45,7 +45,7 @@ torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
   --decoder-type cnn_decoder \
   --encoder-type dinov3 \
   --dinov3-dir /cpfs01/huangxu/models/dinov3 \
-  --global-seed 1031 \
+  --global-seed 20041031 \
   --cfg-prob 0.1 \
   --precision fp32 \
   --noise-schedule log_norm \
@@ -54,9 +54,10 @@ torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
   --denormalize-decoder-output \
   --fid-every 25000 \
   --fid-ref-path VIRTUAL_imagenet256_labeled.npz \
-  --fid-batch-size 64 \
+  --fid-batch-size 128 \
   --no-lora \
   --skip-to-moments \
-  --ckpt result_dit/result_kl500_vae/checkpoints/latest.pt
+  --ckpt result_dit/result_kl500_vae/checkpoints/0660000.pt
+  # --ckpt result_dit/result_kl500_vae/checkpoints/latest.pt
 #   --ckpt result_dit/result_vfloss_vae/checkpoints/latest.pt
   # --ckpt ./result_cfg_v8/checkpoints/latest.pt

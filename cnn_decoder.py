@@ -1269,10 +1269,7 @@ class AutoencoderKL(nn.Module):
         # extra spatial downsample after encoder's base downsample factor
         # DINOv2 uses encoder_patch_size=14, decoder_patch_size=16
         # 其他 encoder 使用相同的 patch_size
-        if encoder_type == "dinov2":
-            base_downsample_factor = encoder_patch_size  # 14 for DINOv2
-        else:
-            base_downsample_factor = encoder_patch_size if encoder_patch_size is not None else patch_size
+        base_downsample_factor = patch_size  
         assert spatial_downsample_factor % base_downsample_factor == 0, \
             f"spatial_downsample_factor must be {base_downsample_factor} * 2^k for {encoder_type}"
         extra_factor = spatial_downsample_factor // base_downsample_factor

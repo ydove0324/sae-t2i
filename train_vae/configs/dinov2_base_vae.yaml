@@ -14,8 +14,8 @@
 data:
   train_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
   val_path: "/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val/"
-  image_size: 224
-  batch_size: 64  # 单卡 batch_size，8 卡 = 512 global batch
+  image_size: 256
+  batch_size: 32  # 单卡 batch_size，8 卡 = 512 global batch
 
 # =================== Encoder 配置 ===================
 encoder:
@@ -28,7 +28,7 @@ encoder:
   dinov2:
     model_name: "/cpfs01/huangxu/models/dinov2-register-base"
     hidden_size: 768
-    patch_size: 14  # DINOv2 默认 patch_size=14
+    patch_size: 16  # decoder patch size
 
 # =================== Decoder 配置 ===================
 decoder:
@@ -36,7 +36,7 @@ decoder:
   out_channels: 3
   latent_channels: 768   # 匹配 DINOv2-base 的 hidden size
   target_latent_channels: null
-  spatial_downsample_factor: 14  # 匹配 DINOv2 的 patch_size
+  spatial_downsample_factor: 16  # 匹配 DINOv2 的 patch_size
   dropout: 0.0
   gradient_checkpointing: false
   denormalize_output: false
@@ -57,7 +57,7 @@ decoder:
 # =================== VAE 配置 ===================
 vae:
   variational: true
-  noise_tau: 0.0
+  noise_tau: 0
   mask_channels: 0.0
   denormalize_decoder_output: true
   skip_to_moments: false
@@ -81,7 +81,7 @@ loss:
   # VF (Visual Feature) 损失 - 特征对齐 (Stage 2 启用)
   vf:
     enabled: true
-    weight: 1
+    weight: 0.75
     margin_cos: 0.1
     margin_dms: 0.1
     max_tokens: 256
@@ -95,7 +95,7 @@ loss:
   gan:
     enabled: true
     weight: 0.75              # GAN loss 权重
-    start_step: 25000         # epoch 10 开始启用 GAN
+    start_step: 20000         # epoch 10 开始启用 GAN
     stage_disc_steps: 5000    # epoch 10-11 单独训练判别器 (2 epochs)
     max_d_weight: 10000.0     # 自适应权重的最大值
 
@@ -130,17 +130,17 @@ training:
   # 两阶段训练:
   #   Stage 1 [0, stage1_steps): 只训练 decoder (无 LoRA, 无 VF loss)
   #   Stage 2 [stage1_steps, max_steps]: 启用 LoRA + VF loss
-  stage1_steps: 20000     # epoch 0-7 为 Stage 1
+  stage1_steps: 15000     # epoch 0-5 为 Stage 1
 
 # =================== EMA 配置 ===================
 ema:
   enabled: true           # 启用 EMA (Exponential Moving Average)
-  decay: 0.9999          # EMA 衰减率
+  decay: 0.999          # EMA 衰减率
   val_use_ema: true      # 验证时使用 EMA 模型
 
 # =================== 日志和检查点 ===================
 logging:
-  output_dir: "results_vae/dinov2_base_vit_decoder_GAN0p75_v2"
+  output_dir: "results_vae/dinov2_base_vit_decoder_GAN0p75_VF0p75_wo_noise_tau"
   log_every: 10
   eval_every: 2000
   save_every: 5000
@@ -149,5 +149,5 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: "results_vae/dinov2_base_vit_decoder_GAN0p75_v2/step_20000.pth"  # 可选的 VAE 初始化权重路径
+  vae_ckpt: ""  # 可选的 VAE 初始化权重路径
   # vae_ckpt: "results_vae/dinov2_base_vit_decoder_GAN0p75/step_60000.pth"

@@ -30,6 +30,23 @@ import argparse
 #                              Timing Profiler                                  #
 #################################################################################
 
+def setup_ddp():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(local_rank)
+        print(f"Rank: {rank}, Local Rank: {local_rank}, World Size: {world_size}")
+        return rank, local_rank, world_size
+    else:
+        os.environ["RANK"] = "0"
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(0)
+        return 0, 0, 1
+
 class TrainingProfiler:
     """
     训练过程时间分析器，用于追踪各主要操作的耗时。
@@ -679,12 +696,13 @@ def main(args):
         raise ValueError("Image size must be divisible by 16 for the VAE encoder (downsample_factor=16).")
 
     # ---------------- DDP init ----------------
-    dist.init_process_group("nccl")
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    device_idx = rank % torch.cuda.device_count()
-    torch.cuda.set_device(device_idx)
-    device = torch.device("cuda", device_idx)
+    # dist.init_process_group("nccl")
+    # world_size = dist.get_world_size()
+    # rank = dist.get_rank()
+    # device_idx = rank % torch.cuda.device_count()
+    # torch.cuda.set_device(device_idx)
+    rank, local_rank, world_size = setup_ddp()
+    device = torch.device("cuda", local_rank)
 
     if global_batch_size % (world_size * grad_accum_steps) != 0:
         raise ValueError("Global batch size must be divisible by world_size * grad_accum_steps.")
@@ -855,7 +873,7 @@ def main(args):
         if rank == 0:
             logger.info("Model compiled successfully.")
 
-    model = DDP(model, device_ids=[device_idx], gradient_as_bucket_view=False)
+    model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=False)
 
     opt, opt_msg = build_optimizer(model.parameters(), training_cfg)
     if opt_state is not None:
@@ -1148,28 +1166,28 @@ def main(args):
                 )
 
                 # 2) CFG
-                if train_steps % (args.fid_every * 4) != 0:
-                    continue
-                run_fid_evaluation(
-                    model=ema,
-                    vae=dinov3_vae,
-                    args=args,
-                    logger=logger,
-                    device=device,
-                    step=train_steps,
-                    time_shift=time_shift,
-                    rank=rank,
-                    world_size=world_size,
-                    writer=writer,
-                    decoder_type=args.decoder_type,
-                    encoder_type=args.encoder_type,
-                    latent_shape=latent_size,
-                    use_cfg=True,
-                    cfg_scale=args.cfg_scale,
-                    cfg_interval_low=args.cfg_interval_low,
-                    cfg_interval_high=args.cfg_interval_high,
-                    null_class=num_classes,
-                )
+                # if train_steps % (args.fid_every * 4) != 0:
+                #     continue
+                # run_fid_evaluation(
+                #     model=ema,
+                #     vae=dinov3_vae,
+                #     args=args,
+                #     logger=logger,
+                #     device=device,
+                #     step=train_steps,
+                #     time_shift=time_shift,
+                #     rank=rank,
+                #     world_size=world_size,
+                #     writer=writer,
+                #     decoder_type=args.decoder_type,
+                #     encoder_type=args.encoder_type,
+                #     latent_shape=latent_size,
+                #     use_cfg=True,
+                #     cfg_scale=args.cfg_scale,
+                #     cfg_interval_low=args.cfg_interval_low,
+                #     cfg_interval_high=args.cfg_interval_high,
+                #     null_class=num_classes,
+                # )
 
                 model.train()
                 torch.cuda.empty_cache()
