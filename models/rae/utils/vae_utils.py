@@ -3,6 +3,8 @@ VAE utility functions for loading and using DINOv3/SigLIP2/DINOv2 VAE models.
 Supports both CNN decoder and diffusion decoder.
 """
 
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -50,7 +52,7 @@ def denormalize_siglip2(tensor: torch.Tensor) -> torch.Tensor:
 # These are placeholder values - you may need to compute proper statistics
 # from your training data similar to how DINOv3/SigLIP2 stats were computed.
 DINOV2_SHIFT_FACTOR = 0.0
-DINOV2_SCALE_FACTOR = 0.5  # Placeholder - adjust based on actual feature distribution
+DINOV2_SCALE_FACTOR = 1.0  # Placeholder - adjust based on actual feature distribution
 
 
 def normalize_dinov2(tensor: torch.Tensor) -> torch.Tensor:
@@ -92,6 +94,138 @@ def get_denormalize_fn(encoder_type: str = "dinov3"):
 
 
 # ==========================================
+#     Latent Stats Loading & Normalization
+# ==========================================
+
+def load_latent_stats(stats_path: str, device: torch.device = None, verbose: bool = True):
+    """
+    Load pre-computed latent statistics from .npz file.
+    
+    Args:
+        stats_path: Path to latent_stats.npz file (from compute_latent_stats.py)
+        device: Device to load tensors to (default: CPU)
+        verbose: Whether to print loading information
+    
+    Returns:
+        dict with keys: 'mean', 'std', 'shift_factor', 'scale_factor'
+    """
+    if not os.path.exists(stats_path):
+        raise FileNotFoundError(f"Latent stats file not found: {stats_path}")
+    
+    data = np.load(stats_path)
+    
+    # Load per-channel mean and std
+    mean = torch.from_numpy(data['mean']).float()  # [C]
+    std = torch.from_numpy(data['std']).float()    # [C]
+    
+    # Compute scalar shift/scale factors (mean of means/stds)
+    shift_factor = float(mean.mean().item())
+    scale_factor = float(std.mean().item())
+    
+    if device is not None:
+        mean = mean.to(device)
+        std = std.to(device)
+    
+    if verbose:
+        print(f"[load_latent_stats] Loaded from: {stats_path}")
+        print(f"[load_latent_stats] Channels: {len(mean)}, shift_factor: {shift_factor:.6f}, scale_factor: {scale_factor:.6f}")
+    
+    return {
+        'mean': mean,
+        'std': std,
+        'shift_factor': shift_factor,
+        'scale_factor': scale_factor,
+    }
+
+
+def normalize_with_stats(
+    tensor: torch.Tensor, 
+    stats: dict, 
+    per_channel: bool = False
+) -> torch.Tensor:
+    """
+    Normalize tensor using pre-computed latent statistics.
+    
+    Args:
+        tensor: Input tensor [B, C, H, W]
+        stats: Dict from load_latent_stats() containing 'mean', 'std', 'shift_factor', 'scale_factor'
+        per_channel: If True, use per-channel mean/std. If False, use scalar shift/scale factors.
+    
+    Returns:
+        Normalized tensor
+    """
+    if per_channel:
+        # Per-channel normalization: (x - mean[c]) / std[c]
+        mean = stats['mean'].to(tensor.device)  # [C]
+        std = stats['std'].to(tensor.device)    # [C]
+        # Reshape for broadcasting: [C] -> [1, C, 1, 1]
+        mean = mean.view(1, -1, 1, 1)
+        std = std.view(1, -1, 1, 1)
+        return (tensor - mean) / (std + 1e-8)
+    else:
+        # Scalar normalization: (x - shift_factor) / scale_factor
+        shift = stats['shift_factor']
+        scale = stats['scale_factor']
+        return (tensor - shift) / scale
+
+
+def denormalize_with_stats(
+    tensor: torch.Tensor, 
+    stats: dict, 
+    per_channel: bool = False
+) -> torch.Tensor:
+    """
+    Denormalize tensor using pre-computed latent statistics.
+    
+    Args:
+        tensor: Normalized tensor [B, C, H, W]
+        stats: Dict from load_latent_stats() containing 'mean', 'std', 'shift_factor', 'scale_factor'
+        per_channel: If True, use per-channel mean/std. If False, use scalar shift/scale factors.
+    
+    Returns:
+        Denormalized tensor
+    """
+    if per_channel:
+        # Per-channel denormalization: x * std[c] + mean[c]
+        mean = stats['mean'].to(tensor.device)  # [C]
+        std = stats['std'].to(tensor.device)    # [C]
+        # Reshape for broadcasting: [C] -> [1, C, 1, 1]
+        mean = mean.view(1, -1, 1, 1)
+        std = std.view(1, -1, 1, 1)
+        return tensor * std + mean
+    else:
+        # Scalar denormalization: x * scale_factor + shift_factor
+        shift = stats['shift_factor']
+        scale = stats['scale_factor']
+        return tensor * scale + shift
+
+
+class LatentNormalizer:
+    """
+    A helper class that wraps normalization/denormalization with loaded stats.
+    Can be used as a drop-in replacement for normalize_fn/denormalize_fn.
+    """
+    def __init__(self, stats: dict, per_channel: bool = False):
+        """
+        Args:
+            stats: Dict from load_latent_stats()
+            per_channel: Whether to use per-channel normalization
+        """
+        self.stats = stats
+        self.per_channel = per_channel
+    
+    def normalize(self, tensor: torch.Tensor) -> torch.Tensor:
+        return normalize_with_stats(tensor, self.stats, self.per_channel)
+    
+    def denormalize(self, tensor: torch.Tensor) -> torch.Tensor:
+        return denormalize_with_stats(tensor, self.stats, self.per_channel)
+    
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Default call is normalize."""
+        return self.normalize(tensor)
+
+
+# ==========================================
 #           VAE Loading
 # ==========================================
 
@@ -107,11 +241,20 @@ def load_dinov3_vae(
     decoder_type: str = "diffusion_decoder",
     model_params: dict = None,
     verbose: bool = True,
+    use_ema: bool = False,
 ):
     """
     Build and load DINOv3 AutoencoderKL.
     This is a wrapper for backward compatibility.
     Use load_vae() for more flexibility with different encoder types.
+    
+    Args:
+        vae_checkpoint_path: Path to VAE checkpoint file.
+        device: Device to load the model on.
+        decoder_type: "diffusion_decoder" or "cnn_decoder".
+        model_params: Optional custom model parameters.
+        verbose: Whether to print loading information.
+        use_ema: If True, load EMA model from checkpoint if available.
     """
     return load_vae(
         vae_checkpoint_path=vae_checkpoint_path,
@@ -120,6 +263,7 @@ def load_dinov3_vae(
         decoder_type=decoder_type,
         model_params=model_params,
         verbose=verbose,
+        use_ema=use_ema,
     )
 
 
@@ -131,6 +275,7 @@ def load_vae(
     model_params: dict = None,
     verbose: bool = True,
     skip_to_moments: bool = False,
+    use_ema: bool = False,
 ):
     """
     Build and load VAE with different encoder types (DINOv3, SigLIP2, or DINOv2).
@@ -143,6 +288,7 @@ def load_vae(
         model_params: Optional custom model parameters. If None, uses default based on encoder_type.
         verbose: Whether to print loading information.
         skip_to_moments: If True, ignore missing 'to_moments' keys (for old checkpoints without this layer).
+        use_ema: If True, load EMA model from checkpoint if available. Otherwise, load regular model.
 
     Returns:
         Loaded VAE model in eval mode with frozen parameters.
@@ -247,7 +393,12 @@ def load_vae(
     checkpoint = torch.load(vae_checkpoint_path, map_location="cpu")
 
     # Handle different checkpoint formats
-    if "state_dict" in checkpoint:
+    # If use_ema=True, prioritize loading ema_model
+    if use_ema and "ema_model" in checkpoint:
+        state_dict = checkpoint["ema_model"]
+        if verbose:
+            print("[load_vae] Loading EMA model from checkpoint (use_ema=True)")
+    elif "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
     elif "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
@@ -255,6 +406,11 @@ def load_vae(
         state_dict = checkpoint["model"]
     else:
         state_dict = checkpoint
+    
+    # Warn if use_ema=True but ema_model not found
+    if use_ema and "ema_model" not in checkpoint:
+        if verbose:
+            print("[load_vae] Warning: use_ema=True but checkpoint does not contain 'ema_model'. Loading regular model instead.")
 
     missing, unexpected = vae.load_state_dict(state_dict, strict=False)
     
@@ -284,6 +440,7 @@ def reconstruct_from_latent_with_diffusion(
     diffusion_steps: int = 25,
     decoder_type: str = "diffusion_decoder",
     encoder_type: str = "dinov3",
+    denormalize_fn_override=None,
 ) -> torch.Tensor:
     """
     Given latent_z from encoder (or model prediction in the same latent space),
@@ -296,13 +453,26 @@ def reconstruct_from_latent_with_diffusion(
         diffusion_steps: Number of diffusion steps (only for diffusion_decoder).
         decoder_type: "diffusion_decoder" or "cnn_decoder".
         encoder_type: "dinov3", "siglip2", or "dinov2".
+        denormalize_fn_override: Optional custom denormalization function. If provided,
+            uses this instead of the default encoder_type-based denormalization.
+            Can be a callable or a LatentNormalizer instance.
 
     Returns:
         Reconstructed image tensor in [-1, 1] range.
     """
     device = latent_z.device
-    # Get denormalize function based on encoder_type
-    denormalize_fn = get_denormalize_fn(encoder_type)
+    
+    # Get denormalize function
+    if denormalize_fn_override is not None:
+        # Use custom denormalize function
+        if isinstance(denormalize_fn_override, LatentNormalizer):
+            denormalize_fn = denormalize_fn_override.denormalize
+        else:
+            denormalize_fn = denormalize_fn_override
+    else:
+        # Use default encoder_type-based denormalization
+        denormalize_fn = get_denormalize_fn(encoder_type)
+    
     # VAE is float32, ensure input is also float32
     z = denormalize_fn(latent_z).float()
 

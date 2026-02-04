@@ -151,6 +151,8 @@ from models.rae.utils.vae_utils import (
     get_normalize_fn,
     get_denormalize_fn,
     reconstruct_from_latent_with_diffusion,
+    load_latent_stats,
+    LatentNormalizer,
 )
 from torchvision.datasets import ImageFolder
 import gc
@@ -292,6 +294,7 @@ def run_fid_evaluation(
     cfg_interval_low: float = 0.1,
     cfg_interval_high: float = 1.0,
     null_class: int = 1000,
+    denormalize_fn_override=None,
 ):
     """
     Runs generation and FID calculation.
@@ -366,6 +369,7 @@ def run_fid_evaluation(
                     diffusion_steps=args.vae_diffusion_steps,
                     decoder_type=decoder_type,
                     encoder_type=encoder_type,
+                    denormalize_fn_override=denormalize_fn_override,
                 )
             
             # 3. Save
@@ -595,6 +599,7 @@ def stage2_sample_and_reconstruct(
     device: torch.device | None = None,
     decoder_type: str = "diffusion_decoder",
     encoder_type: str = "dinov3",
+    denormalize_fn_override=None,
 ):
     """
     端到端：
@@ -626,6 +631,7 @@ def stage2_sample_and_reconstruct(
         diffusion_steps=vae_diffusion_steps,
         decoder_type=decoder_type,
         encoder_type=encoder_type,
+        denormalize_fn_override=denormalize_fn_override,
     )  # [-1,1]
 
     return img, z0_hat
@@ -809,13 +815,23 @@ def main(args):
         "spatial_downsample_factor": 16,
         "lora_rank": effective_lora_rank,
         "lora_alpha": effective_lora_alpha,
-        "dec_block_out_channels": default_dec_block_out_channels,
-        "dec_layers_per_block": 3,
         "decoder_dropout": 0.0,
         "gradient_checkpointing": False,
         "denormalize_decoder_output": args.denormalize_decoder_output,
         "skip_to_moments": args.skip_to_moments,
     }
+    
+    # Add decoder-specific params based on decoder_type
+    if args.decoder_type == "cnn_decoder":
+        vae_model_params["dec_block_out_channels"] = default_dec_block_out_channels
+        vae_model_params["dec_layers_per_block"] = 3
+    elif args.decoder_type == "vit_decoder":
+        # ViT decoder 参数 (参数名需要匹配 cnn_decoder.AutoencoderKL)
+        vae_model_params["vit_decoder_hidden_size"] = args.vit_hidden_size
+        vae_model_params["vit_decoder_num_layers"] = args.vit_num_layers
+        vae_model_params["vit_decoder_num_heads"] = args.vit_num_heads
+        vae_model_params["vit_decoder_intermediate_size"] = args.vit_intermediate_size
+    # diffusion_decoder 不需要额外参数
     
     # Add encoder-specific params
     if args.encoder_type == "dinov3":
@@ -832,13 +848,27 @@ def main(args):
         decoder_type=args.decoder_type,
         model_params=vae_model_params,
         skip_to_moments=args.skip_to_moments,
+        use_ema=args.vae_use_ema,
     )
     
-    # Get normalization function based on encoder_type
-    normalize_fn = get_normalize_fn(args.encoder_type)
+    # Get normalization function based on encoder_type or latent_stats
+    latent_stats = None
+    if args.latent_stats_path is not None:
+        # Load pre-computed latent statistics
+        latent_stats = load_latent_stats(args.latent_stats_path, device=device, verbose=(rank == 0))
+        normalize_fn = LatentNormalizer(latent_stats, per_channel=args.per_channel_norm)
+        if rank == 0:
+            logger.info(f"Using latent stats from: {args.latent_stats_path} (per_channel={args.per_channel_norm})")
+    else:
+        # Use default encoder-type-based normalization
+        normalize_fn = get_normalize_fn(args.encoder_type)
+        if rank == 0:
+            logger.info(f"Using default normalization for encoder_type={args.encoder_type}")
     
     if rank == 0:
-        logger.info(f"Loaded VAE: {args.vae_ckpt} encoder_type={args.encoder_type} decoder_type={args.decoder_type}")
+        logger.info(f"Loaded VAE: {args.vae_ckpt} encoder_type={args.encoder_type} decoder_type={args.decoder_type} use_ema={args.vae_use_ema}")
+        if args.decoder_type == "vit_decoder":
+            logger.info(f"ViT decoder config: hidden={args.vit_hidden_size}, layers={args.vit_num_layers}, heads={args.vit_num_heads}, intermediate={args.vit_intermediate_size}")
 
     # ---------------- Stage2 model ----------------
     model: Stage2ModelProtocol = instantiate_from_config(model_config).to(device)
@@ -853,9 +883,9 @@ def main(args):
     if args.ckpt is not None:
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         if "model" in checkpoint:
-            model.load_state_dict(checkpoint["model"])
+            model.load_state_dict(checkpoint["model"],strict=False)
         if "ema" in checkpoint:
-            ema.load_state_dict(checkpoint["ema"])
+            ema.load_state_dict(checkpoint["ema"],strict=False)
         opt_state = checkpoint.get("opt")
         sched_state = checkpoint.get("scheduler")
         train_steps = int(checkpoint.get("train_steps", 0))
@@ -1079,7 +1109,9 @@ def main(args):
                         device=device,
                         decoder_type=args.decoder_type,
                         encoder_type=args.encoder_type,
+                        denormalize_fn_override=normalize_fn if latent_stats is not None else None,
                     )
+                    # img_gen_01 = img_gen.clamp(0, 1)
                     img_gen_01 = (img_gen + 1.0) / 2.0
                     vis_dir = os.path.join(experiment_dir, "samples")
                     os.makedirs(vis_dir, exist_ok=True)
@@ -1094,6 +1126,7 @@ def main(args):
                         diffusion_steps=args.vae_diffusion_steps,
                         decoder_type=args.decoder_type,
                         encoder_type=args.encoder_type,
+                        denormalize_fn_override=normalize_fn if latent_stats is not None else None,
                     )
 
                     # 3) noisy latent 可视化（按你原代码）
@@ -1106,10 +1139,13 @@ def main(args):
                         diffusion_steps=args.vae_diffusion_steps,
                         decoder_type=args.decoder_type,
                         encoder_type=args.encoder_type,
+                        denormalize_fn_override=normalize_fn if latent_stats is not None else None,
                     )
 
                     recon_img = (recon + 1.0) / 2.0
                     x_recon_img = (x_recon + 1.0) / 2.0
+                    # recon_img = recon.clamp(0, 1)
+                    # x_recon_img = x_recon.clamp(0, 1)
 
                     vis_dir = os.path.join(experiment_dir, "recon_debug" if DEBUG else "recon")
                     os.makedirs(vis_dir, exist_ok=True)
@@ -1163,6 +1199,7 @@ def main(args):
                     cfg_interval_low=args.cfg_interval_low,
                     cfg_interval_high=args.cfg_interval_high,
                     null_class=num_classes,
+                    denormalize_fn_override=normalize_fn if latent_stats is not None else None,
                 )
 
                 # 2) CFG
@@ -1311,6 +1348,7 @@ if __name__ == "__main__":
 
     # VAE
     parser.add_argument("--vae-ckpt", type=str, required=True)
+    parser.add_argument("--vae-use-ema", action="store_true", help="Load EMA model from VAE checkpoint if available.")
     
     # Encoder type
     parser.add_argument(
@@ -1345,8 +1383,33 @@ if __name__ == "__main__":
     parser.add_argument("--lora-alpha", type=int, default=256, help="LoRA alpha (ignored if --no-lora is set).")
     parser.add_argument("--skip-to-moments", action="store_true", help="Skip loading to_moments layer (for old checkpoints without it).")
     
+    # Latent normalization stats (from compute_latent_stats.py)
+    parser.add_argument(
+        "--latent-stats-path",
+        type=str,
+        default=None,
+        help="Path to pre-computed latent_stats.npz for normalization. If not provided, uses default encoder-type-based normalization.",
+    )
+    parser.add_argument(
+        "--per-channel-norm",
+        action="store_true",
+        help="Use per-channel normalization instead of scalar normalization (only effective when --latent-stats-path is provided).",
+    )
+    
     # Decoder type
-    parser.add_argument("--decoder-type", type=str, choices=["cnn_decoder", "diffusion_decoder"], default="cnn_decoder")
+    parser.add_argument(
+        "--decoder-type",
+        type=str,
+        choices=["cnn_decoder", "diffusion_decoder", "vit_decoder"],
+        default="cnn_decoder",
+        help="Choose VAE decoder type: 'diffusion_decoder' (sae_model.AutoencoderKL), 'cnn_decoder' (cnn_decoder.AutoencoderKL), or 'vit_decoder' (cnn_decoder.AutoencoderKL with ViT decoder).",
+    )
+    
+    # ViT decoder params (only used if --decoder-type=vit_decoder)
+    parser.add_argument("--vit-hidden-size", type=int, default=1024, help="ViT decoder hidden size (XL: 1024, L: 768, B: 512).")
+    parser.add_argument("--vit-num-layers", type=int, default=24, help="ViT decoder num layers (XL: 24, L: 16, B: 8).")
+    parser.add_argument("--vit-num-heads", type=int, default=16, help="ViT decoder num heads (XL: 16, L: 12, B: 8).")
+    parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size (XL: 4096, L: 3072, B: 2048).")
 
     # VAE diffusion decoder sampling steps (用于 reconstruct / FID decode)
     parser.add_argument("--vae-diffusion-steps", type=int, default=50, help="Sampling steps for VAE diffusion decoder.")
