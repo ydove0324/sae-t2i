@@ -37,7 +37,7 @@ JOB_ID="100"
 
 # =================== 脚本配置 ===================
 TRAIN_SCRIPT="train_vae/train_with_config.sh"
-LOG_FILE="log/dinov2_base_vae_GAN0p75_VF0p75_test.log"
+LOG_FILE="log/dinov2_base_vae_GAN0p75_VF0p75_bs1024_layernorm.log"
 TMUX_SESSION="dinov2_base_vae_multi_node"
 
 # 训练配置文件

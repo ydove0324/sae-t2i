@@ -25,7 +25,7 @@ stage_2:
     mlp_ratio: 4.0
     class_dropout_prob: 0.1
     num_classes: 1000
-    use_qknorm: false
+    use_qknorm: true
     use_swiglu: true
     use_rope: true
     use_rmsnorm: true
@@ -63,12 +63,12 @@ misc:
 training:
   global_seed: 0
   epochs: 1400
-  global_batch_size: 128 # change to 512
+  global_batch_size: 512 # change to 512
   grad_accum_steps: 1 # change according to your GPU memory
   ema_decay: 0.9995
   num_workers: 4
   log_every: 100
-  ckpt_every: 5000
+  ckpt_every: 10000
   sample_every: 10000
   base_lr: 0.0002
   final_lr: 0.00002

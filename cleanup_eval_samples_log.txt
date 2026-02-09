@@ -1,0 +1,29 @@
+清理时间: 2026-02-03 15:48:00
+目标目录模式: result_dit/*/eval_samples
+匹配的目录数: 4
+删除目录数: 22
+删除大小: 110.32 GB
+
+删除的目录列表:
+result_dit/result_kl100_vae/eval_samples/step_0025000_cfg
+result_dit/result_kl100_vae/eval_samples/step_0025000_nocfg
+result_dit/result_kl100_vae/eval_samples/step_0050000_nocfg
+result_dit/result_kl100_vae/eval_samples/step_0075000_nocfg
+result_dit/result_siglip2_B/eval_samples/step_0025000_cfg
+result_dit/result_siglip2_B/eval_samples/step_0025000_nocfg
+result_dit/result_siglip2_B/eval_samples/step_0050000_cfg
+result_dit/result_siglip2_B/eval_samples/step_0050000_nocfg
+result_dit/result_siglip2_B/eval_samples/step_0075000_cfg
+result_dit/result_siglip2_B/eval_samples/step_0075000_nocfg
+result_dit/result_siglip2_B/eval_samples/step_0125000_cfg
+result_dit/result_siglip2_B/eval_samples/step_0125000_nocfg
+result_dit/result_siglip2_B/eval_samples/step_0150000_cfg
+result_dit/result_siglip2_B/eval_samples/step_0150000_nocfg
+result_dit/result_siglip2_B/eval_samples/step_0175000_cfg
+result_dit/result_siglip2_B/eval_samples/step_0175000_nocfg
+result_dit/result_siglip2_B_v3/eval_samples/step_0025000_nocfg
+result_dit/result_siglip2_B_v3/eval_samples/step_0050000_nocfg
+result_dit/result_siglip2_B_v3/eval_samples/step_0075000_nocfg
+result_dit/result_siglip2_B_v3/eval_samples/step_0125000_nocfg
+result_dit/result_siglip2_B_v3/eval_samples/step_0150000_nocfg
+result_dit/result_siglip2_B_v3/eval_samples/step_0175000_nocfg

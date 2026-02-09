@@ -60,6 +60,8 @@ from models.rae.utils.vae_utils import (
     get_normalize_fn,
     get_denormalize_fn,
     reconstruct_from_latent_with_diffusion,
+    load_latent_stats,
+    LatentNormalizer,
 )
 
 # === Datasets ===
@@ -67,125 +69,21 @@ from dataset import ImageNetIdxDataset, OverfitSingleImageDataset, SingleClassDa
 from torch.amp import autocast
 
 
+# 导入统一工具模块
+from models.rae.utils.ddp_utils import (
+    setup_ddp,
+    cleanup_ddp as cleanup,
+    create_logger,
+    requires_grad,
+    unwrap_model,
+    get_model_state_dict,
+    update_ema,
+)
+from models.rae.utils.image_utils import center_crop_arr
+
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
-
-@torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
-    """
-    Step the EMA model towards the current model.
-    Supports EMA on CPU and model on GPU.
-    """
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
-    ema_device = next(ema_model.parameters()).device
-    for name, param in model_params.items():
-        # 如果 EMA 在 CPU 上，需要先把 model 参数复制到 CPU
-        param_data = param.data.to(ema_device) if param.device != ema_device else param.data
-        ema_params[name].mul_(decay).add_(param_data, alpha=1 - decay)
-
-
-@torch.no_grad()
-def update_ema_fsdp(ema_model, fsdp_model, decay=0.9999):
-    """
-    Update EMA from FSDP wrapped model.
-    Uses summon_full_params to get full parameters from FSDP shards.
-    """
-    ema_device = next(ema_model.parameters()).device
-    
-    # 使用 summon_full_params 临时获取完整参数
-    with FSDP.summon_full_params(fsdp_model, writeback=False, recurse=True):
-        model_inner = fsdp_model.module if hasattr(fsdp_model, 'module') else fsdp_model
-        ema_params = OrderedDict(ema_model.named_parameters())
-        model_params = OrderedDict(model_inner.named_parameters())
-        
-        for name, param in model_params.items():
-            if name in ema_params:
-                param_data = param.data.to(ema_device) if param.device != ema_device else param.data
-                ema_params[name].mul_(decay).add_(param_data, alpha=1 - decay)
-
-
-def requires_grad(model, flag=True):
-    """
-    Set requires_grad flag for all parameters in a model.
-    """
-    for p in model.parameters():
-        p.requires_grad = flag
-
-
-def cleanup():
-    """
-    End DDP training.
-    """
-    dist.destroy_process_group()
-
-
-def unwrap_model(model):
-    """
-    获取 DDP 或 FSDP 包装模型的内部原始模型。
-    """
-    if isinstance(model, FSDP):
-        return model.module
-    elif isinstance(model, DDP):
-        return model.module
-    elif hasattr(model, "module"):
-        return model.module
-    return model
-
-
-def get_model_state_dict(model):
-    """
-    获取模型状态字典，兼容 DDP 和 FSDP。
-    对于 FSDP，需要使用 full_state_dict 来收集所有分片。
-    """
-    if isinstance(model, FSDP):
-        # FSDP 需要特殊处理来收集完整的状态字典
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-            return model.state_dict()
-    elif isinstance(model, DDP):
-        return model.module.state_dict()
-    elif hasattr(model, "module"):
-        return model.module.state_dict()
-    return model.state_dict()
-
-
-def create_logger(logging_dir):
-    """
-    Create a logger that writes to a log file and stdout.
-    """
-    if dist.get_rank() == 0:
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler(f"{logging_dir}/log.txt") if logging_dir is not None else logging.StreamHandler(),
-            ],
-        )
-        logger = logging.getLogger(__name__)
-    else:
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
 #################################################################################
@@ -323,6 +221,7 @@ def stage2_sample_and_reconstruct(
     pred_mode: str = "x",
     decoder_type: str = "diffusion_decoder",
     encoder_type: str = "dinov3",
+    denormalize_fn_override=None,
 ):
     if device is None:
         device = y.device
@@ -348,6 +247,7 @@ def stage2_sample_and_reconstruct(
         diffusion_steps=vae_diffusion_steps,
         decoder_type=decoder_type,
         encoder_type=encoder_type,
+        denormalize_fn_override=denormalize_fn_override,
     )
     return img, z0_hat
 
@@ -421,7 +321,12 @@ def main(args):
 
     # ---------------- time_shift & latent size ----------------
     # Determine latent_channels based on encoder_type for time_shift calculation
-    _latent_c = 1280 if args.encoder_type == "dinov3" else 768  # SigLIP2-base hidden size
+    if args.encoder_type == "dinov3":
+        _latent_c = 1280
+    elif args.encoder_type in ["siglip2", "dinov2"]:
+        _latent_c = 768  # SigLIP2-base or DINOv2-base hidden size
+    else:
+        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
     shift_dim = (args.image_size // 16) * (args.image_size // 16) * _latent_c
     shift_base = 4096
     time_shift = math.sqrt(shift_dim / shift_base)
@@ -445,7 +350,7 @@ def main(args):
         checkpoint_dir = os.path.join(args.results_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, rank=0)
         logger.info(f"Experiment directory created at {experiment_dir}")
         logger.info(f"Prediction Mode: {args.prediction_mode.upper()}")
         logger.info(f"Decoder Type: {args.decoder_type}")
@@ -462,10 +367,10 @@ def main(args):
     else:
         experiment_dir = None
         checkpoint_dir = None
-        logger = create_logger(None)
+        logger = create_logger(None, rank=rank)
         writer = None
 
-    # ---------------- load VAE (DINOv3 or SigLIP2) ----------------
+    # ---------------- load VAE (DINOv3, SigLIP2, or DINOv2) ----------------
     # Determine latent_channels based on encoder_type
     if args.encoder_type == "dinov3":
         latent_channels = 1280
@@ -473,6 +378,9 @@ def main(args):
     elif args.encoder_type == "siglip2":
         latent_channels = 768  # SigLIP2-base hidden size
         default_dec_block_out_channels = (768, 512, 256, 128, 64)
+    elif args.encoder_type == "dinov2":
+        latent_channels = 768  # DINOv2-base hidden size
+        default_dec_block_out_channels = (768, 512, 256, 128, 64)  # DINOv2-base: 768 hidden size
     else:
         raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
     
@@ -491,19 +399,31 @@ def main(args):
         "spatial_downsample_factor": 16,
         "lora_rank": effective_lora_rank,
         "lora_alpha": effective_lora_alpha,
-        "dec_block_out_channels": default_dec_block_out_channels,
-        "dec_layers_per_block": 3,
         "decoder_dropout": 0.0,
         "gradient_checkpointing": False,
-        "denormalize_decoder_output": False,
+        "denormalize_decoder_output": True,
         "skip_to_moments": args.skip_to_moments,
     }
+    
+    # Add decoder-specific params based on decoder_type
+    if args.decoder_type == "cnn_decoder":
+        vae_model_params["dec_block_out_channels"] = default_dec_block_out_channels
+        vae_model_params["dec_layers_per_block"] = 3
+    elif args.decoder_type == "vit_decoder":
+        # ViT decoder 参数 (参数名需要匹配 cnn_decoder.AutoencoderKL)
+        vae_model_params["vit_decoder_hidden_size"] = args.vit_hidden_size
+        vae_model_params["vit_decoder_num_layers"] = args.vit_num_layers
+        vae_model_params["vit_decoder_num_heads"] = args.vit_num_heads
+        vae_model_params["vit_decoder_intermediate_size"] = args.vit_intermediate_size
+    # diffusion_decoder 不需要额外参数
     
     # Add encoder-specific params
     if args.encoder_type == "dinov3":
         vae_model_params["dinov3_model_dir"] = args.dinov3_dir
     elif args.encoder_type == "siglip2":
         vae_model_params["siglip2_model_name"] = args.siglip2_model_name
+    elif args.encoder_type == "dinov2":
+        vae_model_params["dinov2_model_name"] = args.dinov2_model_name
     
     dinov3_vae = load_vae(
         args.vae_ckpt, 
@@ -514,10 +434,24 @@ def main(args):
         skip_to_moments=args.skip_to_moments,
     )
     
-    # Get normalization function based on encoder_type
-    normalize_fn = get_normalize_fn(args.encoder_type)
+    # Get normalization function based on encoder_type or latent_stats
+    latent_stats = None
+    if args.latent_stats_path is not None:
+        # Load pre-computed latent statistics
+        latent_stats = load_latent_stats(args.latent_stats_path, device=device, verbose=(rank == 0))
+        normalize_fn = LatentNormalizer(latent_stats, per_channel=args.per_channel_norm)
+        if rank == 0:
+            logger.info(f"Using latent stats from: {args.latent_stats_path} (per_channel={args.per_channel_norm})")
+    else:
+        # Use default encoder-type-based normalization
+        normalize_fn = get_normalize_fn(args.encoder_type)
+        if rank == 0:
+            logger.info(f"Using default normalization for encoder_type={args.encoder_type}")
     
     logger.info(f"Encoder type: {args.encoder_type}, Latent channels: {latent_channels}")
+    logger.info(f"Decoder type: {args.decoder_type}")
+    if args.decoder_type == "vit_decoder":
+        logger.info(f"ViT decoder config: hidden={args.vit_hidden_size}, layers={args.vit_num_layers}, heads={args.vit_num_heads}, intermediate={args.vit_intermediate_size}")
     logger.info(f"LoRA: rank={effective_lora_rank}, alpha={effective_lora_alpha} (disabled={args.no_lora})")
     logger.info(f"Skip to_moments: {args.skip_to_moments}")
 
@@ -632,10 +566,7 @@ def main(args):
 
     # Init EMA
     use_fsdp = args.fsdp_size > 1
-    if use_fsdp:
-        update_ema_fsdp(ema, model, decay=0.0)
-    else:
-        update_ema(ema, unwrap_model(model), decay=0.0)
+    update_ema(ema, model, decay=0.0, use_fsdp=use_fsdp)
     model.train()
     ema.eval()
 
@@ -701,10 +632,7 @@ def main(args):
 
             opt.step()
             schedl.step()
-            if use_fsdp:
-                update_ema_fsdp(ema, model, decay=ema_decay)
-            else:
-                update_ema(ema, unwrap_model(model), decay=ema_decay)
+            update_ema(ema, model, decay=ema_decay, use_fsdp=use_fsdp)
             opt.zero_grad(set_to_none=True)
 
             running_loss += step_loss_accum / grad_accum_steps
@@ -736,6 +664,7 @@ def main(args):
                         pred_mode=args.prediction_mode,
                         decoder_type=args.decoder_type,
                         encoder_type=args.encoder_type,
+                        denormalize_fn_override=normalize_fn if latent_stats is not None else None,
                     )
 
                     # 只有 rank 0 保存图片
@@ -759,6 +688,7 @@ def main(args):
                             diffusion_steps=args.vae_diffusion_steps,
                             decoder_type=args.decoder_type,
                             encoder_type=args.encoder_type,
+                            denormalize_fn_override=normalize_fn if latent_stats is not None else None,
                         )
 
                         # Original noisy latent reconstruction monitor
@@ -773,6 +703,7 @@ def main(args):
                             diffusion_steps=args.vae_diffusion_steps,
                             decoder_type=args.decoder_type,
                             encoder_type=args.encoder_type,
+                            denormalize_fn_override=normalize_fn if latent_stats is not None else None,
                         )
 
                         recon_img = (recon + 1.0) / 2.0
@@ -877,8 +808,8 @@ if __name__ == "__main__":
         "--encoder-type",
         type=str,
         default="dinov3",
-        choices=["dinov3", "siglip2"],
-        help="Choose encoder type: 'dinov3' or 'siglip2'.",
+        choices=["dinov3", "siglip2", "dinov2"],
+        help="Choose encoder type: 'dinov3', 'siglip2', or 'dinov2'.",
     )
     parser.add_argument(
         "--dinov3-dir",
@@ -892,21 +823,46 @@ if __name__ == "__main__":
         default="google/siglip2-base-patch16-256",
         help="SigLIP2 model name from HuggingFace.",
     )
+    parser.add_argument(
+        "--dinov2-model-name",
+        type=str,
+        default="facebook/dinov2-with-registers-base",
+        help="DINOv2 model name from HuggingFace (e.g., 'facebook/dinov2-with-registers-base').",
+    )
     
     # === LoRA ===
     parser.add_argument("--no-lora", action="store_true", help="Do not use LoRA in VAE encoder (for loading non-LoRA checkpoints).")
     parser.add_argument("--lora-rank", type=int, default=256, help="LoRA rank (ignored if --no-lora is set).")
     parser.add_argument("--lora-alpha", type=int, default=256, help="LoRA alpha (ignored if --no-lora is set).")
     parser.add_argument("--skip-to-moments", action="store_true", help="Skip loading to_moments layer (for old checkpoints without it).")
+    
+    # Latent normalization stats (from compute_latent_stats.py)
+    parser.add_argument(
+        "--latent-stats-path",
+        type=str,
+        default=None,
+        help="Path to pre-computed latent_stats.npz for normalization. If not provided, uses default encoder-type-based normalization.",
+    )
+    parser.add_argument(
+        "--per-channel-norm",
+        action="store_true",
+        help="Use per-channel normalization instead of scalar normalization (only effective when --latent-stats-path is provided).",
+    )
 
     # === Decoder type ===
     parser.add_argument(
         "--decoder-type",
         type=str,
         default="cnn_decoder",
-        choices=["diffusion_decoder", "cnn_decoder"],
-        help="Choose VAE decoder type: 'diffusion_decoder' (sae_model.AutoencoderKL) or 'cnn_decoder' (cnn_decoder.AutoencoderKL).",
+        choices=["diffusion_decoder", "cnn_decoder", "vit_decoder"],
+        help="Choose VAE decoder type: 'diffusion_decoder' (sae_model.AutoencoderKL), 'cnn_decoder' (cnn_decoder.AutoencoderKL), or 'vit_decoder' (cnn_decoder.AutoencoderKL with ViT decoder).",
     )
+    
+    # ViT decoder params (only used if --decoder-type=vit_decoder)
+    parser.add_argument("--vit-hidden-size", type=int, default=1024, help="ViT decoder hidden size (XL: 1024, L: 768, B: 512).")
+    parser.add_argument("--vit-num-layers", type=int, default=24, help="ViT decoder num layers (XL: 24, L: 16, B: 8).")
+    parser.add_argument("--vit-num-heads", type=int, default=16, help="ViT decoder num heads (XL: 16, L: 12, B: 8).")
+    parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size (XL: 4096, L: 3072, B: 2048).")
 
     # Dataset choice
     parser.add_argument(

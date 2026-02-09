@@ -9,14 +9,14 @@ VAL_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val"
 # VAE_CKPT="results_vae/cnn_decoder_finetune_vf_loss0p1_lora_rank256_ganloss0p01_frozen_dinov3_gramloss/step_40000.pth"  # Change to your VAE checkpoint
 # VAE_CKPT="results_vae/siglip2_default/step_140000.pth"  # Change to your VAE checkpoint
 # VAE_CKPT="/cpfs01/huangxu/models/SAE/models/ema_vae.pth"
-VAE_CKPT="results_vae/dinov2_base_vit_decoder_GAN0p75/step_60000.pth"
+VAE_CKPT="results_vae/dinov2_base_vit_decoder_GAN0p75_VF0p75_layernorm/step_30000.pth"
 
 ENCODER_TYPE="dinov2"  # dinov3, dinov3_vitl, siglip2, or dinov2
 DINOV3_DIR="/cpfs01/huangxu/models/dinov3"
 SIGLIP2_MODEL_NAME="/cpfs01/huangxu/models/siglip2"
 DINOV2_MODEL_NAME="/cpfs01/huangxu/models/dinov2-register-base"
 
-OUTPUT_DIR="results/linear_probe_dinov2_base_vit_decoder_GAN0p75_60000"
+OUTPUT_DIR="results/linear_probe_dinov2_base_vit_decoder_GAN0p75_VF0p75_layernorm_30000"
 IMAGE_SIZE=256
 BATCH_SIZE=256
 EPOCHS=100

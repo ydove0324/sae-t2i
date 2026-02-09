@@ -4,7 +4,6 @@ import sys
 sys.path.append(".")
 import argparse
 import shutil
-import logging
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
@@ -29,13 +28,20 @@ from cnn_decoder import AutoencoderKL
 # DinoDisc from local dinodisc.py
 from dinodisc import DinoDisc, DiffAug, hinge_d_loss, vanilla_g_loss
 
-# === deps ===
-try:
-    import lpips
-except ImportError:
-    print("Please install lpips: pip install lpips")
-    sys.exit(1)
+# === 导入统一工具模块 ===
+from models.rae.utils.ddp_utils import (
+    setup_ddp,
+    cleanup_ddp,
+    create_logger,
+    requires_grad,
+    unwrap_model,
+    get_model_state_dict,
+    update_ema,
+)
+from models.rae.utils.image_utils import center_crop_arr
+from models.rae.utils.metrics_utils import LPIPSLoss, calculate_psnr, is_fid_available, is_lpips_available
 
+# === deps ===
 try:
     from torch.utils.tensorboard import SummaryWriter
     HAS_TENSORBOARD = True
@@ -43,12 +49,17 @@ except ImportError:
     HAS_TENSORBOARD = False
     print("Warning: tensorboard not found. TensorBoard logging will be skipped.")
 
-try:
-    from pytorch_fid import fid_score
-    HAS_FID = True
-except ImportError:
-    HAS_FID = False
+# FID 可用性检查
+HAS_FID = is_fid_available()
+if not HAS_FID:
     print("Warning: pytorch-fid not found. rFID calculation will be skipped.")
+else:
+    from pytorch_fid import fid_score
+
+# LPIPS 可用性检查
+if not is_lpips_available():
+    print("Warning: lpips not installed. LPIPS loss will not be available.")
+    sys.exit(1)
 
 
 # ==========================
@@ -72,121 +83,35 @@ def get_cosine_schedule_with_warmup(
         total_steps: Total training steps
         min_lr_ratio: Ratio of min_lr to max_lr (default 0.1 means min_lr = 0.1 * max_lr)
     """
+    # 获取优化器的参数组数量，确保为每个参数组创建对应的 lambda 函数
+    num_param_groups = len(optimizer.param_groups)
+    
     def lr_lambda(current_step: int):
         # Warmup phase
         if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        # Cosine decay phase
-        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        # Scale from [0, 1] to [min_lr_ratio, 1]
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-    
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
-# ==========================
-# DDP / FSDP helpers
-# ==========================
-
-def setup_ddp():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl")
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(local_rank)
-        print(f"Rank: {rank}, Local Rank: {local_rank}, World Size: {world_size}")
-        return rank, local_rank, world_size
-    else:
-        os.environ["RANK"] = "0"
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(0)
-        return 0, 0, 1
-
-def cleanup_ddp():
-    dist.destroy_process_group()
-
-def create_logger(save_dir, rank):
-    logger = logging.getLogger(f"rank{rank}")
-    logger.setLevel(logging.INFO)
-    if rank == 0:
-        os.makedirs(save_dir, exist_ok=True)
-        fh = logging.FileHandler(os.path.join(save_dir, "train_log.txt"), mode='a')
-        ch = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(message)s')
-        fh.setFormatter(formatter)
-        ch.setFormatter(formatter)
-        logger.addHandler(fh)
-        logger.addHandler(ch)
-    else:
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-def requires_grad(model, flag=True):
-    for p in model.parameters():
-        p.requires_grad = flag
-
-
-def unwrap_model(model):
-    """获取 DDP 或 FSDP 包装模型的内部原始模型。"""
-    if isinstance(model, FSDP):
-        return model.module
-    elif isinstance(model, DDP):
-        return model.module
-    elif hasattr(model, "module"):
-        return model.module
-    return model
-
-
-def get_model_state_dict(model):
-    """
-    获取模型状态字典，兼容 DDP 和 FSDP。
-    对于 FSDP，需要使用 full_state_dict 来收集所有分片。
-    """
-    if isinstance(model, FSDP):
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-            return model.state_dict()
-    elif isinstance(model, DDP):
-        return model.module.state_dict()
-    elif hasattr(model, "module"):
-        return model.module.state_dict()
-    return model.state_dict()
-
-
-@torch.no_grad()
-def update_ema(ema_model: nn.Module, model: nn.Module, decay: float, use_fsdp: bool = False):
-    """
-    更新 EMA 模型参数。
-    
-    Args:
-        ema_model: EMA 模型
-        model: 当前训练模型（可能是 DDP/FSDP 包装的）
-        decay: EMA decay rate
-        use_fsdp: 是否使用 FSDP
-    """
-    if use_fsdp:
-        # FSDP 需要使用 summon_full_params 来获取完整参数
-        with FSDP.summon_full_params(model, writeback=False, recurse=True):
-            model_inner = unwrap_model(model)
-            ema_params = dict(ema_model.named_parameters())
-            model_params = dict(model_inner.named_parameters())
-            
-            for name, param in model_params.items():
-                if name in ema_params:
-                    ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-    else:
-        # DDP 或普通模型
-        model_inner = unwrap_model(model)
-        ema_params = dict(ema_model.named_parameters())
-        model_params = dict(model_inner.named_parameters())
+            lr_factor = float(current_step) / float(max(1, warmup_steps))
+        else:
+            # Cosine decay phase
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            # Scale from [0, 1] to [min_lr_ratio, 1]
+            lr_factor = min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
         
-        for name, param in model_params.items():
-            if name in ema_params:
-                ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+        # 为每个参数组返回相同的学习率因子
+        # LambdaLR 会为每个参数组调用这个函数，所以返回单个值即可
+        return lr_factor
+    
+    # 如果优化器有多个参数组，需要为每个参数组提供 lambda 函数
+    # 但 LambdaLR 支持单个函数（会被每个参数组调用），所以这样应该可以
+    # 如果仍然有问题，可以显式创建函数列表
+    if num_param_groups == 1:
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        # 为每个参数组创建相同的 lambda 函数
+        lr_lambdas = [lr_lambda] * num_param_groups
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambdas)
+
+
 
 
 def calculate_adaptive_weight(
@@ -236,45 +161,8 @@ def calculate_adaptive_weight(
     return d_weight.detach()
 
 
-# ==========================
-# Data helpers
-# ==========================
-
-def center_crop_arr(pil_image, image_size):
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC)
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
-# ==========================
-# Losses & metrics
-# ==========================
-
-class LPIPSLoss(nn.Module):
-    def __init__(self, device):
-        super().__init__()
-        # LPIPS expects input in [-1, 1]
-        self.lpips = lpips.LPIPS(net='vgg',lpips=False,use_dropout=False).to(device)
-        self.lpips.eval()
-        requires_grad(self.lpips, False)
-
-    def forward(self, x, rec):
-        # x, rec: [-1, 1]
-        return self.lpips(x, rec).mean()
-
-def calculate_psnr(img1, img2):
-    # img1,img2: [-1,1]
-    img1 = torch.clamp((img1 + 1.0) / 2.0, 0, 1)
-    img2 = torch.clamp((img2 + 1.0) / 2.0, 0, 1)
-    mse = torch.mean((img1 - img2) ** 2)
-    if mse <= 0:
-        return 100.0
-    return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
 
 # ==========================
@@ -562,6 +450,10 @@ def main():
     parser.add_argument("--ema-decay", type=float, default=0.9999, help="EMA decay rate")
     parser.add_argument("--use-ema", action="store_true", help="Enable EMA (Exponential Moving Average)")
     parser.add_argument("--val-use-ema", action="store_true", help="Use EMA model for validation")
+    
+    # Resume 配置
+    parser.add_argument("--no-resume-optimizer", action="store_true", 
+                        help="Do not resume optimizer state from checkpoint (start with fresh optimizer)")
 
     args = parser.parse_args()
     
@@ -732,6 +624,8 @@ def main():
             ckpt_cfg = config['checkpoint']
             if 'vae_ckpt' in ckpt_cfg and ckpt_cfg['vae_ckpt']:
                 args.vae_ckpt = ckpt_cfg['vae_ckpt']
+            if 'no_resume_optimizer' in ckpt_cfg:
+                args.no_resume_optimizer = ckpt_cfg['no_resume_optimizer']
         
         if 'vae' in config:
             vae_cfg = config['vae']
@@ -1055,6 +949,69 @@ def main():
 
     loss_lpips = LPIPSLoss(device)
 
+    # ========== Ref Model Setup (for VF loss when no-lora) ==========
+    ref_model = None
+    if args.lora_rank == 0 and args.vf_weight > 0.0:
+        # 当 no-lora 时，创建 ref_model 用于 VF loss 计算
+        model_inner = unwrap_model(model)
+        ref_model = AutoencoderKL(
+            # Encoder 配置
+            encoder_type=args.encoder_type,
+            dinov3_model_dir=args.dinov3_dir,
+            siglip2_model_name=args.siglip2_model_name,
+            dinov2_model_name=args.dinov2_model_name,
+            
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            out_channels=3,
+
+            latent_channels=args.latent_channels,
+            target_latent_channels=None,
+            spatial_downsample_factor=args.spatial_downsample_factor,
+
+            # Decoder 配置
+            decoder_type=args.decoder_type,
+            
+            # CNN decoder 参数
+            dec_block_out_channels=args.dec_block_out_channels,
+            dec_layers_per_block=3,
+            decoder_dropout=0.0,
+            gradient_checkpointing=False,
+            
+            # ViT decoder 参数
+            vit_decoder_hidden_size=args.vit_hidden_size,
+            vit_decoder_num_layers=args.vit_num_layers,
+            vit_decoder_num_heads=args.vit_num_heads,
+            vit_decoder_intermediate_size=args.vit_intermediate_size,
+
+            variational=True,
+            kl_weight=args.kl_weight,
+
+            noise_tau=args.noise_tau,
+            random_masking_channel_ratio=args.mask_channels,
+
+            lora_rank=0,  # ref_model 不使用 LoRA
+            lora_alpha=0,
+            lora_dropout=0.0,
+            enable_lora=False,  # ref_model 不使用 LoRA
+            vf_margin_cos=args.vf_m1,
+            vf_margin_dms=args.vf_m2,
+            vf_max_tokens=args.vf_max_tokens,
+            vf_hyper=args.vf_weight,
+            vf_use_adaptive_weight=True,
+            training_mode="enc_dec",
+            denormalize_decoder_output=args.denormalize_decoder_output,
+            skip_to_moments=args.skip_to_moments,
+        ).to(device)
+        
+        # 初始化 ref_model 为当前模型的状态（但不包括 LoRA，因为 ref_model 没有 LoRA）
+        ref_model.load_state_dict(model_inner.state_dict(), strict=False)
+        ref_model.eval()
+        requires_grad(ref_model, False)
+        
+        if rank == 0:
+            logger.info("Created ref_model for VF loss (no-lora mode)")
+
     # ========== EMA Setup ==========
     ema_model = None
     if args.use_ema:
@@ -1111,7 +1068,7 @@ def main():
         ).to(device)
         
         # 初始化 EMA 模型为当前模型的状态
-        ema_model.load_state_dict(model_inner.state_dict())
+        ema_model.load_state_dict(model_inner.state_dict(),strict=False)
         ema_model.eval()
         requires_grad(ema_model, False)
         
@@ -1198,7 +1155,7 @@ def main():
     # ========== 从 checkpoint 恢复 optimizer/discriminator/scheduler/step ==========
     if resume_ckpt is not None:
         # 恢复 VAE optimizer
-        if "opt" in resume_ckpt:
+        if "opt" in resume_ckpt and not args.no_resume_optimizer:
             try:
                 opt.load_state_dict(resume_ckpt["opt"])
                 if rank == 0:
@@ -1206,13 +1163,31 @@ def main():
             except Exception as e:
                 if rank == 0:
                     logger.warning(f"Failed to load VAE optimizer state: {e}")
+        elif args.no_resume_optimizer and rank == 0:
+            logger.info("Skipping optimizer resume (--no-resume-optimizer)")
         
         # 恢复 VAE scheduler
-        if "scheduler" in resume_ckpt and scheduler is not None:
+        if "scheduler" in resume_ckpt and scheduler is not None and not args.no_resume_optimizer:
             try:
-                scheduler.load_state_dict(resume_ckpt["scheduler"])
-                if rank == 0:
-                    logger.info("Loaded VAE scheduler state from checkpoint")
+                # 检查调度器状态中的参数组数量是否与当前优化器匹配
+                scheduler_state = resume_ckpt["scheduler"]
+                if "base_lrs" in scheduler_state:
+                    saved_num_groups = len(scheduler_state["base_lrs"])
+                    current_num_groups = len(opt.param_groups)
+                    if saved_num_groups != current_num_groups:
+                        if rank == 0:
+                            logger.warning(
+                                f"Scheduler param_groups mismatch: saved={saved_num_groups}, "
+                                f"current={current_num_groups}. Skipping scheduler restore."
+                            )
+                    else:
+                        scheduler.load_state_dict(scheduler_state)
+                        if rank == 0:
+                            logger.info("Loaded VAE scheduler state from checkpoint")
+                else:
+                    scheduler.load_state_dict(scheduler_state)
+                    if rank == 0:
+                        logger.info("Loaded VAE scheduler state from checkpoint")
             except Exception as e:
                 if rank == 0:
                     logger.warning(f"Failed to load VAE scheduler state: {e}")
@@ -1229,7 +1204,7 @@ def main():
                     if rank == 0:
                         logger.warning(f"Failed to load discriminator state: {e}")
             
-            if "opt_disc" in resume_ckpt and opt_disc is not None:
+            if "opt_disc" in resume_ckpt and opt_disc is not None and not args.no_resume_optimizer:
                 try:
                     opt_disc.load_state_dict(resume_ckpt["opt_disc"])
                     if rank == 0:
@@ -1238,24 +1213,61 @@ def main():
                     if rank == 0:
                         logger.warning(f"Failed to load discriminator optimizer state: {e}")
             
-            if "scheduler_disc" in resume_ckpt and scheduler_disc is not None:
+            if "scheduler_disc" in resume_ckpt and scheduler_disc is not None and not args.no_resume_optimizer:
                 try:
-                    scheduler_disc.load_state_dict(resume_ckpt["scheduler_disc"])
-                    if rank == 0:
-                        logger.info("Loaded discriminator scheduler state from checkpoint")
+                    # 检查调度器状态中的参数组数量是否与当前优化器匹配
+                    scheduler_disc_state = resume_ckpt["scheduler_disc"]
+                    if "base_lrs" in scheduler_disc_state:
+                        saved_num_groups = len(scheduler_disc_state["base_lrs"])
+                        current_num_groups = len(opt_disc.param_groups)
+                        if saved_num_groups != current_num_groups:
+                            if rank == 0:
+                                logger.warning(
+                                    f"Discriminator scheduler param_groups mismatch: "
+                                    f"saved={saved_num_groups}, current={current_num_groups}. "
+                                    f"Skipping scheduler restore."
+                                )
+                        else:
+                            scheduler_disc.load_state_dict(scheduler_disc_state)
+                            if rank == 0:
+                                logger.info("Loaded discriminator scheduler state from checkpoint")
+                    else:
+                        scheduler_disc.load_state_dict(scheduler_disc_state)
+                        if rank == 0:
+                            logger.info("Loaded discriminator scheduler state from checkpoint")
                 except Exception as e:
                     if rank == 0:
                         logger.warning(f"Failed to load discriminator scheduler state: {e}")
         
         # 恢复 EMA 模型
-        if args.use_ema and ema_model is not None and "ema_model" in resume_ckpt:
-            try:
-                ema_model.load_state_dict(resume_ckpt["ema_model"])
+        # if args.use_ema and ema_model is not None and "ema_model" in resume_ckpt:
+        #     try:
+        #         ema_model.load_state_dict(resume_ckpt["ema_model"],strict=False)
+        #         if rank == 0:
+        #             logger.info("Loaded EMA model state from checkpoint")
+        #     except Exception as e:
+        #         if rank == 0:
+        #             logger.warning(f"Failed to load EMA model state: {e}")
+        
+        # 恢复 ref_model (no-lora 模式)
+        if ref_model is not None:
+            if "ref_model" in resume_ckpt:
+                try:
+                    ref_model.load_state_dict(resume_ckpt["ref_model"], strict=False)
+                    if rank == 0:
+                        logger.info("Loaded ref_model state from checkpoint")
+                except Exception as e:
+                    if rank == 0:
+                        logger.warning(f"Failed to load ref_model state: {e}, initializing from current model")
+                    # 如果恢复失败，从当前模型重新初始化
+                    model_inner = unwrap_model(model)
+                    ref_model.load_state_dict(model_inner.state_dict(), strict=False)
+            else:
+                # checkpoint 中没有 ref_model，从当前模型初始化
+                model_inner = unwrap_model(model)
+                ref_model.load_state_dict(model_inner.state_dict(), strict=False)
                 if rank == 0:
-                    logger.info("Loaded EMA model state from checkpoint")
-            except Exception as e:
-                if rank == 0:
-                    logger.warning(f"Failed to load EMA model state: {e}")
+                    logger.info("Initialized ref_model from current model (checkpoint had no ref_model)")
 
     # Loop
     if rank == 0:
@@ -1382,7 +1394,9 @@ def main():
                 else:
                     kl_loss = torch.tensor(0.0, device=device)
 
-                # VF loss: student (LoRA on) vs ref (LoRA off)
+                # VF loss: student vs ref
+                # - 如果使用 LoRA: student (LoRA on) vs ref (LoRA off，使用当前模型的 use_lora=False)
+                # - 如果 no-lora: student (当前模型) vs ref (ref_model)
                 # Stage 1: skip VF loss (only recon + GAN)
                 # Stage 2: enable VF loss
                 model_inner = unwrap_model(model)
@@ -1394,13 +1408,32 @@ def main():
                     loss_vf = torch.tensor(0.0, device=device)
                 else:
                     # Stage 2: compute VF loss
-                    z_feat = model_inner.encode_features(x, use_lora=True)  # [B,C,S,S]
-                    with torch.no_grad():
-                        f_feat = model_inner.encode_features(x, use_lora=False)
+                    if args.lora_rank > 0:
+                        # 使用 LoRA: student (LoRA on) vs ref (LoRA off)
+                        z_feat = model_inner.encode_features(x, use_lora=True)  # [B,C,S,S]
+                        with torch.no_grad():
+                            f_feat = model_inner.encode_features(x, use_lora=False)
+                    else:
+                        # no-lora: student (当前模型) vs ref (ref_model)
+                        z_feat = model_inner.encode_features(x, use_lora=True)  # [B,C,S,S]
+                        with torch.no_grad():
+                            if ref_model is not None:
+                                f_feat = ref_model.encode_features(x, use_lora=True)  # ref_model 没有 LoRA，但接口一致
+                            else:
+                                # fallback: 如果 ref_model 不存在，使用当前模型的 use_lora=False
+                                f_feat = model_inner.encode_features(x, use_lora=False)
+                    
                     vf_raw = model_inner.compute_vf_loss(z_feat, f_feat)
 
+                    # 对于 adaptive weight，使用当前模型的可训练参数
+                    if args.lora_rank > 0:
+                        vf_params = current_lora_params
+                    else:
+                        # no-lora 时，使用 decoder 参数
+                        vf_params = list(model_inner.decoder.parameters())
+                    
                     if model_inner.vf_use_adaptive_weight:
-                        w_adapt = model_inner.adaptive_weight(loss_rec, vf_raw, current_lora_params)
+                        w_adapt = model_inner.adaptive_weight(loss_rec, vf_raw, vf_params)
                     else:
                         w_adapt = torch.tensor(1.0, device=device)
                     w_adapt = torch.clamp(w_adapt, max=3.0)
@@ -1547,10 +1580,14 @@ def main():
                 # 保存 EMA 模型
                 if args.use_ema and ema_model is not None:
                     ckpt_state["ema_model"] = ema_model.state_dict()
+                # 保存 ref_model (no-lora 模式)
+                if ref_model is not None:
+                    ckpt_state["ref_model"] = ref_model.state_dict()
                 if use_gan and discriminator is not None:
                     disc_state = get_model_state_dict(discriminator)
                     ckpt_state["discriminator"] = disc_state
-                    ckpt_state["opt_disc"] = opt_disc.state_dict()
+                    if opt_disc is not None:
+                        ckpt_state["opt_disc"] = opt_disc.state_dict()
                     if scheduler_disc is not None:
                         ckpt_state["scheduler_disc"] = scheduler_disc.state_dict()
                 torch.save(ckpt_state, save_path)

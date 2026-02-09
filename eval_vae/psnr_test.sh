@@ -14,7 +14,7 @@ unset PET_MASTER_ADDR
 # VAE_CKPT="results_vae/dinov3_vit_decoder_xl/step_25000.pth"
 # VAE_CKPT="/cpfs01/huangxu/models/SAE/models/ema_vae.pth"
 # VAE_CKPT="results_vae/dinov3_vit_decoder_xl_noise_tau_0p8/step_70000.pth"
-VAE_CKPT="results_vae/dinov2_base_vit_decoder_GAN0p75/step_60000.pth"
+VAE_CKPT="results_vae/dinov2_base_vit_decoder_GAN0p75_VF0p75_tuned_layernorm/step_150000.pth"
 
 # torchrun --nproc_per_node=8 \
 #   --node_rank=0 \
@@ -30,7 +30,8 @@ VAE_CKPT="results_vae/dinov2_base_vit_decoder_GAN0p75/step_60000.pth"
 #   --output-dir eval_vae/dinov3_cnn_decoder_kl500 \
 #   --denormalize-output \
 #   --no-lora \
-#   --skip-to-moments
+#   --skip-to-moments \
+#   --use-ema
 
   # --vit-hidden-size 1024 \
   # --vit-num-layers 24 \
@@ -55,14 +56,17 @@ torchrun --nproc_per_node=8 \
   --vit-num-layers 24 \
   --vit-num-heads 16 \
   --vit-intermediate-size 4096 \
-  --image-size 224 \
-  --patch-size 14 \
+  --image-size 256 \
+  --patch-size 16 \
   --batch-size 64 \
   --max-images 50000 \
-  --output-dir eval_vae/dinov2_vit_decoder_xl \
+  --output-dir eval_vae/dinov2_vit_decoder_xl_GAN0p75_VF0p75_150000 \
   --denormalize-output \
   --lora-rank 256 \
-  --lora-alpha 256
+  --lora-alpha 256 \
+  --use-ema \
+  --save-images \
+  --skip-to-moments
 
 # ==========================================
 # Example 3: DINOv3 + CNN Decoder (original)
@@ -82,4 +86,5 @@ torchrun --nproc_per_node=8 \
 #   --max-images 50000 \
 #   --output-dir eval_vae/dinov3_cnn_decoder \
 #   --lora-rank 256 \
-#   --lora-alpha 256
+#   --lora-alpha 256 \
+#   --use-ema

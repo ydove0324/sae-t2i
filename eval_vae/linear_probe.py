@@ -28,43 +28,9 @@ sys.path.append(".")
 # 导入 VAE 工具函数
 from models.rae.utils.vae_utils import load_vae, get_normalize_fn
 
-
-# ==========================================
-#              Helper Functions
-# ==========================================
-
-def setup_ddp():
-    if "LOCAL_RANK" not in os.environ:
-        # Fallback for single GPU run
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12345"
-        
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    return local_rank
-
-
-def cleanup_ddp():
-    dist.destroy_process_group()
-
-
-def center_crop_arr(pil_image, image_size):
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+# 导入统一工具模块
+from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp
+from models.rae.utils.image_utils import center_crop_arr
 
 
 # ==========================================
@@ -351,9 +317,7 @@ def main():
     args = parser.parse_args()
 
     # 1. 初始化 DDP
-    local_rank = setup_ddp()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank, local_rank, world_size = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
 
     torch.manual_seed(args.seed + rank)

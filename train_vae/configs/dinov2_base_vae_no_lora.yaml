@@ -65,8 +65,8 @@ vae:
 # =================== LoRA 配置 ===================
 lora:
   enabled: true   # 启用 LoRA (Stage 2 生效)
-  rank: 256
-  alpha: 256
+  rank: 0
+  alpha: 0
   dropout: 0.0
 
 # =================== Loss 配置 ===================
@@ -81,7 +81,7 @@ loss:
   # VF (Visual Feature) 损失 - 特征对齐 (Stage 2 启用)
   vf:
     enabled: true
-    weight: 1
+    weight: 0.75
     margin_cos: 0.1
     margin_dms: 0.1
     max_tokens: 256
@@ -124,7 +124,7 @@ optimizer:
 
 # =================== 训练配置 ===================
 training:
-  max_steps: 150000       # ~40 epochs (@ bs=512, 2500 steps/epoch)
+  max_steps: 120000       # ~40 epochs (@ bs=512, 2500 steps/epoch)
   precision: "bf16"
   fsdp_size: 1
   # 两阶段训练:
@@ -140,7 +140,7 @@ ema:
 
 # =================== 日志和检查点 ===================
 logging:
-  output_dir: "results_vae/dinov2_base_vit_decoder_GAN0p75_VF0p75_tuned_layernorm"
+  output_dir: "results_vae/dinov2_base_vit_decoder_GAN0p75_VF0p75_layernorm"
   log_every: 10
   eval_every: 2000
   save_every: 5000
@@ -149,5 +149,4 @@ logging:
 
 # =================== 可选: 从检查点恢复 ===================
 checkpoint:
-  vae_ckpt: "results_vae/dinov2_base_vit_decoder_GAN0p75_VF0p75_tuned_layernorm/step_102000.pth"
-  # no_resume_optimizer: true  # 是否不恢复 optimizer 状态（使用全新 optimizer）
+  vae_ckpt: ""

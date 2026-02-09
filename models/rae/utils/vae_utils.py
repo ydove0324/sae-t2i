@@ -1,9 +1,20 @@
 """
 VAE utility functions for loading and using DINOv3/SigLIP2/DINOv2 VAE models.
 Supports both CNN decoder and diffusion decoder.
+
+包含:
+- Latent 归一化/反归一化
+- VAE 模型加载
+- 从 latent 重建图像
+- Encoder 配置获取
+- 从命令行参数构建 VAE
+
+统一了 train_vae, eval_vae, projects/rae 中的重复代码
 """
 
 import os
+import argparse
+from typing import Dict, Any, Optional, Tuple, Union, Callable
 import numpy as np
 import torch
 import torch.nn as nn
@@ -426,6 +437,298 @@ def load_vae(
     vae.eval()
     requires_grad(vae, False)
     return vae
+
+
+# ==========================================
+#           Reconstruction
+# ==========================================
+
+# ==========================================
+#           Encoder 配置
+# ==========================================
+
+# 各 encoder 类型的默认配置
+ENCODER_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "dinov3": {
+        "latent_channels": 1280,
+        "patch_size": 16,
+        "dec_block_out_channels": (1280, 1024, 512, 256, 128),
+        "default_model_dir": "/cpfs01/huangxu/models/dinov3",
+        "model_key": "dinov3_model_dir",
+    },
+    "dinov3_vitl": {
+        "latent_channels": 1024,
+        "patch_size": 16,
+        "dec_block_out_channels": (1024, 768, 512, 256, 128),
+        "default_model_dir": "/cpfs01/huangxu/models/dinov3",
+        "model_key": "dinov3_model_dir",
+    },
+    "siglip2": {
+        "latent_channels": 768,
+        "patch_size": 16,
+        "dec_block_out_channels": (768, 512, 256, 128, 64),
+        "default_model_name": "google/siglip2-base-patch16-256",
+        "model_key": "siglip2_model_name",
+    },
+    "dinov2": {
+        "latent_channels": 768,
+        "patch_size": 14,
+        "dec_block_out_channels": (768, 512, 256, 128, 64),
+        "default_model_name": "facebook/dinov2-with-registers-base",
+        "model_key": "dinov2_model_name",
+    },
+}
+
+
+def get_encoder_config(encoder_type: str) -> Dict[str, Any]:
+    """
+    获取 encoder 类型的默认配置。
+    
+    Args:
+        encoder_type: encoder 类型 ('dinov3', 'dinov3_vitl', 'siglip2', 'dinov2')
+    
+    Returns:
+        配置字典，包含:
+        - latent_channels: 潜在空间通道数
+        - patch_size: patch 大小
+        - dec_block_out_channels: 默认 decoder block channels
+        - default_model_dir/default_model_name: 默认模型路径
+        - model_key: 模型路径参数名
+    
+    Example:
+        >>> config = get_encoder_config("dinov3")
+        >>> print(config["latent_channels"])
+        1280
+    """
+    if encoder_type not in ENCODER_CONFIGS:
+        raise ValueError(
+            f"Unknown encoder_type: {encoder_type}. "
+            f"Supported: {list(ENCODER_CONFIGS.keys())}"
+        )
+    return ENCODER_CONFIGS[encoder_type].copy()
+
+
+def get_latent_channels(encoder_type: str) -> int:
+    """获取 encoder 类型的 latent channels。"""
+    return get_encoder_config(encoder_type)["latent_channels"]
+
+
+def get_patch_size(encoder_type: str) -> int:
+    """获取 encoder 类型的 patch size。"""
+    return get_encoder_config(encoder_type)["patch_size"]
+
+
+def get_dec_block_out_channels(encoder_type: str) -> Tuple[int, ...]:
+    """获取 encoder 类型对应的默认 decoder block channels。"""
+    return get_encoder_config(encoder_type)["dec_block_out_channels"]
+
+
+# ==========================================
+#           从参数构建 VAE
+# ==========================================
+
+def build_vae_model_params(
+    encoder_type: str,
+    image_size: int = 256,
+    decoder_type: str = "cnn_decoder",
+    lora_rank: int = 256,
+    lora_alpha: int = 256,
+    lora_dropout: float = 0.0,
+    # ViT decoder 参数
+    vit_hidden_size: int = 1024,
+    vit_num_layers: int = 24,
+    vit_num_heads: int = 16,
+    vit_intermediate_size: int = 4096,
+    # 其他参数
+    dec_block_out_channels: Tuple[int, ...] = None,
+    dec_layers_per_block: int = 3,
+    decoder_dropout: float = 0.0,
+    gradient_checkpointing: bool = False,
+    denormalize_decoder_output: bool = False,
+    skip_to_moments: bool = False,
+    # 模型路径
+    dinov3_dir: str = None,
+    siglip2_model_name: str = None,
+    dinov2_model_name: str = None,
+) -> Dict[str, Any]:
+    """
+    构建 VAE 模型参数字典。
+    
+    根据 encoder_type 自动推断 latent_channels、patch_size 等参数，
+    简化了多处重复的参数构建逻辑。
+    
+    Args:
+        encoder_type: encoder 类型
+        image_size: 输入图像尺寸
+        decoder_type: decoder 类型
+        lora_rank: LoRA rank (0 表示不使用 LoRA)
+        lora_alpha: LoRA alpha
+        lora_dropout: LoRA dropout
+        vit_hidden_size: ViT decoder hidden size
+        vit_num_layers: ViT decoder num layers
+        vit_num_heads: ViT decoder num heads
+        vit_intermediate_size: ViT decoder intermediate size
+        dec_block_out_channels: 自定义 decoder block channels (None 使用默认)
+        dec_layers_per_block: decoder layers per block
+        decoder_dropout: decoder dropout
+        gradient_checkpointing: 是否使用 gradient checkpointing
+        denormalize_decoder_output: 是否反归一化 decoder 输出
+        skip_to_moments: 是否跳过 to_moments 层
+        dinov3_dir: DINOv3 模型目录
+        siglip2_model_name: SigLIP2 模型名
+        dinov2_model_name: DINOv2 模型名
+    
+    Returns:
+        VAE 模型参数字典
+    """
+    config = get_encoder_config(encoder_type)
+    latent_channels = config["latent_channels"]
+    patch_size = config["patch_size"]
+    
+    # 使用默认或自定义的 decoder channels
+    if dec_block_out_channels is None:
+        dec_block_out_channels = config["dec_block_out_channels"]
+    
+    # 基础参数
+    model_params = {
+        "encoder_type": encoder_type,
+        "image_size": image_size,
+        "patch_size": patch_size,
+        "out_channels": 3,
+        "latent_channels": latent_channels,
+        "target_latent_channels": None,
+        "spatial_downsample_factor": patch_size,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "decoder_dropout": decoder_dropout,
+        "gradient_checkpointing": gradient_checkpointing,
+        "denormalize_decoder_output": denormalize_decoder_output,
+        "skip_to_moments": skip_to_moments,
+    }
+    
+    # Decoder 类型特定参数
+    if decoder_type in ["cnn_decoder", "vit_decoder"]:
+        model_params["decoder_type"] = decoder_type
+        
+        if decoder_type == "cnn_decoder":
+            model_params["dec_block_out_channels"] = dec_block_out_channels
+            model_params["dec_layers_per_block"] = dec_layers_per_block
+        elif decoder_type == "vit_decoder":
+            model_params["vit_decoder_hidden_size"] = vit_hidden_size
+            model_params["vit_decoder_num_layers"] = vit_num_layers
+            model_params["vit_decoder_num_heads"] = vit_num_heads
+            model_params["vit_decoder_intermediate_size"] = vit_intermediate_size
+    
+    # Encoder 模型路径
+    if encoder_type in ["dinov3", "dinov3_vitl"]:
+        model_params["dinov3_model_dir"] = (
+            dinov3_dir or config.get("default_model_dir", "/cpfs01/huangxu/models/dinov3")
+        )
+    elif encoder_type == "siglip2":
+        model_params["siglip2_model_name"] = (
+            siglip2_model_name or config.get("default_model_name", "google/siglip2-base-patch16-256")
+        )
+    elif encoder_type == "dinov2":
+        model_params["dinov2_model_name"] = (
+            dinov2_model_name or config.get("default_model_name", "facebook/dinov2-with-registers-base")
+        )
+    
+    return model_params
+
+
+def build_vae_from_args(
+    args: argparse.Namespace,
+    device: torch.device,
+    verbose: bool = True,
+) -> nn.Module:
+    """
+    从命令行参数构建并加载 VAE 模型。
+    
+    这是一个便捷函数，整合了参数解析、模型构建和权重加载。
+    
+    Args:
+        args: 解析后的命令行参数，应包含以下属性:
+            - vae_ckpt: VAE checkpoint 路径
+            - encoder_type: encoder 类型
+            - decoder_type: decoder 类型
+            - image_size: 图像尺寸
+            - lora_rank, lora_alpha: LoRA 参数
+            - vit_hidden_size, vit_num_layers 等: ViT decoder 参数
+            - skip_to_moments, denormalize_decoder_output 等
+        device: 设备
+        verbose: 是否打印加载信息
+    
+    Returns:
+        加载好的 VAE 模型
+    
+    Example:
+        >>> parser = argparse.ArgumentParser()
+        >>> add_all_vae_args(parser)  # from argparse_utils
+        >>> args = parser.parse_args()
+        >>> vae = build_vae_from_args(args, device)
+    """
+    # 从 args 获取参数（带默认值）
+    encoder_type = getattr(args, 'encoder_type', 'dinov3')
+    decoder_type = getattr(args, 'decoder_type', 'cnn_decoder')
+    image_size = getattr(args, 'image_size', 256)
+    
+    # LoRA 参数
+    lora_rank = getattr(args, 'lora_rank', 256)
+    lora_alpha = getattr(args, 'lora_alpha', 256)
+    if getattr(args, 'no_lora', False):
+        lora_rank = 0
+        lora_alpha = 0
+    
+    # ViT decoder 参数
+    vit_hidden_size = getattr(args, 'vit_hidden_size', 1024)
+    vit_num_layers = getattr(args, 'vit_num_layers', 24)
+    vit_num_heads = getattr(args, 'vit_num_heads', 16)
+    vit_intermediate_size = getattr(args, 'vit_intermediate_size', 4096)
+    
+    # 其他参数
+    skip_to_moments = getattr(args, 'skip_to_moments', False)
+    denormalize_decoder_output = getattr(args, 'denormalize_decoder_output', False)
+    use_ema = getattr(args, 'vae_use_ema', False) or getattr(args, 'use_ema', False)
+    
+    # 模型路径
+    dinov3_dir = getattr(args, 'dinov3_dir', None)
+    siglip2_model_name = getattr(args, 'siglip2_model_name', None)
+    dinov2_model_name = getattr(args, 'dinov2_model_name', None)
+    
+    # 构建模型参数
+    model_params = build_vae_model_params(
+        encoder_type=encoder_type,
+        image_size=image_size,
+        decoder_type=decoder_type,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        vit_hidden_size=vit_hidden_size,
+        vit_num_layers=vit_num_layers,
+        vit_num_heads=vit_num_heads,
+        vit_intermediate_size=vit_intermediate_size,
+        skip_to_moments=skip_to_moments,
+        denormalize_decoder_output=denormalize_decoder_output,
+        dinov3_dir=dinov3_dir,
+        siglip2_model_name=siglip2_model_name,
+        dinov2_model_name=dinov2_model_name,
+    )
+    
+    # 加载 VAE
+    vae_ckpt = getattr(args, 'vae_ckpt', None)
+    if vae_ckpt is None:
+        raise ValueError("vae_ckpt is required but not provided in args")
+    
+    return load_vae(
+        vae_checkpoint_path=vae_ckpt,
+        device=device,
+        encoder_type=encoder_type,
+        decoder_type=decoder_type,
+        model_params=model_params,
+        verbose=verbose,
+        skip_to_moments=skip_to_moments,
+        use_ema=use_ema,
+    )
 
 
 # ==========================================

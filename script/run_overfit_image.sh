@@ -32,17 +32,18 @@ export OMP_NUM_THREADS=4
 # echo "  MASTER_PORT=$MASTER_PORT"
 # VAE_CKPT="/share/project/huangxu/models/SAE/diffusion_decoder/kl100/vae.pth"
 # VAE_CKPT="/cpfs01/huangxu/models/SAE/ema_vae.pth"
-VAE_CKPT="results_vae/siglip2_default_v3/step_110000.pth"
+# VAE_CKPT="results_vae/siglip2_default_v3/step_110000.pth"
+VAE_CKPT="results_vae/dinov2_base_vit_decoder_GAN0p75_VF0p75/step_90000.pth"
 
 torchrun --nnodes=1 --node_rank=0 \
   --nproc-per-node=1 \
   --master_addr="localhost" \
   --master_port=19291 \
   projects/rae/train_overfit.py \
-  --config projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_SIGLIP_768.yaml \
+  --config projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv2-B.yaml \
   --data-path /cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/ \
   --vae-ckpt $VAE_CKPT \
-  --results-dir ./result_dit/overfit_siglip2_v3_110000 \
+  --results-dir ./result_dit/overfit_dinov2_GAN0p75_VF0p75_90000 \
   --precision bf16 \
   --image-size 256 \
   --global-batch-size 1 \
@@ -50,9 +51,11 @@ torchrun --nnodes=1 --node_rank=0 \
   --dataset-type overfit_single_image \
   --overfit-image-path overfit_image.png \
   --fsdp-size 1 \
-  --encoder-type siglip2 \
-  --dinov3-dir /cpfs01/huangxu/models/dinov3 \
-  --siglip2-model-name /cpfs01/huangxu/models/siglip2 \
+  --encoder-type dinov2 \
+  --dinov2-model-name /cpfs01/huangxu/models/dinov2-register-base \
+  --decoder-type vit_decoder \
+  --latent-stats-path results/latent_stats_dinov2/latent_stats.npz \
+  --per-channel-norm \
   # --no-lora \
   # --skip-to-moments \
   # --ema-cpu

@@ -26,26 +26,13 @@ from collections import defaultdict
 import argparse
 
 
+# 导入统一工具模块
+from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp as cleanup, create_logger, requires_grad, update_ema
+from models.rae.utils.image_utils import center_crop_arr
+
 #################################################################################
 #                              Timing Profiler                                  #
 #################################################################################
-
-def setup_ddp():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl")
-        rank = int(os.environ["RANK"])
-        local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(local_rank)
-        print(f"Rank: {rank}, Local Rank: {local_rank}, World Size: {world_size}")
-        return rank, local_rank, world_size
-    else:
-        os.environ["RANK"] = "0"
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(0)
-        return 0, 0, 1
 
 class TrainingProfiler:
     """
@@ -172,72 +159,6 @@ except ImportError:
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
-
-@torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
-    """
-    Step the EMA model towards the current model.
-    """
-    ema_params = OrderedDict(ema_model.named_parameters())
-    model_params = OrderedDict(model.named_parameters())
-
-    for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
-
-
-def requires_grad(model, flag=True):
-    """
-    Set requires_grad flag for all parameters in a model.
-    """
-    for p in model.parameters():
-        p.requires_grad = flag
-
-
-def cleanup():
-    """
-    End DDP training.
-    """
-    dist.destroy_process_group()
-
-
-def create_logger(logging_dir):
-    """
-    Create a logger that writes to a log file and stdout.
-    """
-    if dist.get_rank() == 0:  # real logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-        )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
 #################################################################################
@@ -637,26 +558,6 @@ def stage2_sample_and_reconstruct(
     return img, z0_hat
 
 
-def center_crop_arr(pil_image, image_size):
-    """
-    Center cropping implementation from ADM.
-    """
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
-
-
 def main(args):
     """Trains a new SiT model using config-driven hyperparameters + DINO VAE."""
     if not torch.cuda.is_available():
@@ -773,7 +674,7 @@ def main(args):
         checkpoint_dir = os.path.join(args.results_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, rank=0)
         logger.info(f"Experiment directory created at {experiment_dir}")
 
         tb_dir = os.path.join(experiment_dir, "tensorboard")
@@ -787,7 +688,7 @@ def main(args):
     else:
         experiment_dir = None
         checkpoint_dir = None
-        logger = create_logger(None)
+        logger = create_logger(None, rank=rank)
         writer = None
 
     # ---------------- load VAE (DINOv3, SigLIP2, or DINOv2) ----------------
@@ -996,7 +897,7 @@ def main(args):
             profiler.start("vae_encode")
             with torch.no_grad(), autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 x_latent, _p = dinov3_vae.encode(x_img)
-                x_latent = normalize_fn(x_latent)
+                # x_latent = normalize_fn(x_latent)
             profiler.stop("vae_encode")
 
             # CFG label dropout
@@ -1131,7 +1032,11 @@ def main(args):
 
                     # 3) noisy latent 可视化（按你原代码）
                     # x_latent 是 z0，t_sample/noise 是 compute_train_loss 里生成的
+                    # t_sample[0] = 0
+                    # print("x_latent.min(), x_latent.max(),x_latent.norm()", x_latent.min(), x_latent.max(),x_latent.norm())
                     x_latent_sample = (x_latent[0:1] * (1 - t_sample[0]) + noise[0:1] * t_sample[0]).float()  # Ensure FP32
+                    # print("x_latent_sample.min(), x_latent_sample.max(),x_latent_sample.norm()", x_latent_sample.min(), x_latent_sample.max(),x_latent_sample.norm())
+                    # print("noise.min(), noise.max(),noise.norm()", noise.min(), noise.max(),noise.norm())
                     x_recon = reconstruct_from_latent_with_diffusion(
                         vae=dinov3_vae,
                         latent_z=x_latent_sample,
@@ -1144,6 +1049,7 @@ def main(args):
 
                     recon_img = (recon + 1.0) / 2.0
                     x_recon_img = (x_recon + 1.0) / 2.0
+                    x_img = (x_img + 1.0) / 2.0
                     # recon_img = recon.clamp(0, 1)
                     # x_recon_img = x_recon.clamp(0, 1)
 
@@ -1157,6 +1063,10 @@ def main(args):
                     save_image(
                         recon_img,
                         os.path.join(vis_dir, f"recon_step_{train_steps:07d}_{int(t_sample[0] * 1000)}.png"),
+                    )
+                    save_image(
+                        x_img[0:1],
+                        os.path.join(vis_dir, f"img_step_{train_steps:07d}_{int(t_sample[0] * 1000)}.png"),
                     )
 
                     # 4) GT：只有当 dataset miss 才会给 img；命中缓存时 img 是 None

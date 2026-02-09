@@ -57,7 +57,7 @@ torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
   --fid-batch-size 128 \
   --no-lora \
   --skip-to-moments \
-  --ckpt result_dit/result_kl500_vae/checkpoints/0660000.pt
+  --ckpt result_dit/result_kl500_vae/checkpoints/0700000.pt
   # --ckpt result_dit/result_kl500_vae/checkpoints/latest.pt
 #   --ckpt result_dit/result_vfloss_vae/checkpoints/latest.pt
   # --ckpt ./result_cfg_v8/checkpoints/latest.pt

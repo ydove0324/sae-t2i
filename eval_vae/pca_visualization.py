@@ -211,7 +211,7 @@ def main():
         decoder_type="cnn_decoder",
         model_params=vae_model_params,
         verbose=True,
-        skip_to_moments=False,
+        skip_to_moments=True,
     )
     vae.eval()
     

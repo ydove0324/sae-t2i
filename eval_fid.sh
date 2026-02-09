@@ -22,9 +22,9 @@ torchrun --nnodes=$NUM_NODES --node_rank=$NODE_RANK \
     --master_port=$MASTER_PORT \
     inference_ddp.py \
     --config "projects/rae/configs/stage2/training/ImageNet256/DiTDH-XL_DINOv3_1536.yaml" \
-    --ckpt "result_dit/result_kl500_vae/checkpoints/0600000.pt" \
+    --ckpt "result_dit/result_kl500_vae/checkpoints/0700000.pt" \
     --vae-ckpt $VAE_CKPT \
-    --out "result_dit/kl500_vit_decoder_GAN0p75_noise_tau_0p8_600000.pt" \
+    --out "result_dit/kl500_vit_decoder_GAN0p75_700000.pt" \
     --samples-per-class 50 \
     --batch-size 32 \
     --stage2-steps 50 \

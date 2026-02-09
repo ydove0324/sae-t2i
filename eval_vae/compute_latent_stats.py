@@ -27,43 +27,9 @@ sys.path.append(".")
 # 导入 VAE 工具函数
 from models.rae.utils.vae_utils import load_vae, get_normalize_fn
 
-
-# ==========================================
-#              Helper Functions
-# ==========================================
-
-def setup_ddp():
-    if "LOCAL_RANK" not in os.environ:
-        # Fallback for single GPU run
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
-        
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    return local_rank
-
-
-def cleanup_ddp():
-    dist.destroy_process_group()
-
-
-def center_crop_arr(pil_image, image_size):
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+# 导入统一工具模块
+from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp
+from models.rae.utils.image_utils import center_crop_arr
 
 
 # ==========================================
@@ -163,11 +129,21 @@ def main():
     
     # VAE
     parser.add_argument("--vae-ckpt", type=str, required=True, help="Path to VAE checkpoint.")
-    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "dinov3_vitl", "siglip2"])
+    parser.add_argument("--encoder-type", type=str, default="dinov3", 
+                        choices=["dinov3", "dinov3_vitl", "siglip2", "dinov2"])
+    parser.add_argument("--decoder-type", type=str, default="cnn_decoder",
+                        choices=["cnn_decoder", "vit_decoder"])
     parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3")
     parser.add_argument("--siglip2-model-name", type=str, default="/cpfs01/huangxu/models/siglip2")
+    parser.add_argument("--dinov2-model-name", type=str, default="/cpfs01/huangxu/models/dinov2-register-base")
     parser.add_argument("--lora-rank", type=int, default=256)
     parser.add_argument("--lora-alpha", type=int, default=256)
+    
+    # ViT decoder parameters (only used when decoder-type="vit_decoder")
+    parser.add_argument("--vit-hidden-size", type=int, default=1024, help="ViT decoder hidden size (XL:1024, L:768, B:512)")
+    parser.add_argument("--vit-num-layers", type=int, default=24, help="ViT decoder num layers (XL:24, L:16, B:8)")
+    parser.add_argument("--vit-num-heads", type=int, default=16, help="ViT decoder num heads (XL:16, L:12, B:8)")
+    parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size (XL:4096, L:3072, B:2048)")
     
     # Processing
     parser.add_argument("--batch-size", type=int, default=64)
@@ -183,9 +159,7 @@ def main():
     args = parser.parse_args()
 
     # 1. Initialize DDP
-    local_rank = setup_ddp()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank, local_rank, world_size = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
 
     # Set seed
@@ -200,6 +174,7 @@ def main():
         print(" Computing Latent Statistics for VAE Encoder")
         print("=" * 60)
         print(f" Encoder:     {args.encoder_type}")
+        print(f" Decoder:     {args.decoder_type}")
         print(f" VAE Ckpt:    {args.vae_ckpt}")
         print(f" Num Samples: {args.num_samples}")
         print(f" Use LoRA:    {args.use_lora}")
@@ -212,43 +187,65 @@ def main():
     if rank == 0:
         print("\nLoading VAE...")
     
+    # 根据 encoder_type 设置 latent_channels 和 decoder 参数
     if args.encoder_type == "dinov3":
         latent_channels = 1280
         dec_block_out_channels = (1280, 1024, 512, 256, 128)
+        default_patch_size = 16
     elif args.encoder_type == "dinov3_vitl":
         latent_channels = 1024
         dec_block_out_channels = (1024, 768, 512, 256, 128)
-    else:  # siglip2
+        default_patch_size = 16
+    elif args.encoder_type == "siglip2":
         latent_channels = 768
         dec_block_out_channels = (768, 512, 256, 128, 64)
+        default_patch_size = 16
+    elif args.encoder_type == "dinov2":
+        latent_channels = 768
+        dec_block_out_channels = (768, 512, 256, 128, 64)
+        # DINOv2 encoder uses patch_size=14, but decoder uses patch_size=16
+        default_patch_size = 16
+    else:
+        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
     
     vae_model_params = {
         "encoder_type": args.encoder_type,
         "image_size": args.image_size,
-        "patch_size": 16,
+        "patch_size": default_patch_size,
         "out_channels": 3,
         "latent_channels": latent_channels,
         "target_latent_channels": None,
-        "spatial_downsample_factor": 16,
+        "spatial_downsample_factor": default_patch_size,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
-        "dec_block_out_channels": dec_block_out_channels,
-        "dec_layers_per_block": 3,
         "decoder_dropout": 0.0,
         "gradient_checkpointing": False,
         "denormalize_decoder_output": False,
     }
     
+    # 根据 decoder_type 添加特定参数
+    if args.decoder_type == "cnn_decoder":
+        vae_model_params["dec_block_out_channels"] = dec_block_out_channels
+        vae_model_params["dec_layers_per_block"] = 3
+    elif args.decoder_type == "vit_decoder":
+        vae_model_params["vit_decoder_hidden_size"] = args.vit_hidden_size
+        vae_model_params["vit_decoder_num_layers"] = args.vit_num_layers
+        vae_model_params["vit_decoder_num_heads"] = args.vit_num_heads
+        vae_model_params["vit_decoder_intermediate_size"] = args.vit_intermediate_size
+    
+    # 根据 encoder_type 添加模型路径参数
     if args.encoder_type == "dinov3" or args.encoder_type == "dinov3_vitl":
         vae_model_params["dinov3_model_dir"] = args.dinov3_dir
     elif args.encoder_type == "siglip2":
         vae_model_params["siglip2_model_name"] = args.siglip2_model_name
+    elif args.encoder_type == "dinov2":
+        vae_model_params["dinov2_model_name"] = args.dinov2_model_name
     
     vae = load_vae(
         args.vae_ckpt,
         device,
         encoder_type=args.encoder_type,
-        decoder_type="cnn_decoder",
+        decoder_type=args.decoder_type,
         model_params=vae_model_params,
         verbose=(rank == 0),
     )
@@ -295,7 +292,16 @@ def main():
         print("\nComputing statistics...")
     
     # Initialize running stats
-    spatial_size = args.image_size // 16
+    # Note: For DINOv2, 256x256 input is resized to 224x224, then patch_size=14 -> 16x16 patches
+    # For other encoders (dinov3/siglip2), 256x256 input with patch_size=16 -> 16x16 patches
+    if args.encoder_type == "dinov2":
+        # DINOv2: resize 256 -> 224, then patch_size=14
+        effective_image_size = 224 if args.image_size == 256 else args.image_size
+        encoder_patch_size = 14
+    else:
+        effective_image_size = args.image_size
+        encoder_patch_size = 16
+    spatial_size = effective_image_size // encoder_patch_size
     stats = RunningStats(shape=(latent_channels,), device=device)
     
     # Also track min/max for debugging
@@ -414,6 +420,7 @@ def main():
         # Save as YAML (easier to read and use in configs)
         stats_dict = {
             "encoder_type": args.encoder_type,
+            "decoder_type": args.decoder_type,
             "vae_checkpoint": args.vae_ckpt,
             "use_lora": args.use_lora,
             "num_samples": int(combined_n / (spatial_size ** 2)),

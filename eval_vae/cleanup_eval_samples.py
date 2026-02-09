@@ -9,13 +9,14 @@
 import os
 import re
 import shutil
+import glob
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple, List
 import time
 
 # 配置
-TARGET_DIR = "result_dit/result_kl500_vae/eval_samples"
+TARGET_DIR = "result_dit/*/eval_samples"
 NUM_WORKERS = 256  # 多线程数量
 MIN_STEP = 500000  # 最小保留步数
 STEP_INTERVAL = 100000  # 步数间隔（100000 的倍数）
@@ -73,16 +74,20 @@ def delete_directory(dir_path: Path) -> Tuple[bool, int, str]:
 
 
 def main():
-    target_path = Path(TARGET_DIR)
+    # 使用 glob 查找所有匹配的目录
+    target_dirs = [Path(p) for p in glob.glob(TARGET_DIR)]
     
-    if not target_path.exists():
-        print(f"Error: {TARGET_DIR} does not exist!")
+    if not target_dirs:
+        print(f"Error: 没有找到匹配 {TARGET_DIR} 的目录!")
         return
     
     print("=" * 70)
     print(" 清理 eval_samples 下的 step 目录")
     print("=" * 70)
-    print(f" 目标目录: {target_path.absolute()}")
+    print(f" 目标目录模式: {TARGET_DIR}")
+    print(f" 找到 {len(target_dirs)} 个匹配的目录:")
+    for td in target_dirs:
+        print(f"   - {td.absolute()}")
     print(f" 删除规则:")
     print(f"   - 删除 step_0xxxxx_xxx 格式的目录")
     print(f"   - 删除条件：步数 < {MIN_STEP} 且不是 {STEP_INTERVAL} 的倍数")
@@ -92,11 +97,15 @@ def main():
     
     # 查找所有 step_* 目录
     step_dirs = []
-    for item in target_path.iterdir():
-        if item.is_dir() and item.name.startswith("step_"):
-            name = item.name
-            if not should_keep_step_dir(name):
-                step_dirs.append(item)
+    for target_path in target_dirs:
+        if not target_path.exists():
+            print(f"  Warning: {target_path} 不存在，跳过")
+            continue
+        for item in target_path.iterdir():
+            if item.is_dir() and item.name.startswith("step_"):
+                name = item.name
+                if not should_keep_step_dir(name):
+                    step_dirs.append(item)
     
     if not step_dirs:
         print("\n没有需要删除的目录！")
@@ -141,15 +150,18 @@ def main():
     
     # 可选：保存删除的目录列表
     if all_deleted_paths:
-        log_file = target_path.parent / "cleanup_eval_samples_log.txt"
+        # 保存日志到当前工作目录
+        log_file = Path("cleanup_eval_samples_log.txt")
         with open(log_file, "w") as f:
             f.write(f"清理时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"目标目录模式: {TARGET_DIR}\n")
+            f.write(f"匹配的目录数: {len(target_dirs)}\n")
             f.write(f"删除目录数: {total_deleted_count}\n")
             f.write(f"删除大小: {total_deleted_size / (1024 ** 3):.2f} GB\n\n")
             f.write("删除的目录列表:\n")
             for path in sorted(all_deleted_paths):
                 f.write(f"{path}\n")
-        print(f"\n删除日志已保存到: {log_file}")
+        print(f"\n删除日志已保存到: {log_file.absolute()}")
 
 
 if __name__ == "__main__":

@@ -1404,7 +1404,7 @@ class AutoencoderKL(nn.Module):
 
     def encode(self, x: torch.Tensor, sample_posterior: bool | None = None) -> CausalEncoderOutput:
         feat = self.encode_features(x, use_lora=True)  # [B,1280,S,S]
-
+        # print("feat.norm: , feat.shape: ", feat.norm(), feat.shape)
         # extra downsample
         for conv in self.latent_downsample_layers:
             feat = conv(feat)
@@ -1433,9 +1433,10 @@ class AutoencoderKL(nn.Module):
 
         if self.random_masking_channel_ratio > 0.0:
             z, _ = mask_channels(z, mask_ratio=self.random_masking_channel_ratio, channel_dim=1)
-
+        # self.noise_tau = 0.8            ## JUST FOR TESTING!!!!
         if self.training and self.noise_tau > 0:
             z = self._noising(z)
+        # z = self._noising(z)
 
         return CausalEncoderOutput(latent=z, posterior=posterior)
     
@@ -1457,5 +1458,7 @@ class AutoencoderKL(nn.Module):
 
     def forward(self, x: torch.Tensor) -> CausalAutoencoderOutput:
         enc = self.encode(x)
+        # self.noise_tau = 0.8            ## JUST FOR TESTING!!!!
+        # enc.latent = self._noising(enc.latent)
         dec = self.decode(enc.latent)
         return CausalAutoencoderOutput(dec.sample, enc.latent, enc.posterior)

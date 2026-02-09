@@ -16,75 +16,25 @@ from torchvision.datasets import ImageFolder
 from torchvision.utils import save_image
 from torch.utils.data import Dataset
 
-# 设置 torch 缓存路径 (可选)
-
 # 添加当前目录以导入项目模块
 sys.path.append(".")
 
 # 导入 VAE 工具函数
 from models.rae.utils.vae_utils import (
     load_vae,
-    normalize_sae,
-    denormalize_sae,
+    get_normalize_fn,
     reconstruct_from_latent_with_diffusion,
 )
 
+# 导入统一工具模块
+from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp
+from models.rae.utils.image_utils import center_crop_arr
+from models.rae.utils.metrics_utils import calculate_batch_psnr, is_fid_available
+
 # 尝试导入 pytorch-fid
-try:
+HAS_FID = is_fid_available()
+if HAS_FID:
     from pytorch_fid import fid_score
-    HAS_FID = True
-except ImportError:
-    HAS_FID = False
-    
-# ==========================================
-#              Helper Functions
-# ==========================================
-
-def setup_ddp():
-    if "LOCAL_RANK" not in os.environ:
-        # Fallback for single GPU run
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12345"
-        
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    return local_rank
-
-def cleanup_ddp():
-    dist.destroy_process_group()
-
-def center_crop_arr(pil_image, image_size):
-    while min(*pil_image.size) >= 2 * image_size:
-        pil_image = pil_image.resize(
-            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
-        )
-    scale = image_size / min(*pil_image.size)
-    pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
-    )
-    arr = np.array(pil_image)
-    crop_y = (arr.shape[0] - image_size) // 2
-    crop_x = (arr.shape[1] - image_size) // 2
-    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
-
-def calculate_batch_psnr(img1, img2):
-    """
-    img1, img2: Tensor [-1, 1]
-    Return: (sum_psnr, count)
-    """
-    img1 = (img1 + 1.0) / 2.0
-    img2 = (img2 + 1.0) / 2.0
-    img1 = torch.clamp(img1, 0, 1)
-    img2 = torch.clamp(img2, 0, 1)
-
-    mse = torch.mean((img1 - img2) ** 2, dim=[1, 2, 3])
-    mse = torch.clamp(mse, min=1e-10)
-    psnr = 10 * torch.log10(1.0 / mse)
-    return psnr.sum().item(), psnr.shape[0]
 
 # ==========================================
 #                   Main
@@ -109,6 +59,7 @@ def main():
     parser.add_argument("--no-lora", action="store_true", help="Disable LoRA (set lora_rank=0).")
     parser.add_argument("--skip-to-moments", action="store_true", help="Skip to_moments layer (for old checkpoints).")
     parser.add_argument("--denormalize-output", action="store_true", help="Denormalize decoder output.")
+    parser.add_argument("--use-ema", action="store_true", help="Load EMA model from checkpoint if available.")
     parser.add_argument("--patch-size", type=int, default=None, 
                         help="Patch size (auto-detected from encoder if not set). "
                              "For old checkpoints trained with hardcoded patch_size=16, use --patch-size 16")
@@ -133,9 +84,7 @@ def main():
     args = parser.parse_args()
 
     # 1. 初始化 DDP
-    local_rank = setup_ddp()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank, local_rank, world_size = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
 
     torch.manual_seed(args.seed + rank)
@@ -162,6 +111,7 @@ def main():
         print(f" LoRA: {'Disabled' if args.no_lora else f'rank={args.lora_rank}, alpha={args.lora_alpha}'}")
         print(f" Skip to_moments: {args.skip_to_moments}")
         print(f" Denormalize output: {args.denormalize_output}")
+        print(f" Use EMA: {args.use_ema}")
         print(f"==========================================")
     dist.barrier()
 
@@ -244,6 +194,7 @@ def main():
         model_params=vae_model_params,
         verbose=(rank == 0),
         skip_to_moments=args.skip_to_moments,
+        use_ema=args.use_ema,
     )
 
     # 4. 数据集与 Sampler
@@ -316,20 +267,28 @@ def main():
         B = x_img.shape[0]
 
         with torch.no_grad():
-            # Encoder
-            z_raw, _ = vae.encode(x_img,sample_posterior=False)
-            # Normalize for latent space
-            z_normalized = normalize_sae(z_raw)
+            # 对于 CNN/ViT decoder，直接使用 forward（与训练时验证一致）
+            # 训练时 run_validation 直接调用 model(x)，不经过 normalize/denormalize
+            if decoder_type in ["cnn_decoder", "vit_decoder"]:
+                out = vae(x_img)
+                print("test!!!")
+                x_recon = out.sample
+            else:
+                # Diffusion decoder 需要 normalize/denormalize
+                z_raw, _ = vae.encode(x_img, sample_posterior=False)
+                # 使用正确的 normalize 函数（根据 encoder_type）
+                normalize_fn = get_normalize_fn(args.encoder_type)
+                z_normalized = normalize_fn(z_raw)
 
-            # Decoder (using unified reconstruct function)
-            x_recon = reconstruct_from_latent_with_diffusion(
-                vae=vae,
-                latent_z=z_normalized,
-                image_shape=x_img.shape,
-                diffusion_steps=args.diffusion_steps,
-                decoder_type=decoder_type,
-                encoder_type=args.encoder_type,
-            )
+                # Decoder (using unified reconstruct function)
+                x_recon = reconstruct_from_latent_with_diffusion(
+                    vae=vae,
+                    latent_z=z_normalized,
+                    image_shape=x_img.shape,
+                    diffusion_steps=args.diffusion_steps,
+                    decoder_type=decoder_type,
+                    encoder_type=args.encoder_type,
+                )
 
         # 统计 PSNR
         batch_psnr_sum, batch_n = calculate_batch_psnr(x_img, x_recon)
@@ -388,6 +347,7 @@ def main():
         if decoder_type == "vit_decoder":
             print(f" ViT Config       : hidden={args.vit_hidden_size}, layers={args.vit_num_layers}")
         print(f" LoRA             : {'Disabled' if args.no_lora else f'rank={args.lora_rank}'}")
+        print(f" Use EMA          : {args.use_ema}")
         print(f" PSNR             : {global_avg_psnr:.4f} dB")
         if HAS_FID:
             print(f" rFID             : {rfid_value:.4f}")
@@ -405,6 +365,7 @@ def main():
             f.write(f"LoRA: {'Disabled' if args.no_lora else f'rank={args.lora_rank}, alpha={args.lora_alpha}'}\n")
             f.write(f"Skip to_moments: {args.skip_to_moments}\n")
             f.write(f"Denormalize output: {args.denormalize_output}\n")
+            f.write(f"Use EMA: {args.use_ema}\n")
             f.write(f"PSNR: {global_avg_psnr:.4f}\n")
             f.write(f"rFID: {rfid_value}\n")
             f.write(f"Count: {global_count}\n")
