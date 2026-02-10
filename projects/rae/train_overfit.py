@@ -80,6 +80,7 @@ from models.rae.utils.ddp_utils import (
     update_ema,
 )
 from models.rae.utils.image_utils import center_crop_arr
+from models.rae.utils.argparse_utils import get_encoder_config
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -371,18 +372,10 @@ def main(args):
         writer = None
 
     # ---------------- load VAE (DINOv3, SigLIP2, or DINOv2) ----------------
-    # Determine latent_channels based on encoder_type
-    if args.encoder_type == "dinov3":
-        latent_channels = 1280
-        default_dec_block_out_channels = (1280, 1024, 512, 256, 128)
-    elif args.encoder_type == "siglip2":
-        latent_channels = 768  # SigLIP2-base hidden size
-        default_dec_block_out_channels = (768, 512, 256, 128, 64)
-    elif args.encoder_type == "dinov2":
-        latent_channels = 768  # DINOv2-base hidden size
-        default_dec_block_out_channels = (768, 512, 256, 128, 64)  # DINOv2-base: 768 hidden size
-    else:
-        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
+    # 使用 get_encoder_config 获取 encoder 配置
+    encoder_config = get_encoder_config(args.encoder_type)
+    latent_channels = encoder_config["latent_channels"]
+    default_dec_block_out_channels = encoder_config["dec_block_out_channels"]
     
     # LoRA rank: 0 means no LoRA layers at all
     effective_lora_rank = 0 if args.no_lora else args.lora_rank

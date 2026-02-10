@@ -31,6 +31,7 @@ from models.rae.utils.vae_utils import load_vae, get_normalize_fn
 # 导入统一工具模块
 from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp
 from models.rae.utils.image_utils import center_crop_arr
+from models.rae.utils.argparse_utils import add_encoder_args, add_lora_args, get_encoder_config
 
 
 # ==========================================
@@ -281,15 +282,10 @@ def main():
     parser.add_argument("--val-path", type=str, required=True, help="Path to ImageNet validation set.")
     parser.add_argument("--image-size", type=int, default=256)
     
-    # VAE (needed for extraction)
+    # VAE (使用 argparse_utils)
     parser.add_argument("--vae-ckpt", type=str, default=None, help="Path to VAE checkpoint.")
-    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "dinov3_vitl", "siglip2", "dinov2"])
-    parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3")
-    parser.add_argument("--siglip2-model-name", type=str, default="google/siglip2-base-patch16-256")
-    parser.add_argument("--dinov2-model-name", type=str, default="facebook/dinov2-with-registers-base",
-                        help="DINOv2 model name from HuggingFace (e.g., 'facebook/dinov2-with-registers-base')")
-    parser.add_argument("--lora-rank", type=int, default=256)
-    parser.add_argument("--lora-alpha", type=int, default=256)
+    add_encoder_args(parser)  # --encoder-type, --dinov3-dir, --siglip2-model-name, --dinov2-model-name
+    add_lora_args(parser)     # --lora-rank, --lora-alpha, --lora-dropout, --no-lora
     
     # Feature paths (for train mode)
     parser.add_argument("--train-features", type=str, default=None, 
@@ -378,25 +374,11 @@ def main():
             if rank == 0:
                 print("Loading VAE...")
             
-            # 根据 encoder_type 设置 latent_channels, dec_block_out_channels, patch_size
-            if args.encoder_type == "dinov3":
-                latent_channels = 1280
-                dec_block_out_channels = (1280, 1024, 512, 256, 128)
-                patch_size = 16
-            elif args.encoder_type == "dinov3_vitl":
-                latent_channels = 1024
-                dec_block_out_channels = (1024, 768, 512, 256, 128)
-                patch_size = 16
-            elif args.encoder_type == "siglip2":
-                latent_channels = 768
-                dec_block_out_channels = (768, 512, 256, 128, 64)
-                patch_size = 16
-            elif args.encoder_type == "dinov2":
-                latent_channels = 768  # DINOv2-base hidden size
-                dec_block_out_channels = (768, 512, 256, 128, 64)
-                patch_size = 14  # DINOv2 uses patch_size=14
-            else:
-                raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
+            # 使用 get_encoder_config 获取 encoder 配置
+            encoder_config = get_encoder_config(args.encoder_type)
+            latent_channels = encoder_config["latent_channels"]
+            dec_block_out_channels = encoder_config["dec_block_out_channels"]
+            patch_size = encoder_config["patch_size"]
             
             vae_model_params = {
                 "encoder_type": args.encoder_type,

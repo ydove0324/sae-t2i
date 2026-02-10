@@ -30,6 +30,10 @@ from models.rae.utils.vae_utils import (
 from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp
 from models.rae.utils.image_utils import center_crop_arr
 from models.rae.utils.metrics_utils import calculate_batch_psnr, is_fid_available
+from models.rae.utils.argparse_utils import (
+    add_encoder_args, add_lora_args, add_vit_decoder_args,
+    process_lora_args, get_encoder_config,
+)
 
 # 尝试导入 pytorch-fid
 HAS_FID = is_fid_available()
@@ -42,21 +46,19 @@ if HAS_FID:
 
 def main():
     parser = argparse.ArgumentParser()
+    
     # Data
     parser.add_argument("--data-path", type=str, required=True, help="Path to ImageNet validation set.")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU.")
     parser.add_argument("--max-images", type=int, default=None, help="Limit total images (across all GPUs).")
     
-    # VAE model
+    # VAE model (使用 argparse_utils)
     parser.add_argument("--vae-ckpt", type=str, required=True, help="Path to VAE checkpoint.")
-    parser.add_argument("--encoder-type", type=str, default="dinov3", choices=["dinov3", "dinov3_vitl", "siglip2", "dinov2"], help="Encoder type.")
-    parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3", help="Path to DINOv3 model directory.")
-    parser.add_argument("--siglip2-model-name", type=str, default="google/siglip2-base-patch16-256", help="SigLIP2 model name.")
-    parser.add_argument("--dinov2-model-name", type=str, default="facebook/dinov2-with-registers-base", help="DINOv2 model name.")
-    parser.add_argument("--lora-rank", type=int, default=256, help="LoRA rank.")
-    parser.add_argument("--lora-alpha", type=int, default=256, help="LoRA alpha.")
-    parser.add_argument("--no-lora", action="store_true", help="Disable LoRA (set lora_rank=0).")
+    add_encoder_args(parser)  # --encoder-type, --dinov3-dir, --siglip2-model-name, --dinov2-model-name
+    add_lora_args(parser)     # --lora-rank, --lora-alpha, --lora-dropout, --no-lora
+    
+    # VAE 其他选项
     parser.add_argument("--skip-to-moments", action="store_true", help="Skip to_moments layer (for old checkpoints).")
     parser.add_argument("--denormalize-output", action="store_true", help="Denormalize decoder output.")
     parser.add_argument("--use-ema", action="store_true", help="Load EMA model from checkpoint if available.")
@@ -67,11 +69,8 @@ def main():
     # Decoder type
     parser.add_argument("--decoder-type", type=str, default="cnn_decoder", choices=["cnn_decoder", "vit_decoder"], help="Decoder architecture type.")
     
-    # ViT decoder params (only used if --decoder-type=vit_decoder)
-    parser.add_argument("--vit-hidden-size", type=int, default=1024, help="ViT decoder hidden size (XL: 1024, L: 768, B: 512).")
-    parser.add_argument("--vit-num-layers", type=int, default=24, help="ViT decoder num layers (XL: 24, L: 16, B: 8).")
-    parser.add_argument("--vit-num-heads", type=int, default=16, help="ViT decoder num heads (XL: 16, L: 12, B: 8).")
-    parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size (XL: 4096, L: 3072, B: 2048).")
+    # ViT decoder params (使用 argparse_utils)
+    add_vit_decoder_args(parser)  # --vit-hidden-size, --vit-num-layers, --vit-num-heads, --vit-intermediate-size
     
     # Reconstruction
     parser.add_argument("--type", type=str, default="CNN", choices=["CNN", "DIFFUSION"], help="Reconstruction type (for diffusion decoder).")
@@ -82,6 +81,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-images", action="store_true", help="Always keep images.")
     args = parser.parse_args()
+    
+    # 处理 LoRA 参数 (--no-lora 设置 lora_rank=0)
+    args = process_lora_args(args)
 
     # 1. 初始化 DDP
     rank, local_rank, world_size = setup_ddp()
@@ -122,34 +124,18 @@ def main():
     else:
         decoder_type = args.decoder_type  # "cnn_decoder" or "vit_decoder"
     
-    # 根据 encoder_type 设置 latent_channels, dec_block_out_channels, patch_size
-    if args.encoder_type == "dinov3":
-        latent_channels = 1280
-        dec_block_out_channels = (1280, 1024, 512, 256, 128)
-        default_patch_size = 16
-    elif args.encoder_type == "dinov3_vitl":
-        latent_channels = 1024
-        dec_block_out_channels = (1024, 768, 512, 256, 128)
-        default_patch_size = 16
-    elif args.encoder_type == "siglip2":
-        latent_channels = 768
-        dec_block_out_channels = (768, 512, 256, 128, 64)
-        default_patch_size = 16
-    elif args.encoder_type == "dinov2":
-        latent_channels = 768
-        dec_block_out_channels = (768, 512, 256, 128, 64)
-        # Note: DINOv2 encoder uses patch_size=14, but old training code used patch_size=16 for decoder
-        # If loading old checkpoint trained with hardcoded patch_size=16, use --patch-size 16
-        default_patch_size = 14  # Default for new training, but old checkpoints may need 16
-    else:
-        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
+    # 使用 get_encoder_config 获取 encoder 配置
+    encoder_config = get_encoder_config(args.encoder_type)
+    latent_channels = encoder_config["latent_channels"]
+    dec_block_out_channels = encoder_config["dec_block_out_channels"]
+    default_patch_size = encoder_config["patch_size"]
     
     # Use user-specified patch_size if provided, otherwise use default
     patch_size = args.patch_size if args.patch_size is not None else default_patch_size
     
-    # 如果 --no-lora，则设置 lora_rank=0
-    lora_rank = 0 if args.no_lora else args.lora_rank
-    lora_alpha = 0 if args.no_lora else args.lora_alpha
+    # LoRA 参数（已通过 process_lora_args 处理）
+    lora_rank = args.lora_rank
+    lora_alpha = args.lora_alpha
     
     # 构建 model_params (基础参数)
     vae_model_params = {

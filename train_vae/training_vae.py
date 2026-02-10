@@ -40,6 +40,7 @@ from models.rae.utils.ddp_utils import (
 )
 from models.rae.utils.image_utils import center_crop_arr
 from models.rae.utils.metrics_utils import LPIPSLoss, calculate_psnr, is_fid_available, is_lpips_available
+from models.rae.utils.argparse_utils import get_encoder_config
 
 # === deps ===
 try:
@@ -730,25 +731,23 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, sampler=val_sampler,
                             num_workers=4, pin_memory=True, drop_last=False)
 
+    # 使用 get_encoder_config 获取 encoder 默认配置
+    try:
+        encoder_config = get_encoder_config(args.encoder_type)
+        default_latent_channels = encoder_config["latent_channels"]
+        default_patch_size = encoder_config["patch_size"]
+    except ValueError:
+        # 未知的 encoder_type，使用默认值
+        default_latent_channels = 1280
+        default_patch_size = 16
+    
     # 根据 encoder_type 设置默认 latent_channels
     if args.latent_channels is None:
-        if args.encoder_type == "dinov3":
-            args.latent_channels = 1280
-        elif args.encoder_type == "siglip2":
-            args.latent_channels = 768  # SigLIP2-base hidden size
-        elif args.encoder_type == "dinov2":
-            args.latent_channels = 768  # DINOv2-base hidden size
+        args.latent_channels = default_latent_channels
     
     # 根据 encoder_type 设置默认 patch_size 和 spatial_downsample_factor
     if args.patch_size is None:
-        if args.encoder_type == "dinov3":
-            args.patch_size = 16
-        elif args.encoder_type == "siglip2":
-            args.patch_size = 16
-        elif args.encoder_type == "dinov2":
-            args.patch_size = 14  # DINOv2 uses patch_size=14
-        else:
-            args.patch_size = 16  # default
+        args.patch_size = default_patch_size
     
     if args.spatial_downsample_factor is None:
         args.spatial_downsample_factor = args.patch_size

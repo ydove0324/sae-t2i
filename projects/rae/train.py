@@ -29,6 +29,7 @@ import argparse
 # 导入统一工具模块
 from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp as cleanup, create_logger, requires_grad, update_ema
 from models.rae.utils.image_utils import center_crop_arr
+from models.rae.utils.argparse_utils import get_encoder_config
 
 #################################################################################
 #                              Timing Profiler                                  #
@@ -629,15 +630,9 @@ def main(args):
         latent_size = tuple(latent_size_cfg)
         latent_channels = latent_size[0]
     else:
-        # Fallback: determine from encoder_type
-        if args.encoder_type == "dinov3":
-            latent_channels = 1280
-        elif args.encoder_type == "siglip2":
-            latent_channels = 768  # SigLIP2-base hidden size
-        elif args.encoder_type == "dinov2":
-            latent_channels = 768  # DINOv2-base hidden size
-        else:
-            raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
+        # Fallback: determine from encoder_type using get_encoder_config
+        encoder_config = get_encoder_config(args.encoder_type)
+        latent_channels = encoder_config["latent_channels"]
         latent_size = (latent_channels, 16, 16)
     
     if rank == 0:

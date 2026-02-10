@@ -30,6 +30,9 @@ from models.rae.utils.vae_utils import load_vae, get_normalize_fn
 # 导入统一工具模块
 from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp
 from models.rae.utils.image_utils import center_crop_arr
+from models.rae.utils.argparse_utils import (
+    add_encoder_args, add_lora_args, add_vit_decoder_args, get_encoder_config,
+)
 
 
 # ==========================================
@@ -127,30 +130,20 @@ def main():
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--num-samples", type=int, default=50000, help="Number of samples to use.")
     
-    # VAE
+    # VAE (使用 argparse_utils)
     parser.add_argument("--vae-ckpt", type=str, required=True, help="Path to VAE checkpoint.")
-    parser.add_argument("--encoder-type", type=str, default="dinov3", 
-                        choices=["dinov3", "dinov3_vitl", "siglip2", "dinov2"])
+    add_encoder_args(parser)     # --encoder-type, --dinov3-dir, --siglip2-model-name, --dinov2-model-name
+    add_lora_args(parser)        # --lora-rank, --lora-alpha, --lora-dropout, --no-lora
+    add_vit_decoder_args(parser) # --vit-hidden-size, --vit-num-layers, --vit-num-heads, --vit-intermediate-size
+    
+    # Decoder type
     parser.add_argument("--decoder-type", type=str, default="cnn_decoder",
                         choices=["cnn_decoder", "vit_decoder"])
-    parser.add_argument("--dinov3-dir", type=str, default="/cpfs01/huangxu/models/dinov3")
-    parser.add_argument("--siglip2-model-name", type=str, default="/cpfs01/huangxu/models/siglip2")
-    parser.add_argument("--dinov2-model-name", type=str, default="/cpfs01/huangxu/models/dinov2-register-base")
-    parser.add_argument("--lora-rank", type=int, default=256)
-    parser.add_argument("--lora-alpha", type=int, default=256)
-    
-    # ViT decoder parameters (only used when decoder-type="vit_decoder")
-    parser.add_argument("--vit-hidden-size", type=int, default=1024, help="ViT decoder hidden size (XL:1024, L:768, B:512)")
-    parser.add_argument("--vit-num-layers", type=int, default=24, help="ViT decoder num layers (XL:24, L:16, B:8)")
-    parser.add_argument("--vit-num-heads", type=int, default=16, help="ViT decoder num heads (XL:16, L:12, B:8)")
-    parser.add_argument("--vit-intermediate-size", type=int, default=4096, help="ViT decoder intermediate size (XL:4096, L:3072, B:2048)")
     
     # Processing
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--use-lora", action="store_true", default=True, 
                         help="Use LoRA-enabled encoder features.")
-    parser.add_argument("--no-lora", dest="use_lora", action="store_false",
-                        help="Use frozen encoder features (no LoRA).")
     
     # Output
     parser.add_argument("--output-dir", type=str, default="results/latent_stats")
@@ -187,26 +180,11 @@ def main():
     if rank == 0:
         print("\nLoading VAE...")
     
-    # 根据 encoder_type 设置 latent_channels 和 decoder 参数
-    if args.encoder_type == "dinov3":
-        latent_channels = 1280
-        dec_block_out_channels = (1280, 1024, 512, 256, 128)
-        default_patch_size = 16
-    elif args.encoder_type == "dinov3_vitl":
-        latent_channels = 1024
-        dec_block_out_channels = (1024, 768, 512, 256, 128)
-        default_patch_size = 16
-    elif args.encoder_type == "siglip2":
-        latent_channels = 768
-        dec_block_out_channels = (768, 512, 256, 128, 64)
-        default_patch_size = 16
-    elif args.encoder_type == "dinov2":
-        latent_channels = 768
-        dec_block_out_channels = (768, 512, 256, 128, 64)
-        # DINOv2 encoder uses patch_size=14, but decoder uses patch_size=16
-        default_patch_size = 16
-    else:
-        raise ValueError(f"Unknown encoder_type: {args.encoder_type}")
+    # 使用 get_encoder_config 获取 encoder 配置
+    encoder_config = get_encoder_config(args.encoder_type)
+    latent_channels = encoder_config["latent_channels"]
+    dec_block_out_channels = encoder_config["dec_block_out_channels"]
+    default_patch_size = encoder_config["patch_size"]
     
     vae_model_params = {
         "encoder_type": args.encoder_type,
