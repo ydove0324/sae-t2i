@@ -129,6 +129,7 @@ def build_model(cfg, device: torch.device) -> DecoSAE:
         flow_steps=cfg.model.flow_steps,
         time_dim=cfg.model.time_dim,
         enable_hf_branch=cfg.model.enable_hf_branch,
+        hf_dim=cfg.model.hf_dim,
         hf_dropout_prob=cfg.model.hf_dropout_prob,
         hf_noise_std=cfg.model.hf_noise_std,
         hf_loss_weight=cfg.model.hf_loss_weight,

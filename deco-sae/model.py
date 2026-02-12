@@ -369,7 +369,7 @@ class DecoSAE(nn.Module):
             self.to_moments = nn.Conv2d(effective_c, 2 * effective_c, kernel_size=1)
 
         # 3) Condition fusion (Semantic + HF -> hidden_size).
-        self.hf_dim = self.semantic_channels
+        self.hf_dim = hf_dim
         self.hf_encoder = HFEncoder(
             in_channels=in_channels,
             out_channels=self.hf_dim,
