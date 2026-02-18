@@ -1,0 +1,857 @@
+"""
+Train DiT (Diffusion Transformer) on DECO-SAE latent space.
+Uses config-driven approach with minimal argparse.
+Supports multi-node multi-GPU distributed training.
+"""
+
+import argparse
+import gc
+import math
+import os
+import shutil
+import sys
+from collections import defaultdict
+from copy import deepcopy
+from glob import glob
+from time import time
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from omegaconf import OmegaConf
+from PIL import Image
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
+from torchvision.utils import save_image
+
+# FID imports
+try:
+    from pytorch_fid import fid_score
+    HAS_FID = True
+except ImportError:
+    HAS_FID = False
+    print("Warning: 'pytorch-fid' not found. FID calculation will be skipped.")
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from config_utils import load_config
+from model import DecoSAE
+from models.rae.utils.ddp_utils import (
+    cleanup_ddp,
+    create_logger,
+    requires_grad,
+    setup_ddp,
+    update_ema,
+)
+from models.rae.utils.image_utils import center_crop_arr
+from models.rae.utils.model_utils import instantiate_from_config
+from models.rae.utils.optim_utils import build_optimizer, build_scheduler
+from models.rae.utils.train_utils import parse_configs
+
+
+#################################################################################
+#                              Training Utilities                               #
+#################################################################################
+
+def sample_timesteps(
+    batch_size: int,
+    device: torch.device,
+    time_shift: float = 1.0,
+):
+    """Sample timesteps for flow matching training with SD3-style time shift."""
+    t = torch.rand(batch_size, device=device)
+    t = (time_shift * t) / (1.0 + (time_shift - 1.0) * t)
+    t = t.clamp(1e-5, 1.0 - 1e-5)
+    return t
+
+
+def compute_train_loss(
+    model,
+    x_latent: torch.Tensor,
+    model_kwargs: dict,
+    time_shift: float = 1.0,
+):
+    """
+    Compute flow matching training loss.
+    
+    x_t = t * noise + (1 - t) * x_0
+    target = x_0 (x-prediction)
+    """
+    B = x_latent.size(0)
+    device = x_latent.device
+
+    noise = torch.randn_like(x_latent)
+    t = sample_timesteps(B, device, time_shift)
+
+    t_broadcast = t.view(B, 1, 1, 1)
+    x_t = t_broadcast * noise + (1.0 - t_broadcast) * x_latent
+
+    # Model predicts x_0
+    model_output = model(x_t, t, **model_kwargs)
+
+    # MSE loss with reweighting
+    loss = F.mse_loss(model_output, x_latent, reduction="none")
+    reweight_scale = torch.clamp_max(1.0 / (t**2 + 1e-8), 10)
+    loss = loss * reweight_scale.view(B, 1, 1, 1)
+    loss = loss.mean()
+
+    return loss, model_output, noise, t
+
+
+@torch.no_grad()
+def sample_latent(
+    model,
+    batch_size: int,
+    latent_shape: tuple,
+    device: torch.device,
+    y: torch.Tensor,
+    time_shift: float,
+    steps: int = 50,
+    use_cfg: bool = False,
+    cfg_scale: float = 3.0,
+    null_class: int = 1000,
+):
+    """Sample latent z0 using Euler method."""
+    model_inner = model.module if hasattr(model, "module") else model
+    model_inner.eval()
+
+    C, H, W = latent_shape
+    x = torch.randn((batch_size, C, H, W), device=device, dtype=torch.float32)
+
+    shift = float(time_shift)
+
+    def flow_shift(t_lin: torch.Tensor) -> torch.Tensor:
+        t = (shift * t_lin) / (1.0 + (shift - 1.0) * t_lin)
+        return t.clamp(0.0, 1.0 - 1e-6)
+
+    for i in range(steps, 0, -1):
+        t_lin = torch.full((batch_size,), i / steps, device=device, dtype=torch.float32)
+        t_next_lin = torch.full((batch_size,), (i - 1) / steps, device=device, dtype=torch.float32)
+
+        t = flow_shift(t_lin)
+        t_next = flow_shift(t_next_lin)
+
+        if not use_cfg:
+            x0_hat = model_inner(x, t, y=y)
+        else:
+            y_cond = y
+            y_uncond = torch.full_like(y, null_class)
+            x0_hat_cond = model_inner(x, t, y=y_cond)
+            x0_hat_uncond = model_inner(x, t, y=y_uncond)
+            x0_hat = x0_hat_uncond + cfg_scale * (x0_hat_cond - x0_hat_uncond)
+
+        t_scalar = t.view(batch_size, 1, 1, 1)
+        eps_hat = (x - (1.0 - t_scalar) * x0_hat) / (t_scalar + 1e-8)
+
+        t_next_scalar = t_next.view(batch_size, 1, 1, 1)
+        x = t_next_scalar * eps_hat + (1.0 - t_next_scalar) * x0_hat
+
+    return x
+
+
+def build_deco_sae(sae_cfg, device: torch.device) -> DecoSAE:
+    """Build DecoSAE model from config."""
+    print("sae_cfg:", sae_cfg)
+    return DecoSAE(
+        encoder_type=sae_cfg.encoder.type,
+        dinov3_model_dir=sae_cfg.encoder.dinov3_model_dir,
+        siglip2_model_name=sae_cfg.encoder.siglip2_model_name,
+        dinov2_model_name=sae_cfg.encoder.dinov2_model_name,
+        image_size=sae_cfg.data.image_size,
+        in_channels=3,
+        out_channels=3,
+        hidden_size=sae_cfg.model.hidden_size,
+        hidden_size_x=sae_cfg.model.hidden_size_x,
+        decoder_type=getattr(sae_cfg.model, "decoder_type", "vit_decoder"),
+        num_decoder_blocks=sae_cfg.model.num_decoder_blocks,
+        nerf_max_freqs=sae_cfg.model.nerf_max_freqs,
+        flow_steps=sae_cfg.model.flow_steps,
+        time_dim=sae_cfg.model.time_dim,
+        vit_decoder_hidden_size=getattr(sae_cfg.model, "vit_decoder_hidden_size", 1024),
+        vit_decoder_num_layers=getattr(sae_cfg.model, "vit_decoder_num_layers", 24),
+        vit_decoder_num_heads=getattr(sae_cfg.model, "vit_decoder_num_heads", 16),
+        vit_decoder_intermediate_size=getattr(sae_cfg.model, "vit_decoder_intermediate_size", 4096),
+        vit_decoder_dropout=getattr(sae_cfg.model, "vit_decoder_dropout", 0.0),
+        gradient_checkpointing=getattr(sae_cfg.model, "gradient_checkpointing", False),
+        enable_hf_branch=sae_cfg.model.enable_hf_branch,
+        hf_dim=sae_cfg.model.hf_dim,
+        hf_encoder_config_path=getattr(sae_cfg.model, "hf_encoder_config_path", None),
+        hf_dropout_prob=0.0,  # Disable dropout for encoding
+        hf_noise_std=0.0,
+        hf_loss_weight=sae_cfg.model.hf_loss_weight,
+        recon_l2_weight=sae_cfg.loss.recon_l2_weight,
+        recon_l1_weight=sae_cfg.loss.recon_l1_weight,
+        recon_lpips_weight=sae_cfg.loss.recon_lpips_weight,
+        recon_gan_weight=sae_cfg.loss.recon_gan_weight,
+        lora_rank=sae_cfg.model.lora_rank,
+        lora_alpha=sae_cfg.model.lora_alpha,
+        lora_dropout=sae_cfg.model.lora_dropout,
+        enable_lora=sae_cfg.model.enable_lora,
+        target_latent_channels=sae_cfg.model.target_latent_channels,
+        variational=sae_cfg.model.variational,
+        kl_weight=sae_cfg.model.kl_weight,
+        skip_to_moments=sae_cfg.model.skip_to_moments,
+        noise_tau=0.0,
+        random_masking_channel_ratio=0.0,
+        denormalize_decoder_output=sae_cfg.model.denormalize_decoder_output,
+    ).to(device)
+
+
+def load_sae_checkpoint(model: DecoSAE, ckpt_path: str, device: torch.device, logger):
+    """Load DECO-SAE checkpoint."""
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"SAE checkpoint not found: {ckpt_path}")
+
+    payload = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if "model" in payload:
+        state_dict = payload["model"]
+    elif "state_dict" in payload:
+        state_dict = payload["state_dict"]
+    else:
+        state_dict = payload
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    step = payload.get("step", 0) if isinstance(payload, dict) else 0
+    logger.info(f"Loaded SAE checkpoint from {ckpt_path} (step={step})")
+    logger.info(f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+    return step
+
+
+@torch.no_grad()
+def encode_with_deco_sae(
+    sae_model: DecoSAE,
+    x_img: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Encode images using DECO-SAE.
+    Returns fused latent [B, N, semantic_channels + hf_dim] reshaped to [B, C, H, W].
+    """
+    sae_model.eval()
+    
+    # Get semantic latent
+    enc = sae_model._infer_latent(x_img)
+    z = enc.latent  # [B, semantic_channels, H_p, W_p]
+    
+    # Get fused encoding (semantic + HF)
+    enc_cond = sae_model.encode(z, x_img=x_img, force_drop_hf=False)  # [B, N, C]
+    
+    # Reshape to spatial format [B, C, H, W]
+    B, N, C = enc_cond.shape
+    H = W = int(math.sqrt(N))
+    latent = enc_cond.transpose(1, 2).contiguous().view(B, C, H, W)
+    
+    return latent
+
+
+@torch.no_grad()
+def decode_with_deco_sae(
+    sae_model: DecoSAE,
+    latent: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Decode latent using DECO-SAE.
+    latent: [B, C, H, W] fused latent
+    Returns: [B, 3, image_size, image_size] reconstructed images
+    """
+    sae_model.eval()
+    
+    B, C, H, W = latent.shape
+    # Reshape to [B, N, C]
+    enc_cond = latent.view(B, C, H * W).transpose(1, 2).contiguous()
+    
+    # Generate image
+    img = sae_model.generate(enc_cond)
+    return img.clamp(-1.0, 1.0)
+
+
+#################################################################################
+#                              FID Evaluation                                   #
+#################################################################################
+
+def create_flat_temp_dir(source_root, temp_dir):
+    """Flatten the directory structure for pytorch-fid."""
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
+
+    count = 0
+    for root, dirs, files in os.walk(source_root):
+        if os.path.abspath(root) == os.path.abspath(temp_dir):
+            continue
+        for file in files:
+            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                src_path = os.path.abspath(os.path.join(root, file))
+                parent_name = os.path.basename(root)
+                new_name = f"{parent_name}_{file}"
+                dst_path = os.path.join(temp_dir, new_name)
+                try:
+                    os.symlink(src_path, dst_path)
+                    count += 1
+                except OSError:
+                    shutil.copy(src_path, dst_path)
+                    count += 1
+    return count
+
+
+@torch.no_grad()
+def run_fid_evaluation(
+    model,
+    sae_model: DecoSAE,
+    results_dir: str,
+    fid_ref_path: str,
+    fid_samples_per_class: int,
+    fid_batch_size: int,
+    latent_shape: tuple,
+    time_shift: float,
+    device: torch.device,
+    step: int,
+    rank: int,
+    world_size: int,
+    logger,
+    writer=None,
+    num_classes: int = 1000,
+):
+    """
+    Run FID evaluation by generating samples and computing FID score.
+    
+    Args:
+        model: DiT model (EMA)
+        sae_model: DECO-SAE model for decoding
+        results_dir: Directory to save generated samples
+        fid_ref_path: Path to reference FID statistics (.npz)
+        fid_samples_per_class: Number of samples per class
+        fid_batch_size: Batch size for generation
+        latent_shape: Shape of latent (C, H, W)
+        time_shift: Time shift for flow matching
+        device: Device to use
+        step: Current training step
+        rank: DDP rank
+        world_size: DDP world size
+        logger: Logger instance
+        writer: TensorBoard writer
+        num_classes: Number of classes (default 1000 for ImageNet)
+    """
+    if not HAS_FID:
+        if rank == 0:
+            logger.warning("FID skipped because pytorch-fid is not installed.")
+        return
+
+    if fid_ref_path is None or not os.path.exists(fid_ref_path):
+        if rank == 0:
+            logger.warning(f"FID skipped because reference path is invalid: {fid_ref_path}")
+        return
+
+    # Directories
+    eval_dir = os.path.join(results_dir, "eval_samples", f"step_{step:07d}")
+    flat_dir = os.path.join(results_dir, "eval_samples", f"step_{step:07d}_flat")
+
+    if rank == 0:
+        logger.info(f"========== Starting FID Evaluation (Step {step}) ==========")
+        os.makedirs(eval_dir, exist_ok=True)
+
+    dist.barrier()
+
+    # Distribute classes across ranks
+    all_classes = list(range(num_classes))
+    my_classes = all_classes[rank::world_size]
+
+    # Generation loop
+    model_inner = model.module if hasattr(model, "module") else model
+    model_inner.eval()
+
+    total_needed = fid_samples_per_class
+
+    if rank == 0:
+        logger.info(f"Generating {total_needed} samples per class for {num_classes} classes...")
+
+    for cls_id in my_classes:
+        class_dir = os.path.join(eval_dir, str(cls_id))
+        os.makedirs(class_dir, exist_ok=True)
+
+        generated_count = 0
+        while generated_count < total_needed:
+            curr_batch = min(fid_batch_size, total_needed - generated_count)
+
+            y = torch.full((curr_batch,), cls_id, device=device, dtype=torch.long)
+
+            # FP32 for evaluation precision
+            with torch.autocast(device_type='cuda', enabled=False):
+                # 1. Sample latent (50 steps, no CFG)
+                z_sample = sample_latent(
+                    model=model,
+                    batch_size=curr_batch,
+                    latent_shape=latent_shape,
+                    device=device,
+                    y=y,
+                    time_shift=time_shift,
+                    steps=50,
+                    use_cfg=False,
+                )
+
+                # 2. Decode with DECO-SAE
+                imgs = decode_with_deco_sae(sae_model, z_sample.float())
+
+            # Convert to [0, 1] range
+            imgs = (imgs + 1.0) / 2.0
+            imgs = imgs.clamp(0, 1)
+
+            # Save images
+            for i in range(curr_batch):
+                img_idx = generated_count + i
+                save_image(imgs[i], os.path.join(class_dir, f"{img_idx}.png"))
+
+            generated_count += curr_batch
+
+    dist.barrier()
+
+    # FID calculation (rank 0 only)
+    if rank == 0:
+        logger.info("Generation finished. Flattening directory for FID...")
+        try:
+            num_imgs = create_flat_temp_dir(eval_dir, flat_dir)
+            if num_imgs < 100:
+                logger.warning(f"Too few images ({num_imgs}) for valid FID.")
+            else:
+                logger.info(f"Calculating FID using {num_imgs} images...")
+                fid_value = fid_score.calculate_fid_given_paths(
+                    paths=[flat_dir, fid_ref_path],
+                    batch_size=50,
+                    device=device,
+                    dims=2048,
+                    num_workers=8
+                )
+                logger.info(f"Step {step} FID: {fid_value:.4f}")
+
+                if writer is not None:
+                    writer.add_scalar("eval/FID", fid_value, global_step=step)
+
+                # Write to text file
+                with open(os.path.join(results_dir, "fid_scores.txt"), "a") as f:
+                    f.write(f"Step {step}: {fid_value:.4f}\n")
+
+        except Exception as e:
+            logger.error(f"FID Calculation failed: {e}")
+        finally:
+            # Clean up flat directory to save space
+            if os.path.exists(flat_dir):
+                shutil.rmtree(flat_dir)
+            # Optional: keep eval_dir for inspection, or uncomment to delete
+            # if os.path.exists(eval_dir):
+            #     shutil.rmtree(eval_dir)
+
+    dist.barrier()
+    logger.info(f"========== End FID Evaluation (Step {step}) ==========")
+
+
+#################################################################################
+#                                  Main Training                                #
+#################################################################################
+
+def main():
+    parser = argparse.ArgumentParser(description="Train DiT on DECO-SAE latent space")
+    parser.add_argument("--config", type=str, required=True, help="DiT config path")
+    parser.add_argument("--sae-config", type=str, required=True, help="DECO-SAE config path")
+    parser.add_argument("--sae-ckpt", type=str, required=True, help="DECO-SAE checkpoint path")
+    parser.add_argument("--data-path", type=str, required=True, help="ImageNet train path")
+    parser.add_argument("--results-dir", type=str, default="results_dit", help="Output directory")
+    parser.add_argument("--ckpt", type=str, default=None, help="Resume checkpoint")
+    parser.add_argument("--precision", type=str, choices=["bf16", "fp32"], default="bf16")
+    parser.add_argument("--cfg-prob", type=float, default=0.1, help="CFG dropout probability")
+    parser.add_argument("--cfg-scale", type=float, default=3.0, help="CFG scale for sampling")
+    
+    # FID evaluation args
+    parser.add_argument("--fid-ref-path", type=str, default="VIRTUAL_imagenet256_labeled.npz",
+                        help="Path to reference FID statistics (.npz)")
+    parser.add_argument("--fid-samples-per-class", type=int, default=50,
+                        help="Number of samples per class for FID evaluation")
+    parser.add_argument("--fid-batch-size", type=int, default=32,
+                        help="Batch size for FID generation")
+    parser.add_argument("--skip-fid", action="store_true",
+                        help="Skip FID evaluation")
+    args = parser.parse_args()
+
+    # Parse DiT config
+    (
+        _,  # rae_config (not used)
+        model_config,
+        transport_config,
+        sampler_config,
+        guidance_config,
+        misc_config,
+        training_config,
+    ) = parse_configs(args.config)
+
+    def to_dict(cfg_section):
+        if cfg_section is None:
+            return {}
+        return OmegaConf.to_container(cfg_section, resolve=True)
+
+    misc = to_dict(misc_config)
+    training_cfg = to_dict(training_config)
+
+    # Training hyperparameters from config
+    num_classes = int(misc.get("num_classes", 1000))
+    grad_accum_steps = int(training_cfg.get("grad_accum_steps", 1))
+    clip_grad = float(training_cfg.get("clip_grad", 1.0))
+    ema_decay = float(training_cfg.get("ema_decay", 0.9995))
+    epochs = int(training_cfg.get("epochs", 1400))
+    global_batch_size = int(training_cfg.get("global_batch_size", 512))
+    num_workers = int(training_cfg.get("num_workers", 4))
+    log_every = int(training_cfg.get("log_every", 100))
+    ckpt_every = int(training_cfg.get("ckpt_every", 10000))
+    sample_every = int(training_cfg.get("sample_every", 10000))
+    global_seed = int(training_cfg.get("global_seed", 0))
+
+    # Latent size from config
+    latent_size_cfg = misc.get("latent_size", [832, 16, 16])
+    latent_size = tuple(latent_size_cfg)
+    latent_channels = latent_size[0]
+
+    # Time shift
+    shift_dim = latent_size[0] * latent_size[1] * latent_size[2]
+    shift_base = misc.get("time_dist_shift_base", 4096)
+    time_shift = math.sqrt(shift_dim / shift_base)
+
+    # DDP setup
+    rank, local_rank, world_size = setup_ddp()
+    device = torch.device("cuda", local_rank)
+
+    if global_batch_size % (world_size * grad_accum_steps) != 0:
+        raise ValueError("Global batch size must be divisible by world_size * grad_accum_steps.")
+    micro_batch_size = global_batch_size // (world_size * grad_accum_steps)
+
+    seed = global_seed * world_size + rank
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    if rank == 0:
+        print(f"Starting rank={rank}, seed={seed}, world_size={world_size}")
+        print(f"Latent size: {latent_size}, time_shift: {time_shift:.4f}")
+
+    # Create directories
+    if rank == 0:
+        os.makedirs(args.results_dir, exist_ok=True)
+        experiment_dir = os.path.join(args.results_dir, "experiment")
+        checkpoint_dir = os.path.join(args.results_dir, "checkpoints")
+        sample_dir = os.path.join(args.results_dir, "samples")
+        os.makedirs(experiment_dir, exist_ok=True)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(sample_dir, exist_ok=True)
+
+        logger = create_logger(experiment_dir, rank=0)
+        logger.info(f"Experiment directory: {experiment_dir}")
+
+        tb_dir = os.path.join(experiment_dir, "tensorboard")
+        os.makedirs(tb_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_dir)
+    else:
+        experiment_dir = None
+        checkpoint_dir = None
+        sample_dir = None
+        logger = create_logger(None, rank=rank)
+        writer = None
+
+    # Load DECO-SAE
+    logger.info(f"Loading DECO-SAE from {args.sae_ckpt}...")
+    sae_cfg = load_config(args.sae_config)
+    sae_model = build_deco_sae(sae_cfg, device)
+    load_sae_checkpoint(sae_model, args.sae_ckpt, device, logger)
+    sae_model.eval()
+    requires_grad(sae_model, False)
+    logger.info(f"DECO-SAE loaded. Semantic channels: {sae_model.semantic_channels}, HF dim: {sae_model.hf_dim}")
+
+    # Verify latent dimensions match
+    expected_channels = sae_model.semantic_channels + sae_model.hf_dim
+    if expected_channels != latent_channels:
+        raise ValueError(
+            f"Latent channel mismatch: SAE outputs {expected_channels} channels, "
+            f"but DiT config expects {latent_channels}"
+        )
+
+    # Build DiT model
+    model = instantiate_from_config(model_config).to(device)
+    ema = deepcopy(model).to(device)
+    requires_grad(ema, False)
+
+    opt_state = None
+    sched_state = None
+    train_steps = 0
+
+    # Resume checkpoint
+    if args.ckpt is not None:
+        checkpoint = torch.load(args.ckpt, map_location="cpu")
+        if "model" in checkpoint:
+            model.load_state_dict(checkpoint["model"], strict=False)
+        if "ema" in checkpoint:
+            ema.load_state_dict(checkpoint["ema"], strict=False)
+        opt_state = checkpoint.get("opt")
+        sched_state = checkpoint.get("scheduler")
+        train_steps = int(checkpoint.get("train_steps", 0))
+        if rank == 0:
+            logger.info(f"Resumed from {args.ckpt}, train_steps={train_steps}")
+
+    model_param_count = sum(p.numel() for p in model.parameters())
+    logger.info(f"DiT Parameters: {model_param_count / 1e6:.2f}M")
+
+    # DDP wrap
+    model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=False)
+
+    # Optimizer
+    opt, opt_msg = build_optimizer(model.parameters(), training_cfg)
+    if opt_state is not None:
+        opt.load_state_dict(opt_state)
+
+    # Dataset
+    transform = transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, sae_cfg.data.image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda t: t * 2.0 - 1.0),
+    ])
+
+    dataset = ImageFolder(args.data_path, transform=transform)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=global_seed)
+    loader = DataLoader(
+        dataset,
+        batch_size=micro_batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    logger.info(f"Dataset: {len(dataset):,} images from {args.data_path}")
+    logger.info(f"Batch: micro={micro_batch_size}, global={global_batch_size}, accum={grad_accum_steps}")
+    logger.info(f"Precision: {args.precision}")
+
+    loader_batches = len(loader)
+    steps_per_epoch = max(1, loader_batches // grad_accum_steps)
+
+    schedl, sched_msg = build_scheduler(opt, steps_per_epoch, training_cfg, sched_state)
+    if rank == 0:
+        logger.info(f"Training: {epochs} epochs, {steps_per_epoch} steps/epoch")
+        logger.info(opt_msg + "\n" + sched_msg)
+
+    # Initialize EMA
+    update_ema(ema, model.module, decay=0)
+    model.train()
+    ema.eval()
+
+    # AMP
+    use_amp = (args.precision == "bf16")
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+
+    log_steps = 0
+    running_loss = 0.0
+    start_time = time()
+
+    logger.info("Starting training...")
+
+    for epoch in range(epochs):
+        sampler.set_epoch(epoch)
+        if rank == 0:
+            print(f"Beginning epoch {epoch}...")
+
+        opt.zero_grad()
+        accum_counter = 0
+        step_loss_accum = 0.0
+
+        for x_img, y in loader:
+            x_img = x_img.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            # Encode with DECO-SAE
+            with torch.no_grad(), autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                x_latent = encode_with_deco_sae(sae_model, x_img)
+
+            # CFG label dropout
+            NULL_CLASS = num_classes
+            if args.cfg_prob > 0.0:
+                drop_mask = torch.rand_like(y.float()) < args.cfg_prob
+                y_train = y.clone()
+                y_train[drop_mask] = NULL_CLASS
+            else:
+                y_train = y
+
+            model_kwargs = dict(y=y_train)
+
+            # Forward + loss
+            with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
+                    model=model,
+                    x_latent=x_latent,
+                    model_kwargs=model_kwargs,
+                    time_shift=time_shift,
+                )
+
+            # NaN check
+            is_nan_local = 0 if torch.isfinite(loss_tensor) else 1
+            is_nan = torch.tensor(is_nan_local, device=device)
+            dist.all_reduce(is_nan, op=dist.ReduceOp.SUM)
+
+            if is_nan.item() > 0:
+                if rank == 0:
+                    logger.warning(f"[step {train_steps}] NaN detected! Skipping...")
+                opt.zero_grad(set_to_none=True)
+                accum_counter = 0
+                step_loss_accum = 0.0
+                dist.barrier()
+                continue
+
+            # Backward
+            step_loss_accum += loss_tensor.item()
+            loss_tensor = loss_tensor / grad_accum_steps
+            loss_tensor.backward()
+            accum_counter += 1
+
+            if accum_counter < grad_accum_steps:
+                continue
+
+            # Optimizer step
+            if clip_grad > 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            else:
+                grad_norm = torch.tensor(0.0, device=device)
+
+            opt.step()
+            schedl.step()
+            update_ema(ema, model.module, decay=ema_decay)
+            opt.zero_grad()
+
+            running_loss += step_loss_accum / grad_accum_steps
+            log_steps += 1
+            train_steps += 1
+            accum_counter = 0
+            step_loss_accum = 0.0
+
+            # Logging
+            if train_steps % log_every == 0:
+                torch.cuda.synchronize()
+                end_time = time()
+                steps_per_sec = log_steps / (end_time - start_time)
+                avg_loss = torch.tensor(running_loss / max(1, log_steps), device=device)
+                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                avg_loss = avg_loss.item() / world_size
+
+                if rank == 0:
+                    print(
+                        f"(step={train_steps:07d}) Loss: {avg_loss:.4f}, "
+                        f"Steps/Sec: {steps_per_sec:.2f}, Grad Norm: {float(grad_norm):.4f}"
+                    )
+                    if writer is not None:
+                        writer.add_scalar("train/loss", avg_loss, global_step=train_steps)
+                        writer.add_scalar("train/steps_per_sec", steps_per_sec, global_step=train_steps)
+                        writer.add_scalar("train/grad_norm", float(grad_norm), global_step=train_steps)
+
+                running_loss = 0.0
+                log_steps = 0
+                start_time = time()
+
+            # Sampling visualization
+            if train_steps % sample_every == 0 and rank == 0:
+                with torch.no_grad(), torch.autocast(device_type='cuda', enabled=False):
+                    # Sample latent using EMA
+                    y_sample = y[:4]
+                    z_sample = sample_latent(
+                        model=ema,
+                        batch_size=4,
+                        latent_shape=latent_size,
+                        device=device,
+                        y=y_sample,
+                        time_shift=time_shift,
+                        steps=50,
+                        use_cfg=False,
+                    )
+
+                    # Decode with DECO-SAE
+                    img_gen = decode_with_deco_sae(sae_model, z_sample.float())
+                    img_gen_01 = (img_gen + 1.0) / 2.0
+
+                    save_image(img_gen_01, os.path.join(sample_dir, f"sample_step_{train_steps:07d}.png"), nrow=2)
+
+                    # Also save GT reconstruction
+                    x_gt_01 = (x_img[:4] + 1.0) / 2.0
+                    save_image(x_gt_01, os.path.join(sample_dir, f"gt_step_{train_steps:07d}.png"), nrow=2)
+
+                    # Reconstruction from predicted latent
+                    recon = decode_with_deco_sae(sae_model, pred_latent[:4].float())
+                    recon_01 = (recon + 1.0) / 2.0
+                    save_image(recon_01, os.path.join(sample_dir, f"recon_step_{train_steps:07d}.png"), nrow=2)
+
+                logger.info(f"[step {train_steps}] Saved samples")
+
+            # Checkpoint
+            if train_steps % ckpt_every == 0 and train_steps > 0:
+                if rank == 0:
+                    checkpoint = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "scheduler": schedl.state_dict(),
+                        "train_steps": train_steps,
+                        "config": args.config,
+                    }
+                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    torch.save(checkpoint, checkpoint_path)
+                    logger.info(f"Saved checkpoint: {checkpoint_path}")
+                dist.barrier()
+
+                # FID evaluation after checkpoint
+                if not args.skip_fid:
+                    if rank == 0:
+                        logger.info(f"Step {train_steps}: Starting FID evaluation...")
+                    
+                    torch.cuda.empty_cache()
+                    
+                    run_fid_evaluation(
+                        model=ema,
+                        sae_model=sae_model,
+                        results_dir=args.results_dir,
+                        fid_ref_path=args.fid_ref_path,
+                        fid_samples_per_class=args.fid_samples_per_class,
+                        fid_batch_size=args.fid_batch_size,
+                        latent_shape=latent_size,
+                        time_shift=time_shift,
+                        device=device,
+                        step=train_steps,
+                        rank=rank,
+                        world_size=world_size,
+                        logger=logger,
+                        writer=writer,
+                        num_classes=num_classes,
+                    )
+                    
+                    model.train()
+                    torch.cuda.empty_cache()
+
+            # Latest snapshot
+            if train_steps % 1000 == 0 and train_steps > 0:
+                if rank == 0:
+                    snapshot = {
+                        "model": model.module.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "scheduler": schedl.state_dict(),
+                        "train_steps": train_steps,
+                        "config": args.config,
+                    }
+                    latest_path = f"{checkpoint_dir}/latest.pt"
+                    torch.save(snapshot, latest_path)
+                    logger.info(f"Updated latest checkpoint: {latest_path}")
+                dist.barrier()
+
+    model.eval()
+    logger.info("Training complete!")
+    cleanup_ddp()
+
+
+if __name__ == "__main__":
+    main()

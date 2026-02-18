@@ -24,25 +24,48 @@ class EncoderConfig:
 
 @dataclass
 class ModelConfig:
+    # Decoder type: "flow_matching" or "vit_decoder"
+    decoder_type: str = "flow_matching"
+    
+    # Shared config
     hidden_size: int = 1152
+    hidden_size_x: int = 64
+    
+    # Flow matching decoder config
     num_decoder_blocks: int = 12
     nerf_max_freqs: int = 8
     flow_steps: int = 25
     time_dim: int = 256
+    
+    # ViT decoder config (when decoder_type="vit_decoder")
+    # Available presets: XL (1024, 24, 16, 4096), L (768, 16, 12, 3072), B (512, 8, 8, 2048)
+    vit_decoder_hidden_size: int = 1024
+    vit_decoder_num_layers: int = 24
+    vit_decoder_num_heads: int = 16
+    vit_decoder_intermediate_size: int = 4096
+    vit_decoder_dropout: float = 0.0
+    gradient_checkpointing: bool = False
 
+    # HF branch config
     enable_hf_branch: bool = True
+    hf_dim: int = 256
+    hf_encoder_config_path: Optional[str] = None
     hf_dropout_prob: float = 0.4
     hf_noise_std: float = 0.1
     hf_loss_weight: float = 0.1
 
+    # Latent config
     target_latent_channels: Optional[int] = None
     variational: bool = False
     kl_weight: float = 1e-8
     skip_to_moments: bool = True
+    
+    # Regularization
     noise_tau: float = 0.0
     random_masking_channel_ratio: float = 0.0
     denormalize_decoder_output: bool = False
 
+    # LoRA
     lora_rank: int = 0
     lora_alpha: int = 0
     lora_dropout: float = 0.0
@@ -59,26 +82,27 @@ class LossConfig:
 
 @dataclass
 class DiscriminatorConfig:
+    # General GAN config
     enabled: bool = False
     disc_type: str = "dino"  # "dino" | "patchgan"
     lr: float = 2e-4
-    start_step: int = 0
+    start_step: int = 0  # Step to start GAN training (0 = from beginning)
     weight_decay: float = 0.0
     betas0: float = 0.5
     betas1: float = 0.9
 
-    # DinoDisc options
+    # DinoDisc options (when disc_type="dino")
     dino_ckpt_path: str = "./dino_vit_small_patch8_224.pth"
-    recipe: str = "S_8"
-    ks: int = 3
-    norm: str = "bn"
-    key_depths: str = "2,5,8,11"
-    diffaug_prob: float = 1.0
-    diffaug_cutout: float = 0.2
+    recipe: str = "S_8"  # "S_8", "S_16", "B_16"
+    ks: int = 3  # Kernel size for head
+    norm: str = "bn"  # "bn" | "gn"
+    key_depths: str = "2,5,8,11"  # Feature extraction depths
+    diffaug_prob: float = 1.0  # DiffAug probability
+    diffaug_cutout: float = 0.2  # DiffAug cutout ratio
 
-    # PatchGAN options
-    ndf: int = 64
-    n_layers: int = 4
+    # PatchGAN options (when disc_type="patchgan")
+    ndf: int = 64  # Number of discriminator filters
+    n_layers: int = 4  # Number of layers
 
 
 @dataclass
@@ -168,6 +192,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler", type=str, default=None, choices=["constant", "cosine"])
     parser.add_argument("--precision", type=str, default=None, choices=["fp32", "bf16"])
 
+    # GAN / Discriminator overrides
+    parser.add_argument("--gan-start-step", type=int, default=None, 
+                        help="Step to start GAN training")
+    parser.add_argument("--disc-lr", type=float, default=None,
+                        help="Discriminator learning rate")
+
     parser.add_argument("--sae-ckpt", type=str, default=None)
     parser.add_argument("--seed", type=int, default=None)
     return parser
@@ -204,6 +234,13 @@ def load_and_merge_config(cli_args=None) -> TrainConfig:
         cfg.optimizer.scheduler = args.scheduler
     if args.precision is not None:
         cfg.training.precision = args.precision
+    
+    # GAN / Discriminator overrides
+    if args.gan_start_step is not None:
+        cfg.discriminator.start_step = args.gan_start_step
+    if args.disc_lr is not None:
+        cfg.discriminator.lr = args.disc_lr
+    
     if args.sae_ckpt is not None:
         cfg.checkpoint.sae_ckpt = args.sae_ckpt
     if args.seed is not None:

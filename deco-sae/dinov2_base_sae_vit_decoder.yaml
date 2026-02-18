@@ -12,25 +12,48 @@ encoder:
   dinov2_model_name: "/cpfs01/huangxu/models/dinov2-register-base"
 
 model:
+  # Decoder type: "flow_matching" or "vit_decoder"
+  decoder_type: "vit_decoder"
+  
+  # Shared config
   hidden_size: 1152
   hidden_size_x: 1152
+  
+  # Flow matching config (only used when decoder_type="flow_matching")
   num_decoder_blocks: 12
   nerf_max_freqs: 8
   flow_steps: 10
   time_dim: 256
+  
+  # ViT decoder config (only used when decoder_type="vit_decoder")
+  # Available presets: XL (1024, 24, 16, 4096), L (768, 16, 12, 3072), B (512, 8, 8, 2048)
+  vit_decoder_hidden_size: 1024     # XL: 1024, L: 768, B: 512
+  vit_decoder_num_layers: 24        # XL: 24, L: 16, B: 8
+  vit_decoder_num_heads: 16         # XL: 16, L: 12, B: 8
+  vit_decoder_intermediate_size: 4096  # XL: 4096, L: 3072, B: 2048
+  vit_decoder_dropout: 0.0
+  gradient_checkpointing: false
+  
+  # HF branch config
   enable_hf_branch: true
-  hf_dim: 64
-  hf_encoder_config_path: "deco-sae/hf_encoder_config.json"
-  hf_dropout_prob: 0
-  hf_noise_std: 0.1
+  hf_dim: 256
+  hf_encoder_config_path: "deco-sae/hf_encoder_config_256.json"
+  hf_dropout_prob: 0.4
+  hf_noise_std: 0.8
   hf_loss_weight: 0.1
+  
+  # Latent config
   target_latent_channels: null
   variational: false
   kl_weight: 1.0e-8
   skip_to_moments: true
+  
+  # Regularization
   noise_tau: 0.0
   random_masking_channel_ratio: 0.0
   denormalize_decoder_output: false
+  
+  # LoRA (disabled for SAE)
   lora_rank: 0
   lora_alpha: 0
   lora_dropout: 0.0
@@ -39,14 +62,14 @@ model:
 loss:
   recon_l2_weight: 0.0
   recon_l1_weight: 1.0
-  recon_lpips_weight: 0.5
-  recon_gan_weight: 0
+  recon_lpips_weight: 1.0
+  recon_gan_weight: 0.5
 
 discriminator:
   enabled: true
   disc_type: "dino"  # "dino" | "patchgan"
   lr: 2.0e-4
-  start_step: 10000
+  start_step: 20000
   weight_decay: 0.0
   betas0: 0.5
   betas1: 0.9
@@ -63,8 +86,8 @@ discriminator:
 optimizer:
   lr: 2.0e-4
   min_lr: 2.0e-5
-  betas0: 0.9
-  betas1: 0.999
+  betas0: 0.5
+  betas1: 0.9
   weight_decay: 0.0
   warmup_steps: 2500
   scheduler: "cosine"
@@ -75,12 +98,13 @@ training:
   seed: 42
 
 logging:
-  output_dir: "results_sae/dinov2_base_flow_matching_hf_pixel_dropout0_better_encoder_hf_dim64"
+  output_dir: "results_sae/dinov2_base_vit_decoder_hf_dim64_dropout0p4_GAN0p5"
   log_every: 20
   eval_every: 2000
   save_every: 10000
-  val_max_batches: 200
+  val_max_batches: 2000
+  # debug: true
 
 checkpoint:
-  sae_ckpt: ""
+  sae_ckpt: 
   strict_load: false
