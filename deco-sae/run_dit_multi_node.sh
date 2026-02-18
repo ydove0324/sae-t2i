@@ -50,7 +50,7 @@ CFG_SCALE="3.0"
 RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"  # 留空则从头训练，如: "results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
 
 # FID 评估配置
-FID_REF_PATH="/cpfs01/huangxu/VIRTUAL_imagenet256_labeled.npz"
+FID_REF_PATH="/cpfs01/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz"
 FID_SAMPLES_PER_CLASS="50"
 FID_BATCH_SIZE="64"
 

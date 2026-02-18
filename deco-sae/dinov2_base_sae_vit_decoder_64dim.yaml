@@ -106,5 +106,5 @@ logging:
   # debug: true
 
 checkpoint:
-  sae_ckpt: 
+  sae_ckpt: results_sae/dinov2_base_vit_decoder_hf_dim64_dropout0p4_GAN0p5/step_60000.pth
   strict_load: false

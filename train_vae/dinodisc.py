@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.spectral_norm import SpectralNorm
 
-from utils import RandomWindowCrop
+from .utils import RandomWindowCrop
 
 dropout_add_layer_norm = fused_mlp_func = None
 flash_attn_qkvpacked_func = None

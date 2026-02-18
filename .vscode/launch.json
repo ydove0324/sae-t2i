@@ -2,6 +2,42 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "deco-sae Train (Single GPU Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "args": [
+                "--nproc_per_node=1",
+                "deco-sae/train_sae.py",
+                "--config",
+                "deco-sae/dinov2_base_sae_vit_decoder.yaml"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "TORCH_HOME": "/cpfs01/huangxu/.cache/torch"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
+            "name": "deco-sae Train (8 GPU, run.sh)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "args": [
+                "--nproc_per_node=8",
+                "deco-sae/train_sae.py",
+                "--config",
+                "deco-sae/dinov2_base_sae_flow_matching.yaml"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "TORCH_HOME": "/cpfs01/huangxu/.cache/torch"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        {
             "name": "DINOv2 DiT Training (Single GPU)",
             "type": "debugpy",
             "request": "launch",
