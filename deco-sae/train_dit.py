@@ -39,6 +39,14 @@ except ImportError:
     HAS_FID = False
     print("Warning: 'pytorch-fid' not found. FID calculation will be skipped.")
 
+# Inception Score and Precision/Recall imports
+try:
+    from torch_fidelity import calculate_metrics
+    HAS_TORCH_FIDELITY = True
+except ImportError:
+    HAS_TORCH_FIDELITY = False
+    print("Warning: 'torch-fidelity' not found. IS and Recall calculations will be skipped.")
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from config_utils import load_config
@@ -317,9 +325,10 @@ def run_fid_evaluation(
     logger,
     writer=None,
     num_classes: int = 1000,
+    ref_images_path: str = None,
 ):
     """
-    Run FID evaluation by generating samples and computing FID score.
+    Run FID, IS, and Recall evaluation by generating samples and computing metrics.
     
     Args:
         model: DiT model (EMA)
@@ -337,15 +346,11 @@ def run_fid_evaluation(
         logger: Logger instance
         writer: TensorBoard writer
         num_classes: Number of classes (default 1000 for ImageNet)
+        ref_images_path: Path to reference images directory for Recall calculation
     """
-    if not HAS_FID:
+    if not HAS_FID and not HAS_TORCH_FIDELITY:
         if rank == 0:
-            logger.warning("FID skipped because pytorch-fid is not installed.")
-        return
-
-    if fid_ref_path is None or not os.path.exists(fid_ref_path):
-        if rank == 0:
-            logger.warning(f"FID skipped because reference path is invalid: {fid_ref_path}")
+            logger.warning("All metrics skipped because no evaluation library is installed.")
         return
 
     # Directories
@@ -353,7 +358,7 @@ def run_fid_evaluation(
     flat_dir = os.path.join(results_dir, "eval_samples", f"step_{step:07d}_flat")
 
     if rank == 0:
-        logger.info(f"========== Starting FID Evaluation (Step {step}) ==========")
+        logger.info(f"========== Starting Evaluation (Step {step}) ==========")
         os.makedirs(eval_dir, exist_ok=True)
 
     dist.barrier()
@@ -411,33 +416,100 @@ def run_fid_evaluation(
 
     dist.barrier()
 
-    # FID calculation (rank 0 only)
+    # Metrics calculation (rank 0 only)
     if rank == 0:
-        logger.info("Generation finished. Flattening directory for FID...")
+        logger.info("Generation finished. Flattening directory for evaluation...")
+        
+        fid_value = None
+        is_value = None
+        precision_value = None
+        recall_value = None
+        
         try:
             num_imgs = create_flat_temp_dir(eval_dir, flat_dir)
             if num_imgs < 100:
-                logger.warning(f"Too few images ({num_imgs}) for valid FID.")
+                logger.warning(f"Too few images ({num_imgs}) for valid metrics.")
             else:
-                logger.info(f"Calculating FID using {num_imgs} images...")
-                fid_value = fid_score.calculate_fid_given_paths(
-                    paths=[flat_dir, fid_ref_path],
-                    batch_size=50,
-                    device=device,
-                    dims=2048,
-                    num_workers=8
-                )
-                logger.info(f"Step {step} FID: {fid_value:.4f}")
-
+                # ============ FID Calculation (pytorch-fid) ============
+                if HAS_FID and fid_ref_path is not None and os.path.exists(fid_ref_path):
+                    logger.info(f"Calculating FID using {num_imgs} images...")
+                    try:
+                        fid_value = fid_score.calculate_fid_given_paths(
+                            paths=[flat_dir, fid_ref_path],
+                            batch_size=50,
+                            device=device,
+                            dims=2048,
+                            num_workers=8
+                        )
+                        logger.info(f"Step {step} FID: {fid_value:.4f}")
+                    except Exception as e:
+                        logger.error(f"FID Calculation failed: {e}")
+                
+                # ============ IS, Precision, Recall (torch-fidelity) ============
+                if HAS_TORCH_FIDELITY:
+                    logger.info(f"Calculating IS, Precision, Recall using {num_imgs} images...")
+                    try:
+                        # Calculate Inception Score (doesn't need reference)
+                        is_metrics = calculate_metrics(
+                            input1=flat_dir,
+                            cuda=True,
+                            isc=True,  # Inception Score
+                            isc_splits=10,
+                            verbose=False,
+                        )
+                        is_value = is_metrics.get('inception_score_mean', None)
+                        is_std = is_metrics.get('inception_score_std', None)
+                        if is_value is not None:
+                            logger.info(f"Step {step} IS: {is_value:.4f} ± {is_std:.4f}")
+                        
+                        # Calculate Precision and Recall (needs reference images)
+                        if ref_images_path is not None and os.path.exists(ref_images_path):
+                            logger.info(f"Calculating Precision/Recall with reference: {ref_images_path}")
+                            pr_metrics = calculate_metrics(
+                                input1=flat_dir,
+                                input2=ref_images_path,
+                                cuda=True,
+                                prc=True,  # Precision and Recall
+                                verbose=False,
+                            )
+                            precision_value = pr_metrics.get('precision', None)
+                            recall_value = pr_metrics.get('recall', None)
+                            if precision_value is not None:
+                                logger.info(f"Step {step} Precision: {precision_value:.4f}")
+                            if recall_value is not None:
+                                logger.info(f"Step {step} Recall: {recall_value:.4f}")
+                        else:
+                            logger.warning("Recall/Precision skipped: ref_images_path not provided or invalid")
+                            
+                    except Exception as e:
+                        logger.error(f"torch-fidelity metrics calculation failed: {e}")
+                
+                # ============ Log to TensorBoard ============
                 if writer is not None:
-                    writer.add_scalar("eval/FID", fid_value, global_step=step)
-
-                # Write to text file
-                with open(os.path.join(results_dir, "fid_scores.txt"), "a") as f:
-                    f.write(f"Step {step}: {fid_value:.4f}\n")
+                    if fid_value is not None:
+                        writer.add_scalar("eval/FID", fid_value, global_step=step)
+                    if is_value is not None:
+                        writer.add_scalar("eval/IS", is_value, global_step=step)
+                    if precision_value is not None:
+                        writer.add_scalar("eval/Precision", precision_value, global_step=step)
+                    if recall_value is not None:
+                        writer.add_scalar("eval/Recall", recall_value, global_step=step)
+                
+                # ============ Write to text file ============
+                with open(os.path.join(results_dir, "eval_metrics.txt"), "a") as f:
+                    f.write(f"Step {step}:\n")
+                    if fid_value is not None:
+                        f.write(f"  FID: {fid_value:.4f}\n")
+                    if is_value is not None:
+                        f.write(f"  IS: {is_value:.4f}\n")
+                    if precision_value is not None:
+                        f.write(f"  Precision: {precision_value:.4f}\n")
+                    if recall_value is not None:
+                        f.write(f"  Recall: {recall_value:.4f}\n")
+                    f.write("\n")
 
         except Exception as e:
-            logger.error(f"FID Calculation failed: {e}")
+            logger.error(f"Metrics Calculation failed: {e}")
         finally:
             # Clean up flat directory to save space
             if os.path.exists(flat_dir):
@@ -447,7 +519,7 @@ def run_fid_evaluation(
             #     shutil.rmtree(eval_dir)
 
     dist.barrier()
-    logger.info(f"========== End FID Evaluation (Step {step}) ==========")
+    logger.info(f"========== End Evaluation (Step {step}) ==========")
 
 
 #################################################################################
@@ -466,15 +538,17 @@ def main():
     parser.add_argument("--cfg-prob", type=float, default=0.1, help="CFG dropout probability")
     parser.add_argument("--cfg-scale", type=float, default=3.0, help="CFG scale for sampling")
     
-    # FID evaluation args
+    # Evaluation args (FID, IS, Recall)
     parser.add_argument("--fid-ref-path", type=str, default="VIRTUAL_imagenet256_labeled.npz",
                         help="Path to reference FID statistics (.npz)")
+    parser.add_argument("--ref-images-path", type=str, default=None,
+                        help="Path to reference images directory for Precision/Recall calculation")
     parser.add_argument("--fid-samples-per-class", type=int, default=50,
                         help="Number of samples per class for FID evaluation")
     parser.add_argument("--fid-batch-size", type=int, default=32,
                         help="Batch size for FID generation")
     parser.add_argument("--skip-fid", action="store_true",
-                        help="Skip FID evaluation")
+                        help="Skip FID/IS/Recall evaluation")
     args = parser.parse_args()
 
     # Parse DiT config
@@ -584,8 +658,8 @@ def main():
     sched_state = None
     train_steps = 0
 
-    # Resume checkpoint
-    if args.ckpt is not None:
+    # Resume checkpoint (skip if None, empty string, or file doesn't exist)
+    if args.ckpt and os.path.isfile(args.ckpt):
         checkpoint = torch.load(args.ckpt, map_location="cpu")
         if "model" in checkpoint:
             model.load_state_dict(checkpoint["model"], strict=False)
@@ -596,6 +670,9 @@ def main():
         train_steps = int(checkpoint.get("train_steps", 0))
         if rank == 0:
             logger.info(f"Resumed from {args.ckpt}, train_steps={train_steps}")
+    else:
+        if rank == 0:
+            logger.info("No checkpoint provided or file not found, training from scratch.")
 
     model_param_count = sum(p.numel() for p in model.parameters())
     logger.info(f"DiT Parameters: {model_param_count / 1e6:.2f}M")
@@ -827,6 +904,7 @@ def main():
                         logger=logger,
                         writer=writer,
                         num_classes=num_classes,
+                        ref_images_path=args.ref_images_path,
                     )
                     
                     model.train()

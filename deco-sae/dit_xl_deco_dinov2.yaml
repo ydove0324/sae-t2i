@@ -6,7 +6,7 @@ stage_2:
   params:
     input_size: 16
     patch_size: 1
-    in_channels: 1024  # 768 (DINOv2-base) + 256 (HF)
+    in_channels: 1024  # 768 (DINOv2-base) + 64 (HF)
     hidden_size: [1152, 2048]
     depth: [28, 2]
     num_heads: [16, 16]
@@ -43,9 +43,9 @@ guidance:
   t_max: 1.0
 
 misc:
-  latent_size: [1024, 16, 16]  # [C, H, W] - 768 (DINOv2) + 256 (HF)
+  latent_size: [1024, 16, 16]  # [C, H, W] - 768 (DINOv2) + 64 (HF)
   num_classes: 1000
-  time_dist_shift_dim: 262144  # 16*16*1024
+  time_dist_shift_dim: 212992  # 16*16*832
   time_dist_shift_base: 4096
 
 training:

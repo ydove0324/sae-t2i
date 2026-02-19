@@ -9,9 +9,9 @@ Manipulations:
 5. Add 0.2 * Gaussian noise to HF
 6. Add 0.5 * Gaussian noise to HF
 
-python test_sae.py \
-    --config dinov2_base_sae_vit_decoder.yaml \
-    --ckpt ../results_sae/dinov2_base_vit_decoder_hf_dim64_dropout0p4_GAN0p5/step_60000.pth \
+python deco-sae/test_sae.py \
+    --config deco-sae/dinov2_base_sae_vit_decoder.yaml \
+    --ckpt results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth \
     --output test_hf_manipulation.png \
     --num_images 4 \
     --seed 42
@@ -174,7 +174,8 @@ def manipulate_hf_tokens(
         # Replace with Gaussian noise (same std as original HF tokens)
         std = s_hf.std()
         mean = s_hf.mean()
-        noise = torch.randn_like(s_hf) * std + mean
+        print(f"Gaussian replace: std={std}, mean={mean}")
+        noise = torch.randn_like(s_hf) * std * 0.5 + mean
         return noise
     
     elif mode == "gaussian_add_0.2":
