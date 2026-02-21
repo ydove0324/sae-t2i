@@ -37,27 +37,28 @@ MASTER_PORT="27532"
 
 # =================== 脚本和模型配置 ===================
 TRAIN_SCRIPT="deco-sae/train_dit.py"
-DIT_CONFIG="deco-sae/dit_xl_deco_dinov2.yaml"
-SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder_64dim.yaml"
-SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim64_dropout0p4_GAN0p5/step_100000.pth"
+DIT_CONFIG="deco-sae/dit_xl_deco_dinov2_joint_train.yaml"
+SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder.yaml"
+SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth"
 DATA_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
-RESULTS_DIR="results_dit/deco_dinov2_base_dit_xl_64dim"
+RESULTS_DIR="results_dit/deco_dinov2_base_dit_xl_hf_joint_train_reweight_256dim"
 PRECISION="bf16"
 CFG_PROB="0.1"
 CFG_SCALE="3.0"
 
 # 可选：断点续训
-RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl_64dim/checkpoints/latest.pt"  # 留空则从头训练，如: "results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
+RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl_hf_zero_mode_256dim/checkpoints/0075000.pt"  # 留空则从头训练，如: "results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
 # RESUME_CKPT=""
 
 # FID 评估配置
 FID_REF_PATH="/cpfs01/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz"
 FID_SAMPLES_PER_CLASS="50"
 FID_BATCH_SIZE="64"
+REF_IMAGES_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val_256/"
 
 # =================== 日志配置 ===================
 LOG_DIR="log"
-LOG_FILE="${LOG_DIR}/deco_dinov2_dit_xl_multi_node_64dim.log"
+LOG_FILE="${LOG_DIR}/deco_dinov2_dit_xl_multi_node_hf_joint_train_reweight.log"
 TMUX_SESSION="deco_dit"
 
 # Conda环境配置
@@ -94,7 +95,8 @@ TRAIN_ARGS="--config $DIT_CONFIG \
     --ckpt $RESUME_CKPT \
     --fid-ref-path $FID_REF_PATH \
     --fid-samples-per-class $FID_SAMPLES_PER_CLASS \
-    --fid-batch-size $FID_BATCH_SIZE"
+    --fid-batch-size $FID_BATCH_SIZE \
+    --ref-images-path $REF_IMAGES_PATH"
 
 # =================== Master节点启动 ===================
 echo "=========================================="
@@ -127,7 +129,7 @@ MASTER_CMD="torchrun --nnodes=$NUM_NODES --node_rank=0 \
     $TRAIN_ARGS"
 
 echo "Master command: $MASTER_CMD"
-nohup $MASTER_CMD > $LOG_FILE 2>&1 < /dev/null &
+nohup $MASTER_CMD >> $LOG_FILE 2>&1 < /dev/null &
 MASTER_PID=$!
 echo "Master process PID: $MASTER_PID"
 echo "Master log: $LOG_FILE"

@@ -10,8 +10,8 @@ DIT_CONFIG="deco-sae/dit_xl_deco_dinov2.yaml"
 SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder.yaml"
 SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth"
 DATA_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
-RESULTS_DIR="results_dit/deco_dinov2_base_dit_xl"
-RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
+RESULTS_DIR="results_dit/deco_dinov2_base_dit_xl_zero_hf_mode"
+RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl_zero_hf_mode/checkpoints/latest.pt"
 
 # FID 评估配置
 FID_REF_PATH="/cpfs01/huangxu/VIRTUAL_imagenet256_labeled.npz"

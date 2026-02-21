@@ -49,13 +49,13 @@ misc:
   time_dist_shift_base: 4096
   # Zero HF mode: when true, HF channels are zeroed during training and evaluation
   # Loss is only computed on semantic channels, HF channels are excluded
-  zero_hf_mode: true
+  zero_hf_mode: false
 
   # hf_zero_then_joint mode: first train with zero HF, then switch to joint training
   # at joint_start_step. Supersedes zero_hf_mode when both are true.
   # In joint phase, logs separate semantic/hf loss and grad norms.
-  hf_zero_then_joint_mode: false
-  joint_start_step: 50000
+  hf_zero_then_joint_mode: true
+  joint_start_step: 75000
 
 training:
   global_seed: 0
@@ -65,6 +65,7 @@ training:
   ema_decay: 0.9995
   num_workers: 4
   log_every: 100
+  balance_every: 10
   ckpt_every: 25000
   sample_every: 1000
   base_lr: 0.0002

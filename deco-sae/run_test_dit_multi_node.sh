@@ -40,8 +40,8 @@ TEST_SCRIPT="deco-sae/test_dit.py"
 DIT_CONFIG="deco-sae/dit_xl_deco_dinov2.yaml"
 SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder.yaml"
 SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth"
-DIT_CKPT="results_dit/deco_dinov2_base_dit_xl/checkpoints/0100000.pt"
-OUTPUT_DIR="results_dit/deco_dinov2_base_dit_xl_256dim/test_results"
+DIT_CKPT="results_dit/deco_dinov2_base_dit_xl_hf_joint_train_reweight_256dim/checkpoints/0100000.pt"
+OUTPUT_DIR="results_dit/deco_dinov2_base_dit_xl_hf_joint_train_reweight_256dim/test_results"
 
 # FID 评估配置
 FID_REF_PATH="/cpfs01/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz"

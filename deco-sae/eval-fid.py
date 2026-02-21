@@ -5,14 +5,20 @@ import os
 import shutil
 import torch
 import numpy as np
+import argparse
 
 os.environ["TORCH_HOME"] = "/cpfs01/huangxu/.cache/torch"
 os.environ["http_proxy"] = "localhost:27890"
 os.environ["https_proxy"] = "localhost:27890"
 
+# 解析命令行参数
+parser = argparse.ArgumentParser(description="Evaluate FID, IS, Precision, and Recall")
+parser.add_argument("--force-flatten", action="store_true", help="强制重新展开目录，即使已存在")
+args = parser.parse_args()
+
 # 路径配置
-source_dir = "results_dit/deco_dinov2_base_dit_xl/eval_samples/step_0150000/"
-flat_dir = "results_dit/deco_dinov2_base_dit_xl/eval_samples/step_0150000_flat/"
+source_dir = "results_dit/deco_dinov2_base_dit_xl_hf_zero_mode_256dim/eval_samples/step_0050000"
+flat_dir = "results_dit/deco_dinov2_base_dit_xl_hf_zero_mode_256dim/eval_samples/step_0050000_flat/"
 # 使用预计算的 ImageNet 256x256 统计文件（用于 FID）
 ref_npz_path = "/cpfs01/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz"
 # 256x256 的 ImageNet 验证集（用于 Precision/Recall）
@@ -44,12 +50,12 @@ def create_flat_temp_dir(source_root, temp_dir):
     return count
 
 
-# 1. 展平目录（如果已存在则跳过）
+# 1. 展平目录（如果已存在则跳过，除非指定 --force-flatten）
 print("=" * 60)
 print("Step 1: Checking/Flattening directory structure...")
 
 # 检查 flat_dir 是否已存在且有图片
-if os.path.exists(flat_dir):
+if os.path.exists(flat_dir) and not args.force_flatten:
     existing_files = [f for f in os.listdir(flat_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     num_images = len(existing_files)
     if num_images > 0:
@@ -59,7 +65,10 @@ if os.path.exists(flat_dir):
         num_images = create_flat_temp_dir(source_dir, flat_dir)
         print(f"  Total images: {num_images}")
 else:
-    print("  Creating flat_dir...")
+    if args.force_flatten:
+        print("  Force flatten enabled, re-creating flat_dir...")
+    else:
+        print("  Creating flat_dir...")
     num_images = create_flat_temp_dir(source_dir, flat_dir)
     print(f"  Total images: {num_images}")
 

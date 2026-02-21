@@ -224,22 +224,30 @@ def build_model(cfg, device: torch.device) -> DecoSAE:
     ).to(device)
 
 
-def freeze_for_hf_and_pixel_decoder(model: DecoSAE):
+def freeze_for_hf_and_pixel_decoder(
+    model: DecoSAE,
+    freeze_semantic_encoder: bool = True,
+    freeze_hf_encoder: bool = False,
+):
     requires_grad(model, False)
     trainable_modules = [
-        model.hf_encoder,
         model.fused_norm,
         model.fused_proj,
         model.decoder,
     ]
+    if not freeze_hf_encoder:
+        trainable_modules.append(model.hf_encoder)
     # Flow matching specific modules (may be None for ViT decoder)
     if model.t_embedder is not None:
         trainable_modules.append(model.t_embedder)
     if model.coord_embedder is not None:
         trainable_modules.append(model.coord_embedder)
-    
+
     for module in trainable_modules:
         requires_grad(module, True)
+
+    if not freeze_semantic_encoder:
+        requires_grad(model.encoder, True)
 
 
 def build_discriminator(cfg, device: torch.device):
@@ -384,8 +392,14 @@ def main():
         model, cfg.checkpoint.sae_ckpt, cfg.checkpoint.strict_load, logger
     )
 
-    # Freeze semantic encoder; train only HF encoder and pixel decoder path.
-    freeze_for_hf_and_pixel_decoder(model)
+    # Freeze semantic encoder and/or HF encoder according to config.
+    freeze_semantic_encoder = getattr(cfg.training, "freeze_semantic_encoder", True)
+    freeze_hf_encoder = getattr(cfg.training, "freeze_hf_encoder", False)
+    freeze_for_hf_and_pixel_decoder(
+        model,
+        freeze_semantic_encoder=freeze_semantic_encoder,
+        freeze_hf_encoder=freeze_hf_encoder,
+    )
     model.train()
 
     if rank == 0:

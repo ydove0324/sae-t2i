@@ -1,3 +1,5 @@
+# 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 new one!!!
+# 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
 """
 Train DiT (Diffusion Transformer) on DECO-SAE latent space.
 Uses config-driven approach with minimal argparse.
@@ -11,6 +13,7 @@ import os
 import shutil
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from glob import glob
 from time import time
@@ -85,12 +88,24 @@ def compute_train_loss(
     x_latent: torch.Tensor,
     model_kwargs: dict,
     time_shift: float = 1.0,
+    semantic_channels: int = None,
+    component_split_ch: int = None,
 ):
     """
     Compute flow matching training loss.
     
     x_t = t * noise + (1 - t) * x_0
     target = x_0 (x-prediction)
+    
+    Args:
+        model: DiT model
+        x_latent: Latent tensor [B, C, H, W]
+        model_kwargs: Additional model arguments
+        time_shift: Time shift for flow matching
+        semantic_channels: If not None, only compute loss on first semantic_channels channels
+                          (used for zero_hf_mode to exclude HF channels from loss)
+        component_split_ch: If not None, also return separate semantic/hf losses
+                           split at this channel index (for joint mode monitoring)
     """
     B = x_latent.size(0)
     device = x_latent.device
@@ -101,16 +116,42 @@ def compute_train_loss(
     t_broadcast = t.view(B, 1, 1, 1)
     x_t = t_broadcast * noise + (1.0 - t_broadcast) * x_latent
 
-    # Model predicts x_0
     model_output = model(x_t, t, **model_kwargs)
 
-    # MSE loss with reweighting
-    loss = F.mse_loss(model_output, x_latent, reduction="none")
     reweight_scale = torch.clamp_max(1.0 / (t**2 + 1e-8), 10)
-    loss = loss * reweight_scale.view(B, 1, 1, 1)
-    loss = loss.mean()
+    rw = reweight_scale.view(B, 1, 1, 1)
 
-    return loss, model_output, noise, t
+    components = {}
+    if component_split_ch is not None and component_split_ch > 0:
+        sem_loss = F.mse_loss(
+            model_output[:, :component_split_ch],
+            x_latent[:, :component_split_ch],
+            reduction="none",
+        )
+        sem_loss = sem_loss * rw
+        components["semantic_loss"] = sem_loss.mean()
+        hf_loss = F.mse_loss(
+            model_output[:, component_split_ch:],
+            x_latent[:, component_split_ch:],
+            reduction="none",
+        )
+        hf_loss = hf_loss * rw
+        components["hf_loss"] = hf_loss.mean()
+
+        if semantic_channels is not None and semantic_channels > 0:
+            # Keep zero_hf semantics: optimize only semantic channels.
+            loss = components["semantic_loss"]
+        else:
+            # Use per-element merged mean so scale matches full-channel MSE.
+            loss = torch.cat([sem_loss, hf_loss], dim=1).mean()
+    else:
+        if semantic_channels is not None and semantic_channels > 0:
+            loss = F.mse_loss(model_output[:, :semantic_channels], x_latent[:, :semantic_channels], reduction="none")
+        else:
+            loss = F.mse_loss(model_output, x_latent, reduction="none")
+        loss = (loss * rw).mean()
+
+    return loss, model_output, noise, t, components
 
 
 @torch.no_grad()
@@ -236,10 +277,16 @@ def load_sae_checkpoint(model: DecoSAE, ckpt_path: str, device: torch.device, lo
 def encode_with_deco_sae(
     sae_model: DecoSAE,
     x_img: torch.Tensor,
+    zero_hf: bool = False,
 ) -> torch.Tensor:
     """
     Encode images using DECO-SAE.
     Returns fused latent [B, N, semantic_channels + hf_dim] reshaped to [B, C, H, W].
+    
+    Args:
+        sae_model: DECO-SAE model
+        x_img: Input images [B, 3, H, W]
+        zero_hf: If True, zero out the HF channels
     """
     sae_model.eval()
     
@@ -248,7 +295,8 @@ def encode_with_deco_sae(
     z = enc.latent  # [B, semantic_channels, H_p, W_p]
     
     # Get fused encoding (semantic + HF)
-    enc_cond = sae_model.encode(z, x_img=x_img, force_drop_hf=False)  # [B, N, C]
+    # force_drop_hf=True will zero out HF tokens
+    enc_cond = sae_model.encode(z, x_img=x_img, force_drop_hf=zero_hf)  # [B, N, C]
     
     # Reshape to spatial format [B, C, H, W]
     B, N, C = enc_cond.shape
@@ -262,15 +310,28 @@ def encode_with_deco_sae(
 def decode_with_deco_sae(
     sae_model: DecoSAE,
     latent: torch.Tensor,
+    zero_hf: bool = False,
 ) -> torch.Tensor:
     """
     Decode latent using DECO-SAE.
     latent: [B, C, H, W] fused latent
     Returns: [B, 3, image_size, image_size] reconstructed images
+    
+    Args:
+        sae_model: DECO-SAE model
+        latent: Fused latent [B, C, H, W] where C = semantic_channels + hf_dim
+        zero_hf: If True, zero out the HF channels before decoding
     """
     sae_model.eval()
     
     B, C, H, W = latent.shape
+    
+    # Zero out HF channels if requested
+    if zero_hf and sae_model.hf_dim > 0:
+        latent = latent.clone()
+        semantic_channels = sae_model.semantic_channels
+        latent[:, semantic_channels:, :, :] = 0.0
+    
     # Reshape to [B, N, C]
     enc_cond = latent.view(B, C, H * W).transpose(1, 2).contiguous()
     
@@ -326,6 +387,7 @@ def run_fid_evaluation(
     writer=None,
     num_classes: int = 1000,
     ref_images_path: str = None,
+    zero_hf: bool = False,
 ):
     """
     Run FID, IS, and Recall evaluation by generating samples and computing metrics.
@@ -347,6 +409,7 @@ def run_fid_evaluation(
         writer: TensorBoard writer
         num_classes: Number of classes (default 1000 for ImageNet)
         ref_images_path: Path to reference images directory for Recall calculation
+        zero_hf: If True, zero out HF channels during decoding
     """
     if not HAS_FID and not HAS_TORCH_FIDELITY:
         if rank == 0:
@@ -400,8 +463,8 @@ def run_fid_evaluation(
                     use_cfg=False,
                 )
 
-                # 2. Decode with DECO-SAE
-                imgs = decode_with_deco_sae(sae_model, z_sample.float())
+                # 2. Decode with DECO-SAE (force drop HF when zero_hf is True)
+                imgs = decode_with_deco_sae(sae_model, z_sample.float(), zero_hf=zero_hf)
 
             # Convert to [0, 1] range
             imgs = (imgs + 1.0) / 2.0
@@ -511,14 +574,24 @@ def run_fid_evaluation(
         except Exception as e:
             logger.error(f"Metrics Calculation failed: {e}")
         finally:
-            # Clean up flat directory to save space
+            # Clean up flat directory with multi-threading for speed
             if os.path.exists(flat_dir):
-                shutil.rmtree(flat_dir)
-            # Optional: keep eval_dir for inspection, or uncomment to delete
-            # if os.path.exists(eval_dir):
-            #     shutil.rmtree(eval_dir)
+                files = [os.path.join(flat_dir, f) for f in os.listdir(flat_dir)]
+                with ThreadPoolExecutor(max_workers=32) as executor:
+                    executor.map(os.remove, files)
+                os.rmdir(flat_dir)
 
     dist.barrier()
+    
+    # Each rank cleans up its own class directories in paralle
+    
+    dist.barrier()
+    
+    # Rank 0 removes the empty eval_dir after all ranks finish cleanup
+    if rank == 0:
+        if os.path.exists(eval_dir) and not os.listdir(eval_dir):
+            os.rmdir(eval_dir)
+    
     logger.info(f"========== End Evaluation (Step {step}) ==========")
 
 
@@ -579,6 +652,7 @@ def main():
     global_batch_size = int(training_cfg.get("global_batch_size", 512))
     num_workers = int(training_cfg.get("num_workers", 4))
     log_every = int(training_cfg.get("log_every", 100))
+    balance_every = int(training_cfg.get("balance_every", 0))
     ckpt_every = int(training_cfg.get("ckpt_every", 10000))
     sample_every = int(training_cfg.get("sample_every", 10000))
     global_seed = int(training_cfg.get("global_seed", 0))
@@ -592,6 +666,15 @@ def main():
     shift_dim = latent_size[0] * latent_size[1] * latent_size[2]
     shift_base = misc.get("time_dist_shift_base", 4096)
     time_shift = math.sqrt(shift_dim / shift_base)
+
+    # Zero HF mode: when True, HF channels are zeroed and excluded from loss
+    zero_hf_mode = bool(misc.get("zero_hf_mode", False))
+
+    # hf_zero_then_joint mode: train with zero HF first, then switch to joint training
+    hf_zero_then_joint_mode = bool(misc.get("hf_zero_then_joint_mode", False))
+    joint_start_step = int(misc.get("joint_start_step", 0))
+    if hf_zero_then_joint_mode and zero_hf_mode:
+        zero_hf_mode = False  # hf_zero_then_joint supersedes pure zero_hf
 
     # DDP setup
     rank, local_rank, world_size = setup_ddp()
@@ -608,6 +691,11 @@ def main():
     if rank == 0:
         print(f"Starting rank={rank}, seed={seed}, world_size={world_size}")
         print(f"Latent size: {latent_size}, time_shift: {time_shift:.4f}")
+        print(f"Zero HF mode: {zero_hf_mode}")
+        if hf_zero_then_joint_mode:
+            print(f"hf_zero_then_joint mode: ON, joint_start_step={joint_start_step}")
+        if balance_every > 0:
+            print(f"Gradient balance: ON, balance_every={balance_every}")
 
     # Create directories
     if rank == 0:
@@ -640,6 +728,23 @@ def main():
     sae_model.eval()
     requires_grad(sae_model, False)
     logger.info(f"DECO-SAE loaded. Semantic channels: {sae_model.semantic_channels}, HF dim: {sae_model.hf_dim}")
+    time_shift_full = time_shift
+    time_shift_semantic = math.sqrt((sae_model.semantic_channels * latent_size[1] * latent_size[2]) / shift_base)
+
+    if zero_hf_mode:
+        time_shift = time_shift_semantic
+        if rank == 0:
+            logger.info("Zero HF mode is enabled. HF channels are zeroed during training and evaluation.")
+            logger.info(f"Semantic channels: {sae_model.semantic_channels}, HF dim: {sae_model.hf_dim}")
+            logger.info(f"Time shift: {time_shift:.4f}")
+
+    if hf_zero_then_joint_mode:
+        time_shift = time_shift_semantic
+        time_shift_full = time_shift_semantic  # keep time_shift unchanged across phases
+        if rank == 0:
+            logger.info(f"hf_zero_then_joint mode: joint training starts at step {joint_start_step}")
+            logger.info(f"  Semantic channels: {sae_model.semantic_channels}, HF dim: {sae_model.hf_dim}")
+            logger.info(f"  time_shift: {time_shift_semantic:.4f} (unchanged across phases)")
 
     # Verify latent dimensions match
     expected_channels = sae_model.semantic_channels + sae_model.hf_dim
@@ -679,6 +784,7 @@ def main():
 
     # DDP wrap
     model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=False)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     # Optimizer
     opt, opt_msg = build_optimizer(model.parameters(), training_cfg)
@@ -728,7 +834,15 @@ def main():
 
     log_steps = 0
     running_loss = 0.0
+    running_sem_loss = 0.0
+    running_hf_loss = 0.0
     start_time = time()
+    joint_phase_started = (train_steps >= joint_start_step) if hf_zero_then_joint_mode else False
+    last_sem_grad_norm = None
+    last_hf_grad_norm = None
+    sem_loss_weight = 1.0
+    hf_loss_weight = 1.0
+    grad_ratio_ema = 1.0
 
     logger.info("Starting training...")
 
@@ -740,14 +854,28 @@ def main():
         opt.zero_grad()
         accum_counter = 0
         step_loss_accum = 0.0
+        step_sem_loss_accum = 0.0
+        step_hf_loss_accum = 0.0
 
         for x_img, y in loader:
             x_img = x_img.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
 
+            # Determine current phase
+            if hf_zero_then_joint_mode:
+                in_joint_phase = (train_steps >= joint_start_step)
+                current_zero_hf = not in_joint_phase
+                current_time_shift = time_shift_full if in_joint_phase else time_shift_semantic
+                component_ch = sae_model.semantic_channels if in_joint_phase else None
+            else:
+                in_joint_phase = False
+                current_zero_hf = zero_hf_mode
+                current_time_shift = time_shift
+                component_ch = None
+
             # Encode with DECO-SAE
             with torch.no_grad(), autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                x_latent = encode_with_deco_sae(sae_model, x_img)
+                x_latent = encode_with_deco_sae(sae_model, x_img, zero_hf=current_zero_hf)
 
             # CFG label dropout
             NULL_CLASS = num_classes
@@ -761,12 +889,15 @@ def main():
             model_kwargs = dict(y=y_train)
 
             # Forward + loss
+            semantic_channels_for_loss = sae_model.semantic_channels if current_zero_hf else None
             with autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                loss_tensor, pred_latent, noise, t_sample = compute_train_loss(
+                loss_tensor, pred_latent, noise, t_sample, loss_components = compute_train_loss(
                     model=model,
                     x_latent=x_latent,
                     model_kwargs=model_kwargs,
                     time_shift=time_shift,
+                    semantic_channels=semantic_channels_for_loss,
+                    component_split_ch=component_ch,
                 )
 
             # NaN check
@@ -780,8 +911,70 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 accum_counter = 0
                 step_loss_accum = 0.0
+                step_sem_loss_accum = 0.0
+                step_hf_loss_accum = 0.0
                 dist.barrier()
                 continue
+
+            # Track component losses
+            if loss_components:
+                step_sem_loss_accum += loss_components["semantic_loss"].item()
+                step_hf_loss_accum += loss_components["hf_loss"].item()
+
+            # Dynamic loss reweighting for semantic/HF gradient balance in joint phase.
+            if in_joint_phase and loss_components and balance_every > 0:
+                loss_tensor = (
+                    sem_loss_weight * loss_components["semantic_loss"]
+                    + hf_loss_weight * loss_components["hf_loss"]
+                )
+
+            # Compute separate grad norms:
+            # - for logging at log boundary
+            # - for dynamic reweighting at balance boundary
+            need_balance_grads = (
+                in_joint_phase
+                and loss_components
+                and balance_every > 0
+                and accum_counter == grad_accum_steps - 1
+                and (train_steps + 1) % balance_every == 0
+            )
+            need_component_grads = (
+                in_joint_phase
+                and loss_components
+                and accum_counter == grad_accum_steps - 1
+                and (train_steps + 1) % log_every == 0
+            )
+            need_grad_stats = need_balance_grads or need_component_grads
+
+            if need_grad_stats:
+                sem_grads = torch.autograd.grad(
+                    loss_components["semantic_loss"], trainable_params,
+                    retain_graph=True, allow_unused=True,
+                )
+                last_sem_grad_norm = torch.sqrt(
+                    sum((g.float().norm() ** 2) for g in sem_grads if g is not None)
+                ).item()
+
+                hf_grads = torch.autograd.grad(
+                    loss_components["hf_loss"], trainable_params,
+                    retain_graph=True, allow_unused=True,
+                )
+                last_hf_grad_norm = torch.sqrt(
+                    sum((g.float().norm() ** 2) for g in hf_grads if g is not None)
+                ).item()
+
+                if need_balance_grads:
+                    eps = 1e-8
+                    ratio = (last_sem_grad_norm + eps) / (last_hf_grad_norm + eps)
+                    grad_ratio_ema = 0.9 * grad_ratio_ema + 0.1 * ratio
+                    adj = grad_ratio_ema ** 0.5
+                    sem_loss_weight = 1.0 / max(adj, eps)
+                    hf_loss_weight = max(adj, eps)
+                    sem_loss_weight = float(min(max(sem_loss_weight, 0.2), 5.0))
+                    hf_loss_weight = float(min(max(hf_loss_weight, 0.2), 5.0))
+                    norm = max(0.5 * (sem_loss_weight + hf_loss_weight), eps)
+                    sem_loss_weight /= norm
+                    hf_loss_weight /= norm
 
             # Backward
             step_loss_accum += loss_tensor.item()
@@ -804,10 +997,24 @@ def main():
             opt.zero_grad()
 
             running_loss += step_loss_accum / grad_accum_steps
+            if in_joint_phase:
+                running_sem_loss += step_sem_loss_accum / grad_accum_steps
+                running_hf_loss += step_hf_loss_accum / grad_accum_steps
             log_steps += 1
             train_steps += 1
             accum_counter = 0
             step_loss_accum = 0.0
+            step_sem_loss_accum = 0.0
+            step_hf_loss_accum = 0.0
+
+            # Log phase transition
+            if hf_zero_then_joint_mode and not joint_phase_started and train_steps >= joint_start_step:
+                joint_phase_started = True
+                if rank == 0:
+                    logger.info("=" * 60)
+                    logger.info(f"Switching to JOINT training at step {train_steps}")
+                    logger.info(f"Time shift: {time_shift_full:.4f} (unchanged)")
+                    logger.info("=" * 60)
 
             # Logging
             if train_steps % log_every == 0:
@@ -819,23 +1026,43 @@ def main():
                 avg_loss = avg_loss.item() / world_size
 
                 if rank == 0:
-                    print(
+                    msg = (
                         f"(step={train_steps:07d}) Loss: {avg_loss:.4f}, "
                         f"Steps/Sec: {steps_per_sec:.2f}, Grad Norm: {float(grad_norm):.4f}"
                     )
+                    if in_joint_phase and log_steps > 0:
+                        avg_sem = running_sem_loss / log_steps
+                        avg_hf = running_hf_loss / log_steps
+                        msg += f", Sem Loss: {avg_sem:.4f}, HF Loss: {avg_hf:.4f}"
+                        if last_sem_grad_norm is not None:
+                            msg += f", Sem GradNorm: {last_sem_grad_norm:.4f}, HF GradNorm: {last_hf_grad_norm:.4f}"
+                        if balance_every > 0:
+                            msg += f", SemW: {sem_loss_weight:.3f}, HFW: {hf_loss_weight:.3f}"
+                    print(msg)
+
                     if writer is not None:
                         writer.add_scalar("train/loss", avg_loss, global_step=train_steps)
                         writer.add_scalar("train/steps_per_sec", steps_per_sec, global_step=train_steps)
                         writer.add_scalar("train/grad_norm", float(grad_norm), global_step=train_steps)
+                        if in_joint_phase and log_steps > 0:
+                            writer.add_scalar("train/semantic_loss", avg_sem, global_step=train_steps)
+                            writer.add_scalar("train/hf_loss", avg_hf, global_step=train_steps)
+                            if last_sem_grad_norm is not None:
+                                writer.add_scalar("train/semantic_grad_norm", last_sem_grad_norm, global_step=train_steps)
+                                writer.add_scalar("train/hf_grad_norm", last_hf_grad_norm, global_step=train_steps)
+                            if balance_every > 0:
+                                writer.add_scalar("train/semantic_loss_weight", sem_loss_weight, global_step=train_steps)
+                                writer.add_scalar("train/hf_loss_weight", hf_loss_weight, global_step=train_steps)
 
                 running_loss = 0.0
+                running_sem_loss = 0.0
+                running_hf_loss = 0.0
                 log_steps = 0
                 start_time = time()
 
             # Sampling visualization
             if train_steps % sample_every == 0 and rank == 0:
                 with torch.no_grad(), torch.autocast(device_type='cuda', enabled=False):
-                    # Sample latent using EMA
                     y_sample = y[:4]
                     z_sample = sample_latent(
                         model=ema,
@@ -843,23 +1070,19 @@ def main():
                         latent_shape=latent_size,
                         device=device,
                         y=y_sample,
-                        time_shift=time_shift,
+                        time_shift=current_time_shift,
                         steps=50,
                         use_cfg=False,
                     )
 
-                    # Decode with DECO-SAE
-                    img_gen = decode_with_deco_sae(sae_model, z_sample.float())
+                    img_gen = decode_with_deco_sae(sae_model, z_sample.float(), zero_hf=current_zero_hf)
                     img_gen_01 = (img_gen + 1.0) / 2.0
-
                     save_image(img_gen_01, os.path.join(sample_dir, f"sample_step_{train_steps:07d}.png"), nrow=2)
 
-                    # Also save GT reconstruction
                     x_gt_01 = (x_img[:4] + 1.0) / 2.0
                     save_image(x_gt_01, os.path.join(sample_dir, f"gt_step_{train_steps:07d}.png"), nrow=2)
 
-                    # Reconstruction from predicted latent
-                    recon = decode_with_deco_sae(sae_model, pred_latent[:4].float())
+                    recon = decode_with_deco_sae(sae_model, pred_latent[:4].float(), zero_hf=current_zero_hf)
                     recon_01 = (recon + 1.0) / 2.0
                     save_image(recon_01, os.path.join(sample_dir, f"recon_step_{train_steps:07d}.png"), nrow=2)
 
@@ -896,7 +1119,7 @@ def main():
                         fid_samples_per_class=args.fid_samples_per_class,
                         fid_batch_size=args.fid_batch_size,
                         latent_shape=latent_size,
-                        time_shift=time_shift,
+                        time_shift=current_time_shift,
                         device=device,
                         step=train_steps,
                         rank=rank,
@@ -905,6 +1128,7 @@ def main():
                         writer=writer,
                         num_classes=num_classes,
                         ref_images_path=args.ref_images_path,
+                        zero_hf=current_zero_hf,
                     )
                     
                     model.train()

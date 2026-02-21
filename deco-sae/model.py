@@ -606,7 +606,10 @@ class DecoSAE(nn.Module):
                 )       # 不是随机 mask 掉 40% 的 token，而是有 40% 的概率将整个样本的所有 HF token 全部 dropout。
             s_hf = s_hf * keep_mask
             if self.hf_noise_std > 0:
-                s_hf = s_hf + torch.randn_like(s_hf) * self.hf_noise_std * torch.rand((bsz, 1, 1), device=device, dtype=dtype)
+                # Diffusion-style perturbation with per-sample sigma in [0, hf_noise_std).
+                sigma = torch.rand((bsz, 1, 1), device=device, dtype=dtype) * self.hf_noise_std
+                alpha = torch.sqrt(1.0 - sigma ** 2)
+                s_hf = s_hf * alpha + torch.randn_like(s_hf) * sigma
         elif force_drop_hf:
             s_hf = torch.zeros_like(s_hf)
 
