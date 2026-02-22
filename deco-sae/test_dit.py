@@ -51,6 +51,7 @@ from model import DecoSAE
 from models.rae.utils.ddp_utils import cleanup_ddp, setup_ddp
 from models.rae.utils.model_utils import instantiate_from_config
 from models.rae.utils.train_utils import parse_configs
+from models.rae.utils.vae_utils import LatentNormalizer, load_latent_stats
 
 
 #################################################################################
@@ -209,6 +210,7 @@ def decode_with_deco_sae(
     latent: torch.Tensor,
     mask_hf: bool = False,
     hf_mask_mode: str = "zero",
+    latent_normalizer=None,
 ) -> torch.Tensor:
     """
     Decode latent using DECO-SAE.
@@ -225,6 +227,9 @@ def decode_with_deco_sae(
     Returns: [B, 3, image_size, image_size] reconstructed images
     """
     sae_model.eval()
+
+    if latent_normalizer is not None:
+        latent = latent_normalizer.denormalize(latent)
     
     B, C, H, W = latent.shape
     semantic_channels = sae_model.semantic_channels
@@ -307,6 +312,7 @@ def generate_samples_and_compute_fid(
     num_classes: int = 1000,
     sample_steps: int = 50,
     ref_images_path: str = None,
+    latent_normalizer=None,
 ):
     """
     Generate samples and compute FID/IS/Precision/Recall (distributed version).
@@ -395,6 +401,7 @@ def generate_samples_and_compute_fid(
                 z_sample.float(),
                 mask_hf=mask_hf,
                 hf_mask_mode=hf_mask_mode,
+                latent_normalizer=latent_normalizer,
             )
             
             # Convert to [0, 1] range
@@ -542,6 +549,17 @@ def main():
                         help="Path to reference FID statistics (.npz)")
     parser.add_argument("--ref-images-path", type=str, default=None,
                         help="Path to reference images for Precision/Recall")
+    parser.add_argument(
+        "--latent-stats-path",
+        type=str,
+        default=None,
+        help="Path to latent stats file (.pt/.npz) for latent denormalization before decoding. If not set, read from config misc.latent_stats_path.",
+    )
+    parser.add_argument(
+        "--per-channel-norm",
+        action="store_true",
+        help="Use per-channel denormalization when --latent-stats-path is provided.",
+    )
     
     # Other options
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -605,6 +623,17 @@ def main():
     sae_model.eval()
     if rank == 0:
         print(f"DECO-SAE loaded. Semantic channels: {sae_model.semantic_channels}, HF dim: {sae_model.hf_dim}")
+
+    latent_stats_path = args.latent_stats_path if args.latent_stats_path is not None else misc.get("latent_stats_path", None)
+    per_channel_norm = bool(misc.get("per_channel_norm", False)) or bool(args.per_channel_norm)
+
+    latent_normalizer = None
+    if latent_stats_path:
+        latent_stats = load_latent_stats(latent_stats_path, device=device, verbose=(rank == 0))
+        latent_normalizer = LatentNormalizer(latent_stats, per_channel=per_channel_norm)
+        if rank == 0:
+            norm_mode = "per-channel" if per_channel_norm else "scalar"
+            print(f"Latent denormalization enabled: {norm_mode}, stats={latent_stats_path}")
     
     # Build and load DiT model
     if rank == 0:
@@ -646,6 +675,7 @@ def main():
         num_classes=num_classes,
         sample_steps=args.sample_steps,
         ref_images_path=args.ref_images_path,
+        latent_normalizer=latent_normalizer,
     )
     
     if rank == 0:

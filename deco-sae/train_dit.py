@@ -65,6 +65,7 @@ from models.rae.utils.image_utils import center_crop_arr
 from models.rae.utils.model_utils import instantiate_from_config
 from models.rae.utils.optim_utils import build_optimizer, build_scheduler
 from models.rae.utils.train_utils import parse_configs
+from models.rae.utils.vae_utils import LatentNormalizer, load_latent_stats
 
 
 #################################################################################
@@ -311,6 +312,7 @@ def decode_with_deco_sae(
     sae_model: DecoSAE,
     latent: torch.Tensor,
     zero_hf: bool = False,
+    latent_normalizer=None,
 ) -> torch.Tensor:
     """
     Decode latent using DECO-SAE.
@@ -323,6 +325,9 @@ def decode_with_deco_sae(
         zero_hf: If True, zero out the HF channels before decoding
     """
     sae_model.eval()
+
+    if latent_normalizer is not None:
+        latent = latent_normalizer.denormalize(latent)
     
     B, C, H, W = latent.shape
     
@@ -388,6 +393,7 @@ def run_fid_evaluation(
     num_classes: int = 1000,
     ref_images_path: str = None,
     zero_hf: bool = False,
+    latent_normalizer=None,
 ):
     """
     Run FID, IS, and Recall evaluation by generating samples and computing metrics.
@@ -464,7 +470,12 @@ def run_fid_evaluation(
                 )
 
                 # 2. Decode with DECO-SAE (force drop HF when zero_hf is True)
-                imgs = decode_with_deco_sae(sae_model, z_sample.float(), zero_hf=zero_hf)
+                imgs = decode_with_deco_sae(
+                    sae_model,
+                    z_sample.float(),
+                    zero_hf=zero_hf,
+                    latent_normalizer=latent_normalizer,
+                )
 
             # Convert to [0, 1] range
             imgs = (imgs + 1.0) / 2.0
@@ -622,6 +633,17 @@ def main():
                         help="Batch size for FID generation")
     parser.add_argument("--skip-fid", action="store_true",
                         help="Skip FID/IS/Recall evaluation")
+    parser.add_argument(
+        "--latent-stats-path",
+        type=str,
+        default=None,
+        help="Path to latent stats file (.pt/.npz) for latent normalization. If not set, read from config misc.latent_stats_path.",
+    )
+    parser.add_argument(
+        "--per-channel-norm",
+        action="store_true",
+        help="Use per-channel normalization when --latent-stats-path is provided.",
+    )
     args = parser.parse_args()
 
     # Parse DiT config
@@ -728,6 +750,20 @@ def main():
     sae_model.eval()
     requires_grad(sae_model, False)
     logger.info(f"DECO-SAE loaded. Semantic channels: {sae_model.semantic_channels}, HF dim: {sae_model.hf_dim}")
+
+    latent_stats_path = args.latent_stats_path if args.latent_stats_path is not None else misc.get("latent_stats_path", None)
+    per_channel_norm = bool(misc.get("per_channel_norm", False)) or bool(args.per_channel_norm)
+
+    latent_normalizer = None
+    if latent_stats_path:
+        latent_stats = load_latent_stats(latent_stats_path, device=device, verbose=(rank == 0))
+        latent_normalizer = LatentNormalizer(latent_stats, per_channel=per_channel_norm)
+        if rank == 0:
+            norm_mode = "per-channel" if per_channel_norm else "scalar"
+            logger.info(f"Latent normalization: {norm_mode}, stats={latent_stats_path}")
+    elif rank == 0:
+        logger.info("Latent normalization: disabled")
+
     time_shift_full = time_shift
     time_shift_semantic = math.sqrt((sae_model.semantic_channels * latent_size[1] * latent_size[2]) / shift_base)
 
@@ -876,6 +912,8 @@ def main():
             # Encode with DECO-SAE
             with torch.no_grad(), autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 x_latent = encode_with_deco_sae(sae_model, x_img, zero_hf=current_zero_hf)
+                if latent_normalizer is not None:
+                    x_latent = latent_normalizer.normalize(x_latent)
 
             # CFG label dropout
             NULL_CLASS = num_classes
@@ -1075,14 +1113,24 @@ def main():
                         use_cfg=False,
                     )
 
-                    img_gen = decode_with_deco_sae(sae_model, z_sample.float(), zero_hf=current_zero_hf)
+                    img_gen = decode_with_deco_sae(
+                        sae_model,
+                        z_sample.float(),
+                        zero_hf=current_zero_hf,
+                        latent_normalizer=latent_normalizer,
+                    )
                     img_gen_01 = (img_gen + 1.0) / 2.0
                     save_image(img_gen_01, os.path.join(sample_dir, f"sample_step_{train_steps:07d}.png"), nrow=2)
 
                     x_gt_01 = (x_img[:4] + 1.0) / 2.0
                     save_image(x_gt_01, os.path.join(sample_dir, f"gt_step_{train_steps:07d}.png"), nrow=2)
 
-                    recon = decode_with_deco_sae(sae_model, pred_latent[:4].float(), zero_hf=current_zero_hf)
+                    recon = decode_with_deco_sae(
+                        sae_model,
+                        pred_latent[:4].float(),
+                        zero_hf=current_zero_hf,
+                        latent_normalizer=latent_normalizer,
+                    )
                     recon_01 = (recon + 1.0) / 2.0
                     save_image(recon_01, os.path.join(sample_dir, f"recon_step_{train_steps:07d}.png"), nrow=2)
 
@@ -1129,6 +1177,7 @@ def main():
                         num_classes=num_classes,
                         ref_images_path=args.ref_images_path,
                         zero_hf=current_zero_hf,
+                        latent_normalizer=latent_normalizer,
                     )
                     
                     model.train()

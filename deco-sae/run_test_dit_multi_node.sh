@@ -46,6 +46,7 @@ OUTPUT_DIR="results_dit/deco_dinov2_base_dit_xl_hf_joint_train_reweight_256dim/t
 # FID 评估配置
 FID_REF_PATH="/cpfs01/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz"
 # REF_IMAGES_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val_256/"  # 用于 Precision/Recall
+REF_IMAGES_PATH="not-exist"
 
 # 采样配置
 SAMPLES_PER_CLASS="50"

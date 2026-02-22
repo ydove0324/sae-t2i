@@ -11,7 +11,7 @@ Manipulations:
 
 python deco-sae/test_sae.py \
     --config deco-sae/dinov2_base_sae_vit_decoder.yaml \
-    --ckpt results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth \
+    --ckpt results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5_robust/step_110000.pth \
     --output test_hf_manipulation.png \
     --num_images 4 \
     --seed 42
