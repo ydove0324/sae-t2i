@@ -782,15 +782,16 @@ def main(args):
     }
     
     if args.model_size == "XXL":
-        model = DiT_T2I_XXL_2(**model_kwargs).to(device)
+        model = DiT_T2I_XXL_2(**model_kwargs).to(device, dtype=torch.bfloat16)
     elif args.model_size == "L":
-        model = DiT_T2I_L_2(**model_kwargs).to(device)
+        model = DiT_T2I_L_2(**model_kwargs).to(device, dtype=torch.bfloat16)
     elif args.model_size == "B":
-        model = DiT_T2I_B_2(**model_kwargs).to(device)
+        model = DiT_T2I_B_2(**model_kwargs).to(device, dtype=torch.bfloat16)
     else:
         raise ValueError(f"Unknown model size: {args.model_size}")
     
-    ema = deepcopy(model).to(device)
+    # EMA 放在 CPU 上以节省 GPU 显存
+    ema = deepcopy(model).to("cpu", dtype=torch.float32)
     requires_grad(ema, False)
     
     # Load checkpoint if provided (robust loading)
@@ -822,7 +823,10 @@ def main(args):
             model_loaded = False
             if "model" in checkpoint:
                 try:
-                    missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+                    # 将 checkpoint 参数转换为 bf16 以匹配模型
+                    model_state = {k: v.to(torch.bfloat16) if v.is_floating_point() else v 
+                                   for k, v in checkpoint["model"].items()}
+                    missing, unexpected = model.load_state_dict(model_state, strict=False)
                     model_loaded = True
                     if rank == 0:
                         if missing:
@@ -833,11 +837,14 @@ def main(args):
                     if rank == 0:
                         logger.warning(f"Failed to load model state: {e}")
             
-            # Load EMA state
+            # Load EMA state (EMA 在 CPU 上，fp32)
             ema_loaded = False
             if "ema" in checkpoint:
                 try:
-                    missing, unexpected = ema.load_state_dict(checkpoint["ema"], strict=False)
+                    # EMA 保持 fp32
+                    ema_state = {k: v.to(torch.float32) if v.is_floating_point() else v 
+                                 for k, v in checkpoint["ema"].items()}
+                    missing, unexpected = ema.load_state_dict(ema_state, strict=False)
                     ema_loaded = True
                     if rank == 0:
                         if missing:
@@ -847,12 +854,14 @@ def main(args):
                 except Exception as e:
                     if rank == 0:
                         logger.warning(f"Failed to load EMA state: {e}")
-                    # If EMA load fails, copy from model
+                    # If EMA load fails, copy from model (转换为 fp32)
                     if model_loaded:
-                        ema.load_state_dict(model.state_dict())
+                        model_state_fp32 = {k: v.to(torch.float32).cpu() if v.is_floating_point() else v.cpu()
+                                            for k, v in model.state_dict().items()}
+                        ema.load_state_dict(model_state_fp32)
                         ema_loaded = True
                         if rank == 0:
-                            logger.info("Initialized EMA from model state")
+                            logger.info("Initialized EMA from model state (converted to fp32 on CPU)")
             
             # Get optimizer state (optional)
             opt_state = checkpoint.get("opt", None)
@@ -906,6 +915,8 @@ def main(args):
     model_param_count = sum(p.numel() for p in model.parameters())
     if rank == 0:
         logger.info(f"Model parameters: {model_param_count / 1e6:.2f}M")
+        logger.info(f"Model dtype: {next(model.parameters()).dtype}")
+        logger.info(f"EMA device: {next(ema.parameters()).device}, dtype: {next(ema.parameters()).dtype}")
         logger.info(f"Gradient checkpointing: {args.gradient_checkpointing}")
     
     # torch.compile
@@ -1106,7 +1117,9 @@ def main(args):
             if rank == 0 and train_steps % args.vis_every == 0:
                 vis_start = time()  # 记录可视化开始时间
                 with torch.no_grad(), torch.autocast(device_type='cuda', enabled=False):
-                    # Sample with EMA model
+                    # Sample with EMA model - 临时移到 GPU
+                    ema.to(device, dtype=torch.bfloat16)
+                    
                     sample_caption = captions[0] if captions[0] else "a beautiful landscape"
                     y_sample = text_encoder.encode([sample_caption])
                     y_uncond = text_encoder.get_uncond_embedding(1)
@@ -1122,6 +1135,10 @@ def main(args):
                         uncond_embeddings=y_uncond,
                         cfg_interval=(args.cfg_interval_low, args.cfg_interval_high),
                     )
+                    
+                    # 采样完成后移回 CPU
+                    ema.to("cpu", dtype=torch.float32)
+                    torch.cuda.empty_cache()
                     
                     # Decode to image
                     img_gen = reconstruct_from_latent_with_diffusion(
