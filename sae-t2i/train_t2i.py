@@ -1116,29 +1116,31 @@ def main(args):
             # Visualization (排除可视化时间，不计入 steps/sec)
             if rank == 0 and train_steps % args.vis_every == 0:
                 vis_start = time()  # 记录可视化开始时间
-                with torch.no_grad(), torch.autocast(device_type='cuda', enabled=False):
+                with torch.no_grad():
                     # Sample with EMA model - 临时移到 GPU
                     ema.to(device, dtype=torch.bfloat16)
-                    
-                    sample_caption = captions[0] if captions[0] else "a beautiful landscape"
-                    y_sample = text_encoder.encode([sample_caption])
-                    y_uncond = text_encoder.get_uncond_embedding(1)
-                    
-                    z0_hat = sample_latent_linear(
-                        model=ema,
-                        text_embeddings=y_sample,
-                        latent_shape=latent_size,
-                        device=device,
-                        time_shift=time_shift,
-                        steps=50,
-                        cfg_scale=args.cfg_scale,
-                        uncond_embeddings=y_uncond,
-                        cfg_interval=(args.cfg_interval_low, args.cfg_interval_high),
-                    )
-                    
-                    # 采样完成后移回 CPU
-                    ema.to("cpu", dtype=torch.float32)
-                    torch.cuda.empty_cache()
+
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+                        sample_caption = captions[0] if captions[0] else "a beautiful landscape"
+                        y_sample = text_encoder.encode([sample_caption])
+                        y_uncond = text_encoder.get_uncond_embedding(1)
+
+                        z0_hat = sample_latent_linear(
+                            model=ema,
+                            text_embeddings=y_sample,
+                            latent_shape=latent_size,
+                            device=device,
+                            time_shift=time_shift,
+                            steps=50,
+                            cfg_scale=args.cfg_scale,
+                            uncond_embeddings=y_uncond,
+                            cfg_interval=(args.cfg_interval_low, args.cfg_interval_high),
+                        )
+
+                    # 可选：采样完成后移回 CPU 以节省显存
+                    if not args.ema_stay_on_gpu:
+                        ema.to("cpu", dtype=torch.float32)
+                        torch.cuda.empty_cache()
                     
                     # Decode to image
                     img_gen = reconstruct_from_latent_with_diffusion(
@@ -1285,6 +1287,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.9999)
+    parser.add_argument("--ema-stay-on-gpu", action="store_true",
+                        help="Keep EMA on GPU during visualization sampling (default moves EMA back to CPU)")
     parser.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp32"])
     parser.add_argument("--gradient-checkpointing", action="store_true",
                         help="Enable gradient checkpointing for DiT blocks to save memory")
