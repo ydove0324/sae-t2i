@@ -724,6 +724,7 @@ def main(args):
         "denormalize_decoder_output": args.denormalize_decoder_output,
         "skip_to_moments": args.skip_to_moments,
         "dec_block_out_channels": dec_block_out_channels,
+        "dec_layers_per_block": 3,
     }
     
     if args.encoder_type == "dinov3" or args.encoder_type == "dinov3_vitl":

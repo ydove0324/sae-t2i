@@ -12,11 +12,13 @@
 # Worker节点列表（按顺序，rank从1开始）
 WORKER_NODES=(
     "root@139.224.222.61"  # 示例：机器1
+    "root@139.224.222.61"
 )
 
 # 对应的SSH端口（与WORKER_NODES顺序一致）
 SSH_PORTS=(
     8029  # 机器1的SSH端口
+    8030
 )
 
 # 验证配置
@@ -28,7 +30,7 @@ fi
 # =================== 训练配置 ===================
 NUM_NODES=$((1 + ${#WORKER_NODES[@]}))  # Master + Workers
 MASTER_GPUS=8
-WORKER_GPUS_LIST=(8)  # 与 WORKER_NODES 数量一致，每个Worker的GPU数
+WORKER_GPUS_LIST=(8 8)  # 与 WORKER_NODES 数量一致，每个Worker的GPU数
 
 # Master节点配置（当前机器）
 # 使用 bond0 高速网络 (200Gbps RoCE RDMA)
@@ -37,16 +39,16 @@ MASTER_PORT="27531"
 
 # =================== 测试脚本和模型配置 ===================
 TEST_SCRIPT="deco-sae/test_dit.py"
-DIT_CONFIG="deco-sae/dit_xl_deco_dinov2.yaml"
+DIT_CONFIG="deco-sae/dit_xl_deco_dinov2_per_channel_normalize.yaml"
 SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder.yaml"
-SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth"
-DIT_CKPT="results_dit/deco_dinov2_base_dit_xl_hf_joint_train_reweight_256dim/checkpoints/0100000.pt"
-OUTPUT_DIR="results_dit/deco_dinov2_base_dit_xl_hf_joint_train_reweight_256dim/test_results"
+SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5_robust/step_120000.pth"
+DIT_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/checkpoints/0075000.pt"
+OUTPUT_DIR="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/test_results_750000"
 
 # FID 评估配置
 FID_REF_PATH="/cpfs01/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz"
-# REF_IMAGES_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val_256/"  # 用于 Precision/Recall
-REF_IMAGES_PATH="not-exist"
+REF_IMAGES_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/val_256/"  # 用于 Precision/Recall
+# REF_IMAGES_PATH="not-exist"
 
 # 采样配置
 SAMPLES_PER_CLASS="50"
@@ -58,7 +60,8 @@ USE_CFG=""  # 设置为 "--use-cfg" 启用 CFG
 CFG_SCALE="1.5"
 
 # HF Mask 配置 (测试 HF branch 的影响)
-MASK_HF="--mask-hf"  # 设置为 "--mask-hf" 启用 HF masking
+# MASK_HF="--mask-hf"  # 设置为 "--mask-hf" 启用 HF masking
+MASK_HF=""
 HF_MASK_MODE="zero"  # zero, noise, mean
 
 # =================== 日志配置 ===================

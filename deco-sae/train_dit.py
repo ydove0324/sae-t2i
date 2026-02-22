@@ -1,3 +1,4 @@
+# https://huggingface.co/datasets/BLIP3o/BLIP3o-Pretrain-Short-Caption
 """
 Train DiT (Diffusion Transformer) on DECO-SAE latent space.
 Uses config-driven approach with minimal argparse.
