@@ -34,6 +34,16 @@ from time import time
 from collections import defaultdict
 from PIL import Image
 from typing import Optional
+import io
+import traceback
+
+# WebDataset for large-scale training
+try:
+    import webdataset as wds
+    HAS_WEBDATASET = True
+except ImportError:
+    HAS_WEBDATASET = False
+    print("Warning: webdataset not installed. Install with: pip install webdataset")
 
 # Import utilities
 from models.rae.utils.ddp_utils import setup_ddp, cleanup_ddp as cleanup, create_logger, requires_grad, update_ema
@@ -274,6 +284,209 @@ class ImageNetWithCaptions(Dataset):
         # Create a simple prompt
         caption = f"a photo of {caption}"
         return image, caption
+
+
+#################################################################################
+#                            WebDataset Support                                 #
+#################################################################################
+
+def create_webdataset(
+    tar_paths: list[str],
+    image_size: int = 256,
+    batch_size: int = 32,
+    num_workers: int = 4,
+    image_key: str = "jpg",
+    caption_key: str = "txt",
+    shuffle_buffer: int = 5000,
+    world_size: int = 1,
+    rank: int = 0,
+    seed: int = 0,
+    epoch_length: int = None,
+):
+    """
+    Create a WebDataset dataloader from tar files.
+    
+    Args:
+        tar_paths: List of tar file paths, can be:
+            - Single tar file: ["/path/to/data.tar"]
+            - Multiple tar files: ["/path/to/data-{000..099}.tar"]
+            - Glob pattern: ["/path/to/data/*.tar"]
+        image_size: Target image size
+        batch_size: Batch size per GPU
+        num_workers: Number of workers
+        image_key: Key for image in tar (e.g., "jpg", "png", "webp")
+        caption_key: Key for caption in tar (e.g., "txt", "json", "caption")
+        shuffle_buffer: Size of shuffle buffer
+        world_size: Total number of GPUs
+        rank: Current GPU rank
+        seed: Random seed
+        epoch_length: Number of samples per epoch (for infinite datasets)
+    
+    Returns:
+        WebDataset dataloader
+    
+    Expected tar structure:
+        sample_0001.jpg
+        sample_0001.txt (or .json with "caption" field)
+        sample_0002.jpg
+        sample_0002.txt
+        ...
+    """
+    if not HAS_WEBDATASET:
+        raise ImportError("webdataset is required. Install with: pip install webdataset")
+    
+    # Expand tar paths
+    expanded_paths = []
+    for path in tar_paths:
+        if '*' in path:
+            # Glob pattern
+            expanded = sorted(glob(path))
+            expanded_paths.extend(expanded)
+        elif '{' in path and '..' in path:
+            # Brace expansion pattern like data-{000..099}.tar
+            expanded_paths.append(path)
+        else:
+            expanded_paths.append(path)
+    
+    if not expanded_paths:
+        raise ValueError(f"No tar files found for paths: {tar_paths}")
+    
+    print(f"[Rank {rank}] WebDataset: Found {len(expanded_paths)} tar file(s)")
+    
+    # Image transform
+    transform = transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda t: t * 2.0 - 1.0),
+    ])
+    
+    def preprocess_sample(sample):
+        """Preprocess a single sample from webdataset."""
+        # Get image
+        img_data = None
+        for key in ["jpg", "jpeg", "png", "webp", image_key]:
+            if key in sample:
+                img_data = sample[key]
+                break
+        
+        if img_data is None:
+            raise ValueError(f"No image found in sample. Keys: {list(sample.keys())}")
+        
+        # Decode image
+        if isinstance(img_data, bytes):
+            img = Image.open(io.BytesIO(img_data)).convert("RGB")
+        elif isinstance(img_data, Image.Image):
+            img = img_data.convert("RGB")
+        else:
+            img = img_data
+        
+        # Apply transform
+        img = transform(img)
+        
+        # Get caption
+        caption = ""
+        if caption_key in sample:
+            caption_data = sample[caption_key]
+            if isinstance(caption_data, bytes):
+                caption = caption_data.decode("utf-8").strip()
+            elif isinstance(caption_data, str):
+                caption = caption_data.strip()
+            elif isinstance(caption_data, dict):
+                caption = caption_data.get("caption", caption_data.get("text", ""))
+        elif "json" in sample:
+            # Try parsing JSON for caption
+            try:
+                json_data = sample["json"]
+                if isinstance(json_data, bytes):
+                    json_data = json.loads(json_data.decode("utf-8"))
+                elif isinstance(json_data, str):
+                    json_data = json.loads(json_data)
+                caption = json_data.get("caption", json_data.get("text", ""))
+            except:
+                pass
+        
+        return img, caption
+    
+    # Build dataset pipeline
+    if len(expanded_paths) == 1 and '{' not in expanded_paths[0]:
+        urls = expanded_paths[0]
+    else:
+        urls = expanded_paths
+    
+    dataset = (
+        wds.WebDataset(
+            urls,
+            resampled=True,  # Enable infinite resampling
+            shardshuffle=True,
+            nodesplitter=wds.split_by_node,  # Automatic node splitting
+        )
+        .shuffle(shuffle_buffer)
+        .decode("pil")
+        .map(preprocess_sample)
+    )
+    
+    # Set epoch length if specified
+    if epoch_length:
+        dataset = dataset.with_epoch(epoch_length // world_size)
+    
+    # Create dataloader
+    loader = wds.WebLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    
+    # Add batching features
+    loader = loader.unbatched().shuffle(1000).batched(batch_size)
+    
+    return loader
+
+
+def get_webdataset_loader(
+    tar_paths: list[str],
+    image_size: int,
+    batch_size: int,
+    num_workers: int,
+    world_size: int,
+    rank: int,
+    seed: int = 0,
+    image_key: str = "jpg",
+    caption_key: str = "txt",
+    shuffle_buffer: int = 5000,
+    epoch_length: int = None,
+):
+    """
+    Convenience function to create WebDataset loader.
+    
+    Args:
+        tar_paths: Can be:
+            - String with path to single tar or pattern
+            - List of tar file paths
+            - Path to directory containing tar files
+    """
+    # Handle different input types
+    if isinstance(tar_paths, str):
+        if os.path.isdir(tar_paths):
+            # Directory of tar files
+            tar_paths = sorted(glob(os.path.join(tar_paths, "*.tar")))
+        else:
+            tar_paths = [tar_paths]
+    
+    return create_webdataset(
+        tar_paths=tar_paths,
+        image_size=image_size,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        image_key=image_key,
+        caption_key=caption_key,
+        shuffle_buffer=shuffle_buffer,
+        world_size=world_size,
+        rank=rank,
+        seed=seed,
+        epoch_length=epoch_length,
+    )
 
 
 #################################################################################
@@ -579,22 +792,115 @@ def main(args):
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
     
-    # Load checkpoint if provided
+    # Load checkpoint if provided (robust loading)
     train_steps = 0
     opt_state = None
     sched_state = None
     
-    if args.ckpt:
-        checkpoint = torch.load(args.ckpt, map_location="cpu")
-        if "model" in checkpoint:
-            model.load_state_dict(checkpoint["model"], strict=False)
-        if "ema" in checkpoint:
-            ema.load_state_dict(checkpoint["ema"], strict=False)
-        opt_state = checkpoint.get("opt")
-        sched_state = checkpoint.get("scheduler")
-        train_steps = int(checkpoint.get("train_steps", 0))
-        if rank == 0:
-            logger.info(f"Resumed from {args.ckpt}, train_steps={train_steps}")
+    def try_load_checkpoint(ckpt_path, model, ema, rank, logger):
+        """
+        Attempt to load checkpoint with robust error handling.
+        Returns: (success, train_steps, opt_state, sched_state)
+        """
+        if not ckpt_path:
+            return False, 0, None, None
+        
+        # Check if file exists
+        if not os.path.exists(ckpt_path):
+            if rank == 0:
+                logger.warning(f"Checkpoint not found: {ckpt_path}, training from scratch")
+            return False, 0, None, None
+        
+        try:
+            if rank == 0:
+                logger.info(f"Attempting to load checkpoint: {ckpt_path}")
+            
+            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            
+            # Load model state
+            model_loaded = False
+            if "model" in checkpoint:
+                try:
+                    missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+                    model_loaded = True
+                    if rank == 0:
+                        if missing:
+                            logger.warning(f"Missing keys in model: {len(missing)} keys")
+                        if unexpected:
+                            logger.warning(f"Unexpected keys in model: {len(unexpected)} keys")
+                except Exception as e:
+                    if rank == 0:
+                        logger.warning(f"Failed to load model state: {e}")
+            
+            # Load EMA state
+            ema_loaded = False
+            if "ema" in checkpoint:
+                try:
+                    missing, unexpected = ema.load_state_dict(checkpoint["ema"], strict=False)
+                    ema_loaded = True
+                    if rank == 0:
+                        if missing:
+                            logger.warning(f"Missing keys in EMA: {len(missing)} keys")
+                        if unexpected:
+                            logger.warning(f"Unexpected keys in EMA: {len(unexpected)} keys")
+                except Exception as e:
+                    if rank == 0:
+                        logger.warning(f"Failed to load EMA state: {e}")
+                    # If EMA load fails, copy from model
+                    if model_loaded:
+                        ema.load_state_dict(model.state_dict())
+                        ema_loaded = True
+                        if rank == 0:
+                            logger.info("Initialized EMA from model state")
+            
+            # Get optimizer state (optional)
+            opt_state = checkpoint.get("opt", None)
+            sched_state = checkpoint.get("scheduler", None)
+            train_steps = int(checkpoint.get("train_steps", 0))
+            
+            # Validate train_steps
+            if train_steps < 0:
+                if rank == 0:
+                    logger.warning(f"Invalid train_steps {train_steps}, resetting to 0")
+                train_steps = 0
+            
+            if model_loaded or ema_loaded:
+                if rank == 0:
+                    logger.info(f"Successfully resumed from {ckpt_path}")
+                    logger.info(f"  - Model loaded: {model_loaded}")
+                    logger.info(f"  - EMA loaded: {ema_loaded}")
+                    logger.info(f"  - Train steps: {train_steps}")
+                    logger.info(f"  - Optimizer state: {'available' if opt_state else 'not available'}")
+                return True, train_steps, opt_state, sched_state
+            else:
+                if rank == 0:
+                    logger.warning(f"No model/EMA state found in checkpoint, training from scratch")
+                return False, 0, None, None
+                
+        except Exception as e:
+            if rank == 0:
+                logger.warning(f"Failed to load checkpoint: {e}")
+                logger.warning(f"Traceback: {traceback.format_exc()}")
+                logger.info("Training from scratch...")
+            return False, 0, None, None
+    
+    # Try to resume from checkpoint
+    ckpt_loaded, train_steps, opt_state, sched_state = try_load_checkpoint(
+        args.ckpt, model, ema, rank, logger
+    )
+    
+    # If no explicit checkpoint, try to find latest checkpoint in results_dir
+    if not ckpt_loaded and args.auto_resume:
+        latest_ckpt = os.path.join(args.results_dir, "checkpoints", "latest.pt")
+        if os.path.exists(latest_ckpt):
+            if rank == 0:
+                logger.info(f"Auto-resuming from latest checkpoint: {latest_ckpt}")
+            ckpt_loaded, train_steps, opt_state, sched_state = try_load_checkpoint(
+                latest_ckpt, model, ema, rank, logger
+            )
+    
+    if not ckpt_loaded and rank == 0:
+        logger.info("Starting training from scratch")
     
     model_param_count = sum(p.numel() for p in model.parameters())
     if rank == 0:
@@ -620,39 +926,66 @@ def main(args):
         opt.load_state_dict(opt_state)
     
     # Dataset
-    if args.dataset_type == "imagenet":
-        dataset = ImageNetWithCaptions(
-            args.data_path,
+    use_webdataset = args.dataset_type == "webdataset"
+    
+    if use_webdataset:
+        # WebDataset for large-scale tar-based datasets
+        if not HAS_WEBDATASET:
+            raise ImportError("webdataset is required for dataset_type='webdataset'. "
+                            "Install with: pip install webdataset")
+        
+        loader = get_webdataset_loader(
+            tar_paths=args.data_path,
             image_size=args.image_size,
-            class_to_caption_file=args.class_to_caption_file,
+            batch_size=micro_batch_size,
+            num_workers=args.num_workers,
+            world_size=world_size,
+            rank=rank,
+            seed=args.global_seed,
+            image_key=args.wds_image_key,
+            caption_key=args.wds_caption_key,
+            shuffle_buffer=args.wds_shuffle_buffer,
+            epoch_length=args.wds_epoch_length,
         )
+        
+        if rank == 0:
+            logger.info(f"WebDataset: {args.data_path}")
+            logger.info(f"Micro batch size: {micro_batch_size}, Global batch size: {args.global_batch_size}")
     else:
-        dataset = TextImageDataset(
-            args.data_path,
-            image_size=args.image_size,
+        # Standard PyTorch Dataset
+        if args.dataset_type == "imagenet":
+            dataset = ImageNetWithCaptions(
+                args.data_path,
+                image_size=args.image_size,
+                class_to_caption_file=args.class_to_caption_file,
+            )
+        else:
+            dataset = TextImageDataset(
+                args.data_path,
+                image_size=args.image_size,
+            )
+        
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed,
         )
-    
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed,
-    )
-    
-    loader = DataLoader(
-        dataset,
-        batch_size=micro_batch_size,
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    
-    if rank == 0:
-        logger.info(f"Dataset: {len(dataset)} samples")
-        logger.info(f"Micro batch size: {micro_batch_size}, Global batch size: {args.global_batch_size}")
+        
+        loader = DataLoader(
+            dataset,
+            batch_size=micro_batch_size,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+        
+        if rank == 0:
+            logger.info(f"Dataset: {len(dataset)} samples")
+            logger.info(f"Micro batch size: {micro_batch_size}, Global batch size: {args.global_batch_size}")
     
     # Initialize EMA
     update_ema(ema, model.module, decay=0)
@@ -674,7 +1007,9 @@ def main(args):
         logger.info(f"Training for {args.epochs} epochs...")
     
     for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
+        # Set epoch for sampler (not needed for webdataset)
+        if not use_webdataset:
+            sampler.set_epoch(epoch)
         if rank == 0:
             print(f"Beginning epoch {epoch}...")
         
@@ -876,10 +1211,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     # Data
-    parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--dataset-type", type=str, default="imagenet", choices=["imagenet", "custom"])
+    parser.add_argument("--data-path", type=str, required=True,
+                        help="Path to data. For webdataset, can be path to tar files or directory containing tars")
+    parser.add_argument("--dataset-type", type=str, default="imagenet", 
+                        choices=["imagenet", "custom", "webdataset"],
+                        help="Dataset type: imagenet, custom (text-image pairs), or webdataset (tar files)")
     parser.add_argument("--class-to-caption-file", type=str, default=None)
     parser.add_argument("--image-size", type=int, default=256)
+    
+    # WebDataset options
+    parser.add_argument("--wds-image-key", type=str, default="jpg",
+                        help="Key for image in webdataset tar (jpg, png, webp)")
+    parser.add_argument("--wds-caption-key", type=str, default="txt",
+                        help="Key for caption in webdataset tar (txt, json, caption)")
+    parser.add_argument("--wds-shuffle-buffer", type=int, default=5000,
+                        help="Shuffle buffer size for webdataset")
+    parser.add_argument("--wds-epoch-length", type=int, default=None,
+                        help="Number of samples per epoch for webdataset (for infinite datasets)")
     
     # Model
     parser.add_argument("--model-size", type=str, default="XXL", choices=["XXL", "L", "B"])
@@ -940,6 +1288,8 @@ if __name__ == "__main__":
     parser.add_argument("--vis-every", type=int, default=500)
     parser.add_argument("--ckpt-every", type=int, default=10000)
     parser.add_argument("--ckpt", type=str, default=None, help="Resume from checkpoint")
+    parser.add_argument("--auto-resume", action="store_true", 
+                        help="Auto resume from latest.pt if available")
     
     # Compile
     parser.add_argument("--compile", action="store_true")
