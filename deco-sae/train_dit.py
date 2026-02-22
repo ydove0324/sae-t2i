@@ -1,5 +1,3 @@
-# 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 new one!!!
-# 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
 """
 Train DiT (Diffusion Transformer) on DECO-SAE latent space.
 Uses config-driven approach with minimal argparse.
