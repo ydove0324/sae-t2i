@@ -6,6 +6,7 @@ from math import sqrt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
 from timm.models.vision_transformer import PatchEmbed, Mlp
 from typing import *
 
@@ -452,6 +453,7 @@ class DiTwDDTHead_T2I(nn.Module):
         wo_shift: bool = False,
         use_pos_embed: bool = True,
         cfg_dropout_prob: float = 0.1,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -467,6 +469,7 @@ class DiTwDDTHead_T2I(nn.Module):
         self.num_text_refine_blocks = num_text_refine_blocks
         self.use_rope = use_rope
         self.txt_max_length = txt_max_length
+        self.gradient_checkpointing = gradient_checkpointing
         
         # Patch size
         if isinstance(patch_size, int) or isinstance(patch_size, float):
@@ -659,7 +662,13 @@ class DiTwDDTHead_T2I(nn.Module):
         
         # Text refine blocks
         for block in self.text_refine_blocks:
-            y = block(y, condition)
+            if self.training and self.gradient_checkpointing:
+                y = checkpoint_fn(
+                    lambda y_in, c_in, blk=block: blk(y_in, c_in),
+                    y, condition, use_reentrant=False
+                )
+            else:
+                y = block(y, condition)
         
         # Encoder
         if s is None:
@@ -669,7 +678,15 @@ class DiTwDDTHead_T2I(nn.Module):
             
             # Encoder blocks with cross-attention to text
             for block in self.encoder_blocks:
-                s = block(s, y, condition, feat_rope=self.enc_feat_rope)
+                if self.training and self.gradient_checkpointing:
+                    s = checkpoint_fn(
+                        lambda s_in, y_in, c_in, blk=block: blk(
+                            s_in, y_in, c_in, feat_rope=self.enc_feat_rope
+                        ),
+                        s, y, condition, use_reentrant=False
+                    )
+                else:
+                    s = block(s, y, condition, feat_rope=self.enc_feat_rope)
             
             # Combine timestep with encoder output
             t_broadcast = t_emb.unsqueeze(1).repeat(1, s.shape[1], 1)
@@ -684,7 +701,15 @@ class DiTwDDTHead_T2I(nn.Module):
             x = x + self.x_pos_embed
         
         for block in self.decoder_blocks:
-            x = block(x, y=None, c=s, feat_rope=self.dec_feat_rope)
+            if self.training and self.gradient_checkpointing:
+                x = checkpoint_fn(
+                    lambda x_in, s_in, blk=block: blk(
+                        x_in, y=None, c=s_in, feat_rope=self.dec_feat_rope
+                    ),
+                    x, s, use_reentrant=False
+                )
+            else:
+                x = block(x, y=None, c=s, feat_rope=self.dec_feat_rope)
         
         # Final layer
         x = self.final_layer(x, s)

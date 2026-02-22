@@ -778,6 +778,7 @@ def main(args):
         "wo_shift": False,
         "use_pos_embed": True,
         "cfg_dropout_prob": args.cfg_prob,
+        "gradient_checkpointing": args.gradient_checkpointing,
     }
     
     if args.model_size == "XXL":
@@ -905,6 +906,7 @@ def main(args):
     model_param_count = sum(p.numel() for p in model.parameters())
     if rank == 0:
         logger.info(f"Model parameters: {model_param_count / 1e6:.2f}M")
+        logger.info(f"Gradient checkpointing: {args.gradient_checkpointing}")
     
     # torch.compile
     if args.compile:
@@ -1267,6 +1269,8 @@ if __name__ == "__main__":
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp32"])
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing for DiT blocks to save memory")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--global-seed", type=int, default=0)
     
