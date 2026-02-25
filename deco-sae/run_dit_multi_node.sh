@@ -47,7 +47,7 @@ CFG_PROB="0.1"
 CFG_SCALE="3.0"
 
 # 可选：断点续训
-RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/checkpoints/latest.pt"  # 留空则从头训练，如: "results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
+RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/checkpoints/0225000.pt"  # 留空则从头训练，如: "results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
 # RESUME_CKPT=""
 
 # FID 评估配置

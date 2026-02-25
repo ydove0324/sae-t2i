@@ -587,7 +587,7 @@ def run_fid_evaluation(
             # Clean up flat directory with multi-threading for speed
             if os.path.exists(flat_dir):
                 files = [os.path.join(flat_dir, f) for f in os.listdir(flat_dir)]
-                with ThreadPoolExecutor(max_workers=32) as executor:
+                with ThreadPoolExecutor(max_workers=128) as executor:
                     executor.map(os.remove, files)
                 os.rmdir(flat_dir)
 
