@@ -37,17 +37,22 @@ MASTER_PORT="27532"
 
 # =================== 脚本和模型配置 ===================
 TRAIN_SCRIPT="deco-sae/train_dit.py"
-DIT_CONFIG="deco-sae/dit_xl_deco_dinov2_per_channel_normalize.yaml"
-SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder.yaml"
-SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth"
+# DIT_CONFIG="deco-sae/dit_xl_deco_dinov2_per_channel_normalize.yaml"
+# SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder.yaml"
+# SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth"
 DATA_PATH="/cpfs01/huangxu/ILSVRC/Data/CLS-LOC/train/"
-RESULTS_DIR="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim"
+# RESULTS_DIR="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim"
+DIT_CONFIG="deco-sae/dit_xl_deco_dinov2_hf64_per_channel_normalize.yaml"  # hf64
+SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder_64dim.yaml"              # hf64
+SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim64_dropout0p4_GAN0p5/step_120000.pth"  # hf64
+RESULTS_DIR="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_64dim"  # hf64输出目录
 PRECISION="bf16"
 CFG_PROB="0.1"
 CFG_SCALE="3.0"
 
 # 可选：断点续训
-RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/checkpoints/0225000.pt"  # 留空则从头训练，如: "results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
+# RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/checkpoints/latest.pt"  # 留空则从头训练，如: "results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
+RESUME_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_64dim/checkpoints/latest.pt"  # 留空则从头训练，如: "results_dit/deco_dinov2_base_dit_xl/checkpoints/latest.pt"
 # RESUME_CKPT=""
 
 # FID 评估配置
@@ -60,7 +65,7 @@ REF_IMAGES_PATH="not-exist"
 
 # =================== 日志配置 ===================
 LOG_DIR="log"
-LOG_FILE="${LOG_DIR}/deco_dinov2_dit_xl_multi_node_per_channel_normalize.log"
+LOG_FILE="${LOG_DIR}/deco_dinov2_dit_xl_multi_node_per_channel_normalize_64dim.log" # hf64
 TMUX_SESSION="deco_dit"
 
 # Conda环境配置

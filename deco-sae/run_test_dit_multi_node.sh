@@ -41,9 +41,12 @@ MASTER_PORT="27531"
 TEST_SCRIPT="deco-sae/test_dit.py"
 DIT_CONFIG="deco-sae/dit_xl_deco_dinov2_per_channel_normalize.yaml"
 SAE_CONFIG="deco-sae/dinov2_base_sae_vit_decoder.yaml"
-SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5_robust/step_120000.pth"
-DIT_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/checkpoints/0075000.pt"
-OUTPUT_DIR="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/test_results_750000"
+# SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5_robust/step_120000.pth"
+# DIT_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/checkpoints/0075000.pt"
+SAE_CKPT="results_sae/dinov2_base_vit_decoder_hf_dim256_dropout0p4_GAN0p5/step_70000.pth"
+DIT_CKPT="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/checkpoints/0275000.pt"
+OUTPUT_DIR="results_dit/deco_dinov2_base_dit_xl_per_channel_normalize_256dim/test_results_275000_cfg5p0"
+
 
 # FID 评估配置
 FID_REF_PATH="/cpfs01/huangxu/SAE/VIRTUAL_imagenet256_labeled.npz"
@@ -56,8 +59,8 @@ BATCH_SIZE="64"
 SAMPLE_STEPS="50"
 
 # CFG 配置
-USE_CFG=""  # 设置为 "--use-cfg" 启用 CFG
-CFG_SCALE="1.5"
+USE_CFG="--use-cfg"  # 设置为 "--use-cfg" 启用 CFG
+CFG_SCALE="5.0"
 
 # HF Mask 配置 (测试 HF branch 的影响)
 # MASK_HF="--mask-hf"  # 设置为 "--mask-hf" 启用 HF masking
@@ -66,7 +69,7 @@ HF_MASK_MODE="zero"  # zero, noise, mean
 
 # =================== 日志配置 ===================
 LOG_DIR="log"
-LOG_FILE="${LOG_DIR}/test_dit_multi_node_256dim.log"
+LOG_FILE="${LOG_DIR}/test_dit_multi_node_256dim_cfg3p0.log"
 TMUX_SESSION="test_dit"
 
 # Conda环境配置

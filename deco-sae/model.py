@@ -25,6 +25,7 @@ from cnn_decoder import (
     Encoder2D,
     SigLIP2Encoder2D,
     DINOv2Encoder2D,
+    Qwen3ViTEncoder2D,
     CausalAutoencoderOutput,
     CausalEncoderOutput,
     CausalDecoderOutput,
@@ -308,6 +309,7 @@ class DecoSAE(nn.Module):
         dinov3_model_dir: str = "",
         siglip2_model_name: str = "google/siglip2-base-patch16-256",
         dinov2_model_name: str = "facebook/dinov2-with-registers-base",
+        qwen3_vit_model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
         # ---- Image config ----
         image_size: int = 256,
         in_channels: int = 3,
@@ -334,6 +336,7 @@ class DecoSAE(nn.Module):
         hf_encoder_config_path: Optional[str] = None,
         hf_dropout_prob: float = 0.4,
         hf_noise_std: float = 0.1,
+        hf_noise_alpha_schedule: str = "alpha_one",
         hf_loss_weight: float = 0.1,
         recon_l2_weight: float = 1.0,
         recon_l1_weight: float = 0.0,
@@ -383,6 +386,12 @@ class DecoSAE(nn.Module):
         self.enable_hf_branch = enable_hf_branch
         self.hf_dropout_prob = hf_dropout_prob
         self.hf_noise_std = hf_noise_std
+        self.hf_noise_alpha_schedule = str(hf_noise_alpha_schedule).lower()
+        if self.hf_noise_alpha_schedule not in {"alpha_one", "sqrt_1m_sigma2"}:
+            raise ValueError(
+                "hf_noise_alpha_schedule must be one of {'alpha_one', 'sqrt_1m_sigma2'}, "
+                f"got: {hf_noise_alpha_schedule}"
+            )
         self.hf_loss_weight = hf_loss_weight
         self.recon_l2_weight = recon_l2_weight
         self.recon_l1_weight = recon_l1_weight
@@ -430,15 +439,23 @@ class DecoSAE(nn.Module):
                 enable_lora=enable_lora,
                 normalize=True,
             )
+        elif encoder_type == "qwen3_vit":
+            self.encoder = Qwen3ViTEncoder2D(
+                model_name=qwen3_vit_model_name,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                enable_lora=enable_lora,
+            )
         else:
             raise ValueError(
                 f"Unknown encoder_type: {encoder_type}. "
-                f"Supported: 'dinov3', 'dinov3_vitl', 'siglip2', 'dinov2'"
+                f"Supported: 'dinov3', 'dinov3_vitl', 'siglip2', 'dinov2', 'qwen3_vit'"
             )
 
         encoder_hidden_size = self.encoder.hidden_size
         encoder_patch_size = self.encoder.patch_size
-        self.decode_patch_size = 16 if encoder_type == "dinov2" else encoder_patch_size
+        self.decode_patch_size = 16 if encoder_type == "dinov2" else (32 if encoder_type == "qwen3_vit" else encoder_patch_size)
         self.num_patches_h = image_size // self.decode_patch_size
         self.num_patches_w = image_size // self.decode_patch_size
         self.num_patches = self.num_patches_h * self.num_patches_w
@@ -535,6 +552,10 @@ class DecoSAE(nn.Module):
             cls_len = 1
             reg_len = self.encoder.num_register_tokens
             tokens = pred.last_hidden_state[:, cls_len + reg_len :, :]
+        elif self.encoder_type == "qwen3_vit":
+            tokens = pred.last_hidden_state
+            if getattr(self.encoder, "has_cls_token", True) and tokens.shape[1] > 1:
+                tokens = tokens[:, 1:, :]
         else:
             raise ValueError(f"Unknown encoder_type: {self.encoder_type}")
         return tokens
@@ -608,7 +629,10 @@ class DecoSAE(nn.Module):
             if self.hf_noise_std > 0:
                 # Diffusion-style perturbation with per-sample sigma in [0, hf_noise_std).
                 sigma = torch.rand((bsz, 1, 1), device=device, dtype=dtype) * self.hf_noise_std
-                alpha = torch.sqrt(1.0 - sigma ** 2)
+                if self.hf_noise_alpha_schedule == "alpha_one":
+                    alpha = torch.ones_like(sigma)
+                else:
+                    alpha = torch.sqrt(torch.clamp(1.0 - sigma ** 2, min=0.0))
                 s_hf = s_hf * alpha + torch.randn_like(s_hf) * sigma
         elif force_drop_hf:
             s_hf = torch.zeros_like(s_hf)

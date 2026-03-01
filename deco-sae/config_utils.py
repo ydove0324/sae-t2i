@@ -20,6 +20,7 @@ class EncoderConfig:
     dinov3_model_dir: str = "/cpfs01/huangxu/models/dinov3"
     siglip2_model_name: str = "google/siglip2-base-patch16-256"
     dinov2_model_name: str = "/cpfs01/huangxu/models/dinov2-register-base"
+    qwen3_vit_model_name: str = "/cpfs01/huangxu/models/qwen3vl-8b"
 
 
 @dataclass
@@ -52,6 +53,7 @@ class ModelConfig:
     hf_encoder_config_path: Optional[str] = None
     hf_dropout_prob: float = 0.4
     hf_noise_std: float = 0.1
+    hf_noise_alpha_schedule: str = "alpha_one"
     hf_loss_weight: float = 0.1
 
     # Latent config

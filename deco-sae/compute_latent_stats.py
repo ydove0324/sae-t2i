@@ -106,6 +106,7 @@ def build_deco_sae(sae_cfg, device: torch.device) -> DecoSAE:
         dinov3_model_dir=sae_cfg.encoder.dinov3_model_dir,
         siglip2_model_name=sae_cfg.encoder.siglip2_model_name,
         dinov2_model_name=sae_cfg.encoder.dinov2_model_name,
+        qwen3_vit_model_name=getattr(sae_cfg.encoder, "qwen3_vit_model_name", "Qwen/Qwen3-VL-8B-Instruct"),
         image_size=sae_cfg.data.image_size,
         in_channels=3,
         out_channels=3,

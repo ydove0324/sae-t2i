@@ -213,6 +213,7 @@ def build_deco_sae(sae_cfg, device: torch.device) -> DecoSAE:
         dinov3_model_dir=sae_cfg.encoder.dinov3_model_dir,
         siglip2_model_name=sae_cfg.encoder.siglip2_model_name,
         dinov2_model_name=sae_cfg.encoder.dinov2_model_name,
+        qwen3_vit_model_name=getattr(sae_cfg.encoder, "qwen3_vit_model_name", "Qwen/Qwen3-VL-8B-Instruct"),
         image_size=sae_cfg.data.image_size,
         in_channels=3,
         out_channels=3,
@@ -797,6 +798,7 @@ def main():
     opt_state = None
     sched_state = None
     train_steps = 0
+    ema_loaded = False
 
     # Resume checkpoint (skip if None, empty string, or file doesn't exist)
     if args.ckpt and os.path.isfile(args.ckpt):
@@ -805,6 +807,7 @@ def main():
             model.load_state_dict(checkpoint["model"], strict=False)
         if "ema" in checkpoint:
             ema.load_state_dict(checkpoint["ema"], strict=False)
+            ema_loaded = True
         opt_state = checkpoint.get("opt")
         sched_state = checkpoint.get("scheduler")
         train_steps = int(checkpoint.get("train_steps", 0))
@@ -858,8 +861,9 @@ def main():
         logger.info(f"Training: {epochs} epochs, {steps_per_epoch} steps/epoch")
         logger.info(opt_msg + "\n" + sched_msg)
 
-    # Initialize EMA
-    update_ema(ema, model.module, decay=0)
+    # Initialize EMA from model only when checkpoint EMA is unavailable.
+    if not ema_loaded:
+        update_ema(ema, model.module, decay=0)
     model.train()
     ema.eval()
 

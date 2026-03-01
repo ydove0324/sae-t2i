@@ -73,6 +73,7 @@ def build_model(cfg, device: torch.device) -> DecoSAE:
         dinov3_model_dir=cfg.encoder.dinov3_model_dir,
         siglip2_model_name=cfg.encoder.siglip2_model_name,
         dinov2_model_name=cfg.encoder.dinov2_model_name,
+        qwen3_vit_model_name=getattr(cfg.encoder, "qwen3_vit_model_name", "Qwen/Qwen3-VL-8B-Instruct"),
         image_size=cfg.data.image_size,
         in_channels=3,
         out_channels=3,

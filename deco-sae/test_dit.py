@@ -65,6 +65,7 @@ def build_deco_sae(sae_cfg, device: torch.device) -> DecoSAE:
         dinov3_model_dir=sae_cfg.encoder.dinov3_model_dir,
         siglip2_model_name=sae_cfg.encoder.siglip2_model_name,
         dinov2_model_name=sae_cfg.encoder.dinov2_model_name,
+        qwen3_vit_model_name=getattr(sae_cfg.encoder, "qwen3_vit_model_name", "Qwen/Qwen3-VL-8B-Instruct"),
         image_size=sae_cfg.data.image_size,
         in_channels=3,
         out_channels=3,
@@ -165,6 +166,7 @@ def sample_latent(
     steps: int = 50,
     use_cfg: bool = False,
     cfg_scale: float = 3.0,
+    cfg_interval: tuple = (0.0, 0.9),
     null_class: int = 1000,
 ):
     """Sample latent z0 using Euler method."""
@@ -174,6 +176,9 @@ def sample_latent(
     x = torch.randn((batch_size, C, H, W), device=device, dtype=torch.float32)
 
     shift = float(time_shift)
+    cfg_start, cfg_end = float(cfg_interval[0]), float(cfg_interval[1])
+    if cfg_start > cfg_end:
+        cfg_start, cfg_end = cfg_end, cfg_start
 
     def flow_shift(t_lin: torch.Tensor) -> torch.Tensor:
         t = (shift * t_lin) / (1.0 + (shift - 1.0) * t_lin)
@@ -186,7 +191,9 @@ def sample_latent(
         t = flow_shift(t_lin)
         t_next = flow_shift(t_next_lin)
 
-        if not use_cfg:
+        # Apply CFG only within configured timestep interval.
+        apply_cfg = use_cfg and (cfg_start <= float(t_lin[0].item()) <= cfg_end)
+        if not apply_cfg:
             x0_hat = model(x, t, y=y)
         else:
             y_cond = y
