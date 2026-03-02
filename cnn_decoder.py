@@ -3,6 +3,7 @@ import math
 import contextlib
 from copy import deepcopy
 from typing import NamedTuple, Optional, Tuple, Union
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ from models.dino_v3.modeling_dino_v3 import DINOv3ViTModel
 
 # ViT decoder 相关导入
 from models.rae.stage1.decoders.utils import ViTMAEConfig, ACT2FN
+from transformers import  Qwen3VLForConditionalGeneration
 
 # SigLIP2 import
 try:
@@ -32,6 +34,14 @@ try:
 except ImportError:
     HAS_DINOV2 = False
     print("Warning: transformers Dinov2WithRegistersModel not found. DINOv2 encoder will not be available.")
+
+# Qwen3-ViT import
+try:
+    from transformers import Qwen3VLForConditionalGeneration
+    HAS_QWEN3_VIT = True
+except ImportError:
+    HAS_QWEN3_VIT = False
+    print("Warning: transformers Qwen3VLForConditionalGeneration not found. Qwen3-ViT encoder will not be available.")
 
 
 # =========================
@@ -946,6 +956,25 @@ class DINOv2ScalingLayer(nn.Module):
 
 
 # =========================
+# Normalization for Qwen3-ViT input
+# =========================
+
+class Qwen3ViTScalingLayer(nn.Module):
+    """
+    Qwen3-ViT 输入归一化层。
+    当前默认使用 [-1, 1] 直通，避免与具体 processor 绑定；
+    如需严格对齐官方预处理，可替换为对应 mean/std。
+    """
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("shift", torch.Tensor([0.0, 0.0, 0.0])[None, :, None, None])
+        self.register_buffer("scale", torch.Tensor([1.0, 1.0, 1.0])[None, :, None, None])
+
+    def forward(self, x):
+        return (x - self.shift) / self.scale
+
+
+# =========================
 # Encoder (DINOv3 + LoRA)
 # =========================
 
@@ -1119,6 +1148,175 @@ class DINOv2Encoder2D(nn.Module):
 
 
 # =========================
+# Encoder (Qwen3-ViT)
+# =========================
+
+class Qwen3ViTEncoder2D(nn.Module):
+    """
+    Qwen3-ViT encoder (from Qwen3-VL checkpoints).
+    
+    输出维度: 4096 (经过 spatial merger 后的输出)
+    Token 数量: (H/16/2) * (W/16/2) = 64 (对于 256x256 图像)
+    
+    注意：只保留 visual 模块，删除 LLM 部分以节省显存 (~15GB)
+    """
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
+        lora_rank: int = 32,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.0,
+        enable_lora: bool = True,
+        freeze_encoder: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        if not HAS_QWEN3_VIT:
+            raise ImportError(
+                "Qwen3-ViT requires transformers Qwen3VLForConditionalGeneration. "
+                "Please install: pip install transformers"
+            )
+
+        self.encoder_type = "qwen3_vit"
+        self.model_name = model_name
+
+        # 加载完整 Qwen3-VL 模型
+        print(f"Loading Qwen3-VL from {model_name}...")
+        try:
+            full_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name,
+                dtype=dtype,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+        except (OSError, ValueError, AttributeError):
+            full_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name,
+                dtype=dtype,
+                trust_remote_code=True,
+                local_files_only=False,
+            )
+
+        # 只保留 visual 部分，删除 LLM 节省显存
+        self.visual = full_model.visual
+        del full_model.model
+        del full_model.lm_head
+        del full_model
+        torch.cuda.empty_cache()
+        
+        if enable_lora and lora_rank > 0:
+            print("Warning: LoRA is not wired for Qwen3-ViT yet; running without LoRA adapters.")
+
+        # 冻结 encoder
+        if freeze_encoder:
+            for param in self.visual.parameters():
+                param.requires_grad = False
+
+        self.normalization_layer = Qwen3ViTScalingLayer()
+
+        # 从 visual config 获取配置
+        vision_cfg = self.visual.config if hasattr(self.visual, 'config') else None
+        
+        # 关键配置
+        self.patch_size = getattr(vision_cfg, 'patch_size', 16)
+        self.temporal_patch_size = getattr(vision_cfg, 'temporal_patch_size', 2)
+        self.spatial_merge_size = getattr(vision_cfg, 'spatial_merge_size', 2)
+        self.hidden_size = getattr(vision_cfg, 'out_hidden_size', 4096)  # merger 输出维度
+        self.vit_hidden_size = getattr(vision_cfg, 'hidden_size', 1152)  # ViT 原始维度
+        
+        self.num_register_tokens = 0  # Qwen3-VL 没有 register tokens
+        self.has_cls_token = False    # merger 输出不含 CLS token
+        
+        print(f"Qwen3-ViT Encoder initialized:")
+        print(f"  - patch_size: {self.patch_size}")
+        print(f"  - spatial_merge_size: {self.spatial_merge_size}")
+        print(f"  - hidden_size (output): {self.hidden_size}")
+
+    def _preprocess_images(self, images: torch.Tensor) -> tuple:
+        """
+        将 [B, C, H, W] 的图像 tensor 转换为 Qwen3-VL 所需的格式
+        
+        Returns:
+            pixel_values: [total_patches, C * temporal_patch_size * patch_size * patch_size]
+            image_grid_thw: [B, 3] - (temporal, h_patches, w_patches)
+        """
+        B, C, H, W = images.shape
+        device = images.device
+        
+        h_patches = H // self.patch_size
+        w_patches = W // self.patch_size
+        num_patches = h_patches * w_patches
+        
+        # reshape 为 patches: [B, C, h_p, ps, w_p, ps] -> [B*N, C, ps, ps]
+        patches = images.view(B, C, h_patches, self.patch_size, w_patches, self.patch_size)
+        patches = patches.permute(0, 2, 4, 1, 3, 5).contiguous()
+        patches = patches.view(B * num_patches, C, self.patch_size, self.patch_size)
+        
+        # 添加 temporal 维度 (复制以模拟 temporal_patch_size=2)
+        patches = patches.unsqueeze(2).repeat(1, 1, self.temporal_patch_size, 1, 1)
+        
+        # flatten: [B*N, C*T*ps*ps]
+        pixel_values = patches.view(B * num_patches, -1)
+        
+        # grid_thw: [B, 3]
+        image_grid_thw = torch.tensor(
+            [[1, h_patches, w_patches]] * B,
+            device=device,
+            dtype=torch.long
+        )
+        
+        return pixel_values, image_grid_thw
+
+    def set_lora_enabled(self, enabled: bool):
+        pass  # LoRA not supported yet
+
+    @contextlib.contextmanager
+    def lora_disabled(self):
+        yield
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: [B, C, H, W] tensor, 值域 [-1, 1]
+        
+        Returns:
+            SimpleNamespace with last_hidden_state: [B, N, 4096]
+            其中 N = (H/16/2) * (W/16/2) = 64 (对于 256x256 图像)
+        """
+        B, C, H, W = x.shape
+        device = x.device
+        
+        x = self.normalization_layer(x)
+        
+        # 预处理图像为 Qwen3-VL 格式
+        pixel_values, image_grid_thw = self._preprocess_images(x)
+        pixel_values = pixel_values.to(dtype=self.visual.dtype, device=device)
+        
+        # 获取 vision embeddings (经过 merger，输出 4096 dim)
+        with torch.set_grad_enabled(self.training and any(p.requires_grad for p in self.visual.parameters())):
+            image_embeds, _ = self.visual(pixel_values, grid_thw=image_grid_thw)
+        
+        # 计算每张图片的 token 数量 (spatial merge 后)
+        tokens_per_image = (image_grid_thw[:, 1] * image_grid_thw[:, 2] // (self.spatial_merge_size ** 2)).tolist()
+        
+        # 分割并堆叠
+        image_embeds_list = torch.split(image_embeds, tokens_per_image)
+        
+        if len(set(tokens_per_image)) == 1:
+            embeddings = torch.stack(image_embeds_list, dim=0)
+        else:
+            max_tokens = max(tokens_per_image)
+            embeddings = torch.zeros(B, max_tokens, self.hidden_size, device=device, dtype=image_embeds.dtype)
+            for i, emb in enumerate(image_embeds_list):
+                embeddings[i, :emb.shape[0], :] = emb
+        
+        return SimpleNamespace(last_hidden_state=embeddings)
+
+    def get_backbone(self):
+        return self.visual
+
+
+# =========================
 # AutoencoderKL (DINO encoder + CNN decoder)
 # =========================
 
@@ -1136,10 +1334,11 @@ class AutoencoderKL(nn.Module):
     def __init__(
         self,
         # Encoder 配置 - 支持多种 encoder
-        encoder_type: str = "dinov3",  # "dinov3", "dinov3_vitl", "siglip2" 或 "dinov2"
+        encoder_type: str = "dinov3",  # "dinov3", "dinov3_vitl", "siglip2", "dinov2" 或 "qwen3_vit"
         dinov3_model_dir: str = "",
         siglip2_model_name: str = "google/siglip2-base-patch16-256",
         dinov2_model_name: str = "facebook/dinov2-with-registers-base",
+        qwen3_vit_model_name: str = "Qwen/Qwen3-VL-8B-Instruct",
         
         image_size: int = 256,
         patch_size: int = 16,
@@ -1257,8 +1456,22 @@ class AutoencoderKL(nn.Module):
             # DINOv2 encoder_patch_size=14, decoder_patch_size=16
             encoder_patch_size = self.encoder.patch_size  # 14
             decoder_patch_size = patch_size  # 16 (默认)
+        elif encoder_type == "qwen3_vit":
+            self.encoder = Qwen3ViTEncoder2D(
+                model_name=qwen3_vit_model_name,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                enable_lora=enable_lora,
+            )
+            latent_channels = self.encoder.hidden_size
+            encoder_patch_size = self.encoder.patch_size
+            decoder_patch_size = patch_size
         else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type}. Supported: 'dinov3', 'dinov3_vitl', 'siglip2', 'dinov2'")
+            raise ValueError(
+                f"Unknown encoder_type: {encoder_type}. Supported: "
+                f"'dinov3', 'dinov3_vitl', 'siglip2', 'dinov2', 'qwen3_vit'"
+            )
         
         # 更新 latent_channels (可能被 encoder 覆盖)
         self.original_latent_channels = latent_channels
@@ -1354,6 +1567,10 @@ class AutoencoderKL(nn.Module):
             cls_len = 1
             reg_len = self.encoder.num_register_tokens
             tokens = pred.last_hidden_state[:, cls_len + reg_len:, :]  # [B,N,C]
+        elif self.encoder_type == "qwen3_vit":
+            tokens = pred.last_hidden_state
+            if getattr(self.encoder, "has_cls_token", True) and tokens.shape[1] > 1:
+                tokens = tokens[:, 1:, :]
         else:
             raise ValueError(f"Unknown encoder_type: {self.encoder_type}")
 
@@ -1377,6 +1594,14 @@ class AutoencoderKL(nn.Module):
             return backbone.embeddings.patch_embedding.weight
         elif self.encoder_type == "dinov2":
             return backbone.embeddings.patch_embeddings.projection.weight
+        elif self.encoder_type == "qwen3_vit":
+            if hasattr(backbone, "embeddings") and hasattr(backbone.embeddings, "patch_embeddings"):
+                pe = backbone.embeddings.patch_embeddings
+                if hasattr(pe, "projection"):
+                    return pe.projection.weight
+                if hasattr(pe, "weight"):
+                    return pe.weight
+            return None
         return None
 
     def encode_features(self, x: torch.Tensor, use_lora: bool = True) -> torch.Tensor:
