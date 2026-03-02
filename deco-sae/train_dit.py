@@ -130,20 +130,28 @@ def compute_train_loss(
         )
         sem_loss = sem_loss * rw
         components["semantic_loss"] = sem_loss.mean()
-        hf_loss = F.mse_loss(
-            model_output[:, component_split_ch:],
-            x_latent[:, component_split_ch:],
-            reduction="none",
-        )
-        hf_loss = hf_loss * rw
-        components["hf_loss"] = hf_loss.mean()
+        hf_channels = x_latent.shape[1] - component_split_ch
+        if hf_channels > 0:
+            hf_loss = F.mse_loss(
+                model_output[:, component_split_ch:],
+                x_latent[:, component_split_ch:],
+                reduction="none",
+            )
+            hf_loss = hf_loss * rw
+            components["hf_loss"] = hf_loss.mean()
+        else:
+            hf_loss = None
+            components["hf_loss"] = torch.zeros((), device=device, dtype=model_output.dtype)
 
         if semantic_channels is not None and semantic_channels > 0:
             # Keep zero_hf semantics: optimize only semantic channels.
             loss = components["semantic_loss"]
         else:
             # Use per-element merged mean so scale matches full-channel MSE.
-            loss = torch.cat([sem_loss, hf_loss], dim=1).mean()
+            if hf_loss is not None:
+                loss = torch.cat([sem_loss, hf_loss], dim=1).mean()
+            else:
+                loss = sem_loss.mean()
     else:
         if semantic_channels is not None and semantic_channels > 0:
             loss = F.mse_loss(model_output[:, :semantic_channels], x_latent[:, :semantic_channels], reduction="none")

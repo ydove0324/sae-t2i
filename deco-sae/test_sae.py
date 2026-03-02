@@ -228,13 +228,17 @@ def generate_with_manipulation(
     s_h, s_w = z.shape[-2:]
     
     # 3. Extract original HF tokens
-    hf_feat = model.hf_encoder(x)
-    if hf_feat.shape[-2:] != (s_h, s_w):
-        hf_feat = F.interpolate(hf_feat, size=(s_h, s_w), mode="bilinear", align_corners=False)
-    s_hf_original = hf_feat.flatten(2).transpose(1, 2).contiguous()  # [B, N, hf_dim]
-    
-    # 4. Apply manipulation to HF tokens
-    s_hf_manipulated = manipulate_hf_tokens(s_hf_original, mode, generator)
+    if model.hf_dim > 0 and getattr(model, "hf_encoder", None) is not None:
+        hf_feat = model.hf_encoder(x)
+        if hf_feat.shape[-2:] != (s_h, s_w):
+            hf_feat = F.interpolate(hf_feat, size=(s_h, s_w), mode="bilinear", align_corners=False)
+        s_hf_original = hf_feat.flatten(2).transpose(1, 2).contiguous()  # [B, N, hf_dim]
+        # 4. Apply manipulation to HF tokens
+        s_hf_manipulated = manipulate_hf_tokens(s_hf_original, mode, generator)
+    else:
+        s_hf_manipulated = torch.zeros(
+            bsz, num_patches, 0, device=device, dtype=s_sem.dtype
+        )
     
     # 5. Fuse and generate
     enc_cond = model.fused_norm(torch.cat([s_sem, s_hf_manipulated], dim=-1))

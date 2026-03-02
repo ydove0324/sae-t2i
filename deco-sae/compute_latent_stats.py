@@ -384,6 +384,7 @@ def main():
     full_mean, full_std, full_var, total_n = sync_stats(stats_full)
     semantic_mean, semantic_std, _, _ = sync_stats(stats_semantic)
     hf_mean, hf_std, _, _ = sync_stats(stats_hf)
+    has_hf = hf_dim > 0
     
     # Sync min/max
     dist.all_reduce(global_min, op=dist.ReduceOp.MIN)
@@ -416,10 +417,13 @@ def main():
         print(f"   Mean of std:  {semantic_std.mean().item():.6f}")
         print("-" * 60)
         print(" HF Part:")
-        print(f"   Mean range: [{hf_mean.min().item():.6f}, {hf_mean.max().item():.6f}]")
-        print(f"   Std range:  [{hf_std.min().item():.6f}, {hf_std.max().item():.6f}]")
-        print(f"   Mean of mean: {hf_mean.mean().item():.6f}")
-        print(f"   Mean of std:  {hf_std.mean().item():.6f}")
+        if has_hf:
+            print(f"   Mean range: [{hf_mean.min().item():.6f}, {hf_mean.max().item():.6f}]")
+            print(f"   Std range:  [{hf_std.min().item():.6f}, {hf_std.max().item():.6f}]")
+            print(f"   Mean of mean: {hf_mean.mean().item():.6f}")
+            print(f"   Mean of std:  {hf_std.mean().item():.6f}")
+        else:
+            print("   Skipped (hf_dim=0)")
         print("-" * 60)
         print(f" Global min: {global_min.min().item():.6f}")
         print(f" Global max: {global_max.max().item():.6f}")
@@ -474,12 +478,21 @@ def main():
                 "mean_of_std": float(semantic_std.mean().item()),
             },
             # HF stats
-            "hf": {
-                "mean": hf_mean.cpu().tolist(),
-                "std": hf_std.cpu().tolist(),
-                "mean_of_mean": float(hf_mean.mean().item()),
-                "mean_of_std": float(hf_std.mean().item()),
-            },
+            "hf": (
+                {
+                    "mean": hf_mean.cpu().tolist(),
+                    "std": hf_std.cpu().tolist(),
+                    "mean_of_mean": float(hf_mean.mean().item()),
+                    "mean_of_std": float(hf_std.mean().item()),
+                }
+                if has_hf
+                else {
+                    "mean": [],
+                    "std": [],
+                    "mean_of_mean": 0.0,
+                    "mean_of_std": 0.0,
+                }
+            ),
             # Global range
             "global_min": float(global_min.min().item()),
             "global_max": float(global_max.max().item()),
@@ -512,7 +525,10 @@ def main():
         print("-" * 60)
         print(f" Per-part normalization:")
         print(f"   semantic: (z[:, :{semantic_channels}] - {semantic_mean.mean().item():.4f}) / {semantic_std.mean().item():.4f}")
-        print(f"   hf:       (z[:, {semantic_channels}:] - {hf_mean.mean().item():.4f}) / {hf_std.mean().item():.4f}")
+        if has_hf:
+            print(f"   hf:       (z[:, {semantic_channels}:] - {hf_mean.mean().item():.4f}) / {hf_std.mean().item():.4f}")
+        else:
+            print(f"   hf:       skipped (hf_dim=0)")
         print("=" * 60)
     
     dist.barrier()
