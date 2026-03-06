@@ -237,7 +237,7 @@ def freeze_for_hf_and_pixel_decoder(
         model.fused_proj,
         model.decoder,
     ]
-    if not freeze_hf_encoder:
+    if (not freeze_hf_encoder) and (getattr(model, "hf_encoder", None) is not None):
         trainable_modules.append(model.hf_encoder)
     # Flow matching specific modules (may be None for ViT decoder)
     if model.t_embedder is not None:

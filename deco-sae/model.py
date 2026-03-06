@@ -485,17 +485,24 @@ class DecoSAE(nn.Module):
             self.to_moments = nn.Conv2d(effective_c, 2 * effective_c, kernel_size=1)
 
         # 3) Condition fusion (Semantic + HF -> hidden_size).
-        self.hf_dim = hf_dim
-        if hf_encoder_config_path is not None:
-            self.hf_encoder = HFEncoder.from_config(hf_encoder_config_path, patch_size=self.decode_patch_size)
-            # Override hf_dim from config if specified
-            self.hf_dim = self.hf_encoder.conv_out.out_channels
-        else:
-            self.hf_encoder = HFEncoder(
-                in_channels=in_channels,
-                out_channels=self.hf_dim,
-                patch_size=self.decode_patch_size,
-            )
+        self.hf_dim = int(hf_dim)
+        if self.hf_dim < 0:
+            raise ValueError(f"hf_dim must be >= 0, got: {self.hf_dim}")
+
+        self.hf_encoder = None
+        if self.enable_hf_branch and self.hf_dim > 0:
+            if hf_encoder_config_path is not None:
+                self.hf_encoder = HFEncoder.from_config(
+                    hf_encoder_config_path, patch_size=self.decode_patch_size
+                )
+                # Override hf_dim from config if specified
+                self.hf_dim = self.hf_encoder.conv_out.out_channels
+            else:
+                self.hf_encoder = HFEncoder(
+                    in_channels=in_channels,
+                    out_channels=self.hf_dim,
+                    patch_size=self.decode_patch_size,
+                )
         self.fused_norm = nn.LayerNorm(self.semantic_channels + self.hf_dim, elementwise_affine=False, eps=1e-6)
         self.fused_proj = nn.Linear(self.semantic_channels + self.hf_dim, hidden_size, bias=True)
 
@@ -609,7 +616,7 @@ class DecoSAE(nn.Module):
         if (not self.enable_hf_branch) or (self.hf_dim <= 0):
             return torch.zeros(bsz, num_patches, self.hf_dim, device=device, dtype=dtype)
 
-        if x_img is not None:
+        if x_img is not None and self.hf_encoder is not None:
             hf_feat = self.hf_encoder(x_img)
             if hf_feat.shape[-2:] != (s_h, s_w):
                 hf_feat = F.interpolate(hf_feat, size=(s_h, s_w), mode="bilinear", align_corners=False)
